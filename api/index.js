@@ -8,6 +8,7 @@ try {
 const express = require("express");
 const cors = require("cors");
 
+const scrapeRoutes = require("./routes/scrape");
 const authRoutes = require("./routes/auth");
 const bootstrapRoutes = require("./routes/bootstrap");
 const onboardingRoutes = require("./routes/onboarding");
@@ -23,6 +24,7 @@ const widgetRoutes = require("./routes/widget");
 const chatbotPublicRoutes = require("./routes/chatbot-public");
 const vapiWebhookRoutes = require("./routes/vapi-webhook");
 const { errorHandler } = require("../middleware/error");
+// ... other routes ...
 
 const app = express();
 
@@ -81,6 +83,7 @@ app.use("/api/messenger", messengerRoutes);
 app.use("/api/calls", callsRoutes);
 app.use("/api/leads", leadsRoutes);
 app.use("/api/chatbot-public", chatbotPublicRoutes);
+app.use("/api/scrape", scrapeRoutes);
 app.use("/api/vapi", vapiWebhookRoutes);
 app.use("/api", miscRoutes); // team, billing, settings, contact
 
