@@ -1,18 +1,11 @@
 "use strict";
 
-/**
- * This file replaces api/routes/chatbots.js
- * Key addition: POST /api/chatbots/:id/import-website
- * which triggers the full scrape → chunk → save → FAQ pipeline.
- */
-
 const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
 const { requireAuth, requireAdmin } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 const { serializeChatbot } = require("../../lib/serializers");
-const { scrapeAndSave } = require("../../lib/scraper");
-const { scrapeAndStore } = require("../../lib/scraper.service");
+const { scrapeAndStore } = require("../../lib/scraper.service"); // chunks‑only
 
 const router = express.Router();
 
@@ -136,8 +129,7 @@ router.patch(
   }),
 );
 
-// ── POST /api/chatbots/:id/import-website ─────────────────────
-// Full scrape → chunk → save to knowledge_chunks → generate FAQs → update chatbot
+// ── POST /api/chatbots/:id/import-website (chunks‑only) ───────
 router.post(
   "/:id/import-website",
   requireAuth,
@@ -146,44 +138,36 @@ router.post(
     const { id } = req.params;
     const { website } = req.body;
 
-    if (!website)
+    if (!website?.trim()) {
       return res
         .status(400)
         .json({ error: { message: "website URL is required." } });
+    }
 
     const db = getSupabase();
     const { data: chatbot } = await db
       .from("chatbots")
-      .select("*")
+      .select("id")
       .eq("id", id)
       .eq("organization_id", req.orgId)
       .single();
 
-    if (!chatbot)
+    if (!chatbot) {
       return res.status(404).json({ error: { message: "Chatbot not found." } });
+    }
 
-    // Run full scrape pipeline
-    const { faqs, chunks, strategy } = await scrapeAndSave(
-      req.orgId,
-      id,
-      website,
-    );
-
-    // Update chatbot FAQs
-    await db
-      .from("chatbots")
-      .update({
-        faqs: faqs.map((f) => ({ question: f.question, answer: f.answer })),
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", id);
+    // Use chunks‑only scraper (no FAQ generation)
+    const result = await scrapeAndStore({
+      url: website,
+      chatbotId: id,
+      organizationId: req.orgId,
+    });
 
     res.json({
       success: true,
-      faqs,
-      chunksStored: chunks,
-      strategy,
-      message: `Scraped ${chunks} content chunks and generated ${faqs.length} FAQ entries using ${strategy} strategy.`,
+      chunksStored: result.chunksStored,
+      strategy: result.strategy,
+      message: `Scraped ${result.chunksStored} content chunks using ${result.strategy}.`,
     });
   }),
 );
@@ -284,44 +268,4 @@ router.get(
   }),
 );
 
-router.post("/:id/import-website", requireAuth, async (req, res) => {
-  try {
-    const { website } = req.body;
-    if (!website?.trim()) {
-      return res
-        .status(400)
-        .json({ error: { message: "website URL is required." } });
-    }
-
-    // Verify chatbot belongs to org
-    const db = getSupabase();
-    const { data: chatbot } = await db
-      .from("chatbots")
-      .select("id")
-      .eq("id", req.params.id)
-      .eq("organization_id", req.orgId)
-      .single();
-
-    if (!chatbot) {
-      return res.status(404).json({ error: { message: "Chatbot not found." } });
-    }
-
-    // Scrape and store chunks
-    const result = await scrapeAndStore({
-      url: website,
-      chatbotId: req.params.id,
-      organizationId: req.orgId,
-    });
-
-    res.json({
-      success: true,
-      chunksStored: result.chunksStored,
-      strategy: result.strategy,
-      message: `Scraped ${result.chunksStored} content chunks using ${result.strategy}.`,
-    });
-  } catch (err) {
-    console.error("Import error:", err);
-    res.status(500).json({ error: { message: err.message } });
-  }
-});
 module.exports = router;

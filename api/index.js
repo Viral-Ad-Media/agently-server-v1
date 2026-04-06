@@ -1,6 +1,5 @@
 "use strict";
 
-// Load .env in all environments (Vercel ignores it safely, local dev uses it)
 try {
   require("dotenv").config();
 } catch (_) {}
@@ -20,13 +19,11 @@ const messengerRoutes = require("./routes/messenger");
 const callsRoutes = require("./routes/calls");
 const leadsRoutes = require("./routes/leads");
 const miscRoutes = require("./routes/misc");
-const widgetRoutes = require("./routes/widget");
+const widgetRoutes = require("./routes/widget"); // ← only one, using the new file
 const chatbotPublicRoutes = require("./routes/chatbot-public");
 const vapiWebhookRoutes = require("./routes/vapi-webhook");
-const widgetRoutes = require("./routes/widget.routes");
 
 const { errorHandler } = require("../middleware/error");
-// ... other routes ...
 
 const app = express();
 
@@ -88,8 +85,6 @@ app.use("/api/chatbot-public", chatbotPublicRoutes);
 app.use("/api/scrape", scrapeRoutes);
 app.use("/api/vapi", vapiWebhookRoutes);
 app.use("/api", miscRoutes); // team, billing, settings, contact
-app.use("/widget", widgetRoutes);
-
 app.use("/chatbot-widget", widgetRoutes);
 
 app.use((_req, res) =>
