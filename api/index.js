@@ -23,6 +23,8 @@ const miscRoutes = require("./routes/misc");
 const widgetRoutes = require("./routes/widget");
 const chatbotPublicRoutes = require("./routes/chatbot-public");
 const vapiWebhookRoutes = require("./routes/vapi-webhook");
+const widgetRoutes = require("./routes/widget.routes");
+
 const { errorHandler } = require("../middleware/error");
 // ... other routes ...
 
@@ -86,6 +88,7 @@ app.use("/api/chatbot-public", chatbotPublicRoutes);
 app.use("/api/scrape", scrapeRoutes);
 app.use("/api/vapi", vapiWebhookRoutes);
 app.use("/api", miscRoutes); // team, billing, settings, contact
+app.use("/widget", widgetRoutes);
 
 app.use("/chatbot-widget", widgetRoutes);
 
