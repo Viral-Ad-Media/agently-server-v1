@@ -19,9 +19,10 @@ const messengerRoutes = require("./routes/messenger");
 const callsRoutes = require("./routes/calls");
 const leadsRoutes = require("./routes/leads");
 const miscRoutes = require("./routes/misc");
-const widgetRoutes = require("./routes/widget"); // ← only one, using the new file
+const widgetRoutes = require("./routes/widget");
 const chatbotPublicRoutes = require("./routes/chatbot-public");
 const vapiWebhookRoutes = require("./routes/vapi-webhook");
+const twilioRoutes = require("./routes/twilio"); // ← NEW
 
 const { errorHandler } = require("../middleware/error");
 
@@ -36,7 +37,7 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
 app.use(
   cors({
     origin(origin, cb) {
-      if (!origin) return cb(null, true); // server-to-server
+      if (!origin) return cb(null, true);
       if (process.env.NODE_ENV !== "production") return cb(null, true);
       if (!allowedOrigins.length) return cb(null, true);
       if (allowedOrigins.includes(origin)) return cb(null, true);
@@ -77,14 +78,15 @@ app.use("/api/onboarding", onboardingRoutes);
 app.use("/api/agent", agentRoutes);
 app.use("/api/voice-agents", voiceAgentRoutes);
 app.use("/api/chatbots", chatbotRoutes);
-app.use("/api/chatbots", chatbotDeployRoutes); // /deploy + /deploy-status
+app.use("/api/chatbots", chatbotDeployRoutes);
 app.use("/api/messenger", messengerRoutes);
 app.use("/api/calls", callsRoutes);
 app.use("/api/leads", leadsRoutes);
 app.use("/api/chatbot-public", chatbotPublicRoutes);
 app.use("/api/scrape", scrapeRoutes);
 app.use("/api/vapi", vapiWebhookRoutes);
-app.use("/api", miscRoutes); // team, billing, settings, contact
+app.use("/api/twilio", twilioRoutes); // ← NEW
+app.use("/api", miscRoutes);
 app.use("/chatbot-widget", widgetRoutes);
 
 app.use((_req, res) =>
@@ -92,4 +94,26 @@ app.use((_req, res) =>
 );
 app.use(errorHandler);
 
+// ── WebSocket attachment for local development ─────────────────
+function attachWebSocket(server) {
+  try {
+    const { WebSocketServer } = require("ws");
+    const { handleConversationRelayWS } = require("../lib/conversation-relay");
+    const wss = new WebSocketServer({ noServer: true });
+    server.on("upgrade", (request, socket, head) => {
+      if ((request.url || "").startsWith("/api/twilio/ws")) {
+        wss.handleUpgrade(request, socket, head, (ws) => {
+          handleConversationRelayWS(ws, request);
+        });
+      } else {
+        socket.destroy();
+      }
+    });
+    console.log("[WS] ConversationRelay WebSocket handler attached.");
+  } catch (e) {
+    console.warn("[WS] ws package not available:", e.message);
+  }
+}
+
 module.exports = app;
+module.exports.attachWebSocket = attachWebSocket;
