@@ -23,7 +23,7 @@ router.post(
   requireAuth,
   requireAdmin,
   asyncHandler(async (req, res) => {
-    const { email, role } = req.body;
+    const { email, role, name } = req.body;
 
     if (!email || !role) {
       return res
@@ -38,12 +38,14 @@ router.post(
     }
 
     const db = getSupabase();
+    const normalizedEmail = email.toLowerCase().trim();
+    const memberName = (name || "").trim() || normalizedEmail.split("@")[0];
 
     // Check if already a member
     const { data: existing } = await db
       .from("users")
       .select("id")
-      .eq("email", email.toLowerCase().trim())
+      .eq("email", normalizedEmail)
       .eq("organization_id", req.orgId)
       .single();
 
@@ -57,13 +59,13 @@ router.post(
         });
     }
 
-    // Create placeholder user (they sign in via magic link)
+    // Create placeholder user
     const { data: member, error } = await db
       .from("users")
       .insert({
         organization_id: req.orgId,
-        name: email.split("@")[0],
-        email: email.toLowerCase().trim(),
+        name: memberName,
+        email: normalizedEmail,
         role,
       })
       .select()
@@ -75,13 +77,29 @@ router.post(
         .json({ error: { message: "Failed to invite team member." } });
     }
 
-    // Send invite email (non-blocking)
+    // Generate a magic link so they can sign in immediately
     try {
+      const { v4: uuidv4 } = require("uuid");
+      const token = uuidv4().replace(/-/g, "") + uuidv4().replace(/-/g, "");
+      const expiresAt = new Date(
+        Date.now() + 7 * 24 * 60 * 60 * 1000,
+      ).toISOString(); // 7 days
+      await db
+        .from("magic_link_tokens")
+        .insert({ email: normalizedEmail, token, expires_at: expiresAt });
+
+      const appUrl = (
+        process.env.APP_URL || "https://agently.vercel.app"
+      ).replace(/\/$/, "");
+      const magicLinkUrl = `${appUrl}/#/login?magic=${token}`;
+
       await sendTeamInviteEmail(
-        email,
+        normalizedEmail,
+        memberName,
         req.user.name,
         req.organization.name,
         role,
+        magicLinkUrl,
       );
     } catch (e) {
       console.warn("Invite email failed:", e.message);

@@ -351,6 +351,9 @@ html,body{width:100%;height:100%;overflow:hidden;background:transparent;font-fam
     chips.appendChild(btn);
   });
 
+  /* ── Load session on first open ── */
+  var sessionLoaded = false;
+
   /* ── Toggle open/close ── */
   function toggle() {
     isOpen = !isOpen;
@@ -359,6 +362,10 @@ html,body{width:100%;height:100%;overflow:hidden;background:transparent;font-fam
     icoChat.style.display  = isOpen ? 'none' : '';
     icoClose.style.display = isOpen ? '' : 'none';
 
+    if (isOpen && !sessionLoaded) {
+      sessionLoaded = true;
+      loadSession();
+    }
     if (isOpen && !greeted) {
       greeted = true;
       setTimeout(function() { addBotMsg(WELCOME); }, 200);
@@ -388,13 +395,69 @@ html,body{width:100%;height:100%;overflow:hidden;background:transparent;font-fam
     return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 
+  /* ── Simple markdown renderer ── */
+  function renderMd(text) {
+    var s = String(text || '');
+    // Strip raw escape sequences
+    s = s.replace(/\\n/g, '\n').replace(/\\t/g, ' ');
+    // Escape HTML first
+    s = s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    // Bold **text**
+    s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    // Italic *text* or _text_
+    s = s.replace(/\*([^\*\n]+?)\*/g, '<em>$1</em>');
+    s = s.replace(/_([^_\n]+?)_/g, '<em>$1</em>');
+    // Links [text](url)
+    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline">$1</a>');
+    // Bare URLs
+    s = s.replace(/(^|\s)(https?:\/\/[^\s<]+)/g, '$1<a href="$2" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline">$2</a>');
+    // Unordered lists - lines starting with * or - or •
+    s = s.replace(/(^|\n)[\*\-•] (.+)/g, '$1<li>$2</li>');
+    if (s.includes('<li>')) s = s.replace(/(<li>.*<\/li>)/gs, '<ul style="margin:6px 0 6px 16px;padding:0">$1</ul>');
+    // Numbered lists
+    s = s.replace(/(^|\n)\d+\. (.+)/g, '$1<li>$2</li>');
+    // Line breaks
+    s = s.replace(/\n/g, '<br>');
+    return s;
+  }
+
+  /* ── Session storage key ── */
+  var SESS_KEY = 'agently_chat_' + CID;
+
+  /* ── Load session history ── */
+  function loadSession() {
+    try {
+      var raw = sessionStorage.getItem(SESS_KEY);
+      if (!raw) return;
+      var saved = JSON.parse(raw);
+      if (!Array.isArray(saved)) return;
+      saved.forEach(function(m) {
+        if (m.role && m.text) {
+          if (m.role === 'model') {
+            history.push({ role: 'model', text: m.text });
+            addMsg('bot', m.text, true);
+          } else {
+            history.push({ role: 'user', text: m.text });
+            addMsg('usr', m.text, true);
+          }
+        }
+      });
+      greeted = true;
+    } catch(e) {}
+  }
+
+  /* ── Save session ── */
+  function saveSession() {
+    try { sessionStorage.setItem(SESS_KEY, JSON.stringify(history.slice(-40))); } catch(e) {}
+  }
+
   /* ── Render a message bubble ── */
-  function addMsg(role, text) {
+  function addMsg(role, text, skipSave) {
     var wrap = document.createElement('div');
     wrap.className = 'bubble ' + (role === 'bot' ? 'bot' : 'usr');
     var inner = document.createElement('div');
     inner.className = 'btext';
-    inner.innerHTML = escHtml(text).replace(/\\n/g, '<br>');
+    inner.innerHTML = role === 'bot' ? renderMd(text) : text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     var time = document.createElement('div');
     time.className = 'btime';
     time.textContent = ft();
@@ -402,6 +465,7 @@ html,body{width:100%;height:100%;overflow:hidden;background:transparent;font-fam
     wrap.appendChild(time);
     msgs.appendChild(wrap);
     msgs.scrollTop = msgs.scrollHeight;
+    if (!skipSave) saveSession();
     return wrap;
   }
 
