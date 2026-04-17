@@ -165,4 +165,41 @@ router.delete(
   }),
 );
 
+// ── POST /api/messenger/voice-preview ─────────────────────────
+router.post(
+  "/voice-preview",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { voice, text } = req.body;
+    if (!voice || !text) {
+      return res
+        .status(400)
+        .json({ error: { message: "voice and text are required" } });
+    }
+
+    // Map frontend voice IDs to OpenAI TTS voices
+    const voiceMap = {
+      alloy: "alloy",
+      echo: "echo",
+      fable: "fable",
+      onyx: "onyx",
+      nova: "nova",
+      shimmer: "shimmer",
+    };
+    const openaiVoice = voiceMap[voice] || "alloy";
+
+    const { getOpenAI } = require("../../lib/openai");
+    const openai = getOpenAI();
+    const mp3 = await openai.audio.speech.create({
+      model: "tts-1",
+      voice: openaiVoice,
+      input: text,
+    });
+
+    const buffer = Buffer.from(await mp3.arrayBuffer());
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.send(buffer);
+  }),
+);
+
 module.exports = router;

@@ -342,12 +342,27 @@ router.get(
   }),
 );
 
-// List all numbers owned on master account
+// GET /api/twilio/numbers/owned
 router.get(
   "/numbers/owned",
   requireAuth,
-  asyncHandler(async (_req, res) => {
-    const numbers = await listOwnedNumbers();
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const { data: agents } = await db
+      .from("voice_agents")
+      .select("twilio_phone_number, twilio_phone_sid, name")
+      .eq("organization_id", req.orgId)
+      .neq("twilio_phone_number", "");
+
+    const numbers = (agents || []).map((a) => ({
+      sid: a.twilio_phone_sid,
+      phoneNumber: a.twilio_phone_number,
+      friendlyName: a.twilio_phone_number,
+      voiceUrl: "",
+      dateCreated: new Date().toISOString(),
+      capabilities: { voice: true, sms: false },
+      agentName: a.name,
+    }));
     res.json({ numbers });
   }),
 );
