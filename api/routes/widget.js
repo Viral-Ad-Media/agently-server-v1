@@ -1,8 +1,8 @@
 "use strict";
 
 const express = require("express");
-const { getSupabase } = require("../lib/supabase");
-const { asyncHandler } = require("../middleware/error");
+const { getSupabase } = require("../../lib/supabase");
+const { asyncHandler } = require("../../middleware/error");
 
 const router = express.Router();
 
