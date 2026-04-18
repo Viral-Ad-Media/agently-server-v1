@@ -1,147 +1,200 @@
-'use strict';
+"use strict";
 
-const express = require('express');
-const { getSupabase } = require('../../lib/supabase');
-const { requireAuth } = require('../../middleware/auth');
-const { asyncHandler } = require('../../middleware/error');
-const { scrapeAndSave, getDefaultFaqs } = require('../../lib/scraper');
-const { upsertVapiAssistant } = require('../../lib/vapi');
+const express = require("express");
+const { getSupabase } = require("../../lib/supabase");
+const { requireAuth } = require("../../middleware/auth");
+const { asyncHandler } = require("../../middleware/error");
+const { generateFaqsFromWebsite } = require("../../lib/openai");
+const { serializeAgent } = require("../../lib/serializers");
 
 const router = express.Router();
 
-// ── POST /api/onboarding/faqs ─────────────────────────────────
-router.post('/faqs', requireAuth, asyncHandler(async (req, res) => {
-  const { website } = req.body;
-  if (!website) {
-    return res.status(400).json({ error: { message: 'Website URL is required.' } });
-  }
+// Voice name migration for onboarding (legacy names → Twilio names)
+const VOICE_MIGRATE = {
+  Zephyr: "Rachel",
+  Puck: "Josh",
+  Charon: "Arnold",
+  Kore: "Bella",
+  Fenrir: "Domi",
+};
+const VALID_VOICES = [
+  "Rachel",
+  "Domi",
+  "Bella",
+  "Josh",
+  "Arnold",
+  "Wavenet-F",
+  "Wavenet-D",
+  "Polly-Joanna",
+  "Polly-Matthew",
+];
 
-  let faqs;
-  let meta = {};
+function normalizeVoice(v) {
+  if (VOICE_MIGRATE[v]) return VOICE_MIGRATE[v];
+  if (VALID_VOICES.includes(v)) return v;
+  return "Rachel";
+}
 
-  try {
-    const result = await scrapeAndSave(req.orgId, null, website);
-    faqs = result.faqs;
-    meta = { chunks: result.chunks, strategy: result.strategy };
-  } catch (e) {
-    console.warn('Onboarding FAQ scrape failed, using defaults:', e.message);
-    faqs = getDefaultFaqs();
-    meta = { strategy: 'fallback', error: e.message };
-  }
+// ── POST /api/onboarding/faqs ────────────────────────────────
+router.post(
+  "/faqs",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { website } = req.body;
+    if (!website) {
+      return res
+        .status(400)
+        .json({ error: { message: "Website URL is required." } });
+    }
+    const faqs = await generateFaqsFromWebsite(website);
+    res.json({ website, faqs });
+  }),
+);
 
-  res.json({ website, faqs, meta });
-}));
+// ── POST /api/onboarding/complete ────────────────────────────
+router.post(
+  "/complete",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { profile, agent: agentConfig } = req.body;
 
-// ── POST /api/onboarding/complete ─────────────────────────────
-router.post('/complete', requireAuth, asyncHandler(async (req, res) => {
-  const { profile, agent: agentConfig } = req.body;
+    if (!profile || !agentConfig) {
+      return res
+        .status(400)
+        .json({ error: { message: "Profile and agent config are required." } });
+    }
 
-  if (!profile || !agentConfig) {
-    return res.status(400).json({ error: { message: 'Profile and agent config are required.' } });
-  }
+    const db = getSupabase();
+    const orgId = req.orgId;
 
-  const db = getSupabase();
-  const orgId = req.orgId;
+    // Update org profile
+    await db
+      .from("organizations")
+      .update({
+        name: profile.name || "My Business",
+        industry: profile.industry || "",
+        website: profile.website || "",
+        location: profile.location || "",
+        timezone: profile.timezone || "America/New_York",
+        onboarded: true,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", orgId);
 
-  // Update organization
-  await db.from('organizations').update({
-    name: profile.name || 'My Business',
-    industry: profile.industry || '',
-    website: profile.website || '',
-    location: profile.location || '',
-    timezone: profile.timezone || 'America/New_York',
-    onboarded: true,
-    updated_at: new Date().toISOString(),
-  }).eq('id', orgId);
+    // Determine greeting — use provided or build from agent name + business name
+    const agentName = agentConfig.name || "Maya";
+    const businessName = profile.name || "our business";
+    const greeting =
+      agentConfig.greeting && agentConfig.greeting.trim()
+        ? agentConfig.greeting
+        : `Hello, thank you for calling ${businessName}! This is ${agentName}. How can I help you today?`;
 
-  // Create the first voice agent
-  const { data: agentRow, error: agentErr } = await db.from('voice_agents').insert({
-    organization_id: orgId,
-    name: agentConfig.name || 'My AI Agent',
-    direction: agentConfig.direction || 'inbound',
-    voice: agentConfig.voice || 'Zephyr',
-    language: agentConfig.language || 'English',
-    greeting: agentConfig.greeting || 'Hello, thank you for calling. How can I help you today?',
-    tone: agentConfig.tone || 'Professional',
-    business_hours: agentConfig.businessHours || '9am-5pm Monday-Friday',
-    escalation_phone: agentConfig.escalationPhone || '',
-    voicemail_fallback: agentConfig.voicemailFallback ?? true,
-    data_capture_fields: agentConfig.dataCaptureFields || ['name', 'phone', 'email', 'reason'],
-    rules: agentConfig.rules || { autoBook: false, autoEscalate: true, captureAllLeads: true },
-    is_active: true,
-  }).select().single();
-
-  if (agentErr || !agentRow) {
-    return res.status(500).json({ error: { message: 'Failed to create AI agent.' } });
-  }
-
-  // Save FAQs
-  const faqs = agentConfig.faqs || [];
-  let insertedFaqs = [];
-  if (faqs.length > 0) {
-    const { data: faqData } = await db.from('faqs').insert(
-      faqs.map(f => ({
+    // Create voice agent (no VAPI dependency — uses Twilio ConversationRelay)
+    const { data: agentRow, error: agentErr } = await db
+      .from("voice_agents")
+      .insert({
         organization_id: orgId,
-        voice_agent_id: agentRow.id,
-        question: f.question,
-        answer: f.answer,
-      }))
-    ).select();
-    insertedFaqs = faqData || [];
-  }
+        name: agentName,
+        direction: agentConfig.direction || "inbound",
+        voice: normalizeVoice(agentConfig.voice || "Rachel"),
+        language: agentConfig.language || "English",
+        greeting,
+        tone: agentConfig.tone || "Professional",
+        business_hours: agentConfig.businessHours || "9am-5pm Monday-Friday",
+        escalation_phone: agentConfig.escalationPhone || "",
+        voicemail_fallback: agentConfig.voicemailFallback ?? true,
+        data_capture_fields: agentConfig.dataCaptureFields || [
+          "name",
+          "phone",
+          "email",
+          "reason",
+        ],
+        rules: agentConfig.rules || {
+          autoBook: false,
+          autoEscalate: true,
+          captureAllLeads: true,
+        },
+        is_active: true,
+      })
+      .select()
+      .single();
 
-  // Set active agent
-  await db.from('organizations').update({ active_voice_agent_id: agentRow.id }).eq('id', orgId);
+    if (agentErr || !agentRow) {
+      console.error("Voice agent creation error:", agentErr);
+      return res
+        .status(500)
+        .json({
+          error: {
+            message: "Failed to create AI voice agent. Please try again.",
+          },
+        });
+    }
 
-  // Sync to Vapi
-  if (process.env.VAPI_API_KEY) {
+    // Insert FAQs
+    const faqs = agentConfig.faqs || [];
+    let insertedFaqs = [];
+    if (faqs.length > 0) {
+      const { data: faqData } = await db
+        .from("faqs")
+        .insert(
+          faqs.map((f) => ({
+            organization_id: orgId,
+            voice_agent_id: agentRow.id,
+            question: f.question,
+            answer: f.answer,
+          })),
+        )
+        .select();
+      insertedFaqs = faqData || [];
+    }
+
+    // Set as active agent
+    await db
+      .from("organizations")
+      .update({ active_voice_agent_id: agentRow.id })
+      .eq("id", orgId);
+
+    // Create default chatbot (non-blocking — don't fail onboarding if this fails)
     try {
-      const vapiAgent = await upsertVapiAssistant(agentRow, insertedFaqs);
-      if (vapiAgent?.id) {
-        await db.from('voice_agents').update({ vapi_assistant_id: vapiAgent.id }).eq('id', agentRow.id);
+      const chatbotName = `${businessName} Chat Agent`;
+      const { data: chatbotRow } = await db
+        .from("chatbots")
+        .insert({
+          organization_id: orgId,
+          voice_agent_id: agentRow.id,
+          name: chatbotName,
+          header_title: businessName,
+          welcome_message: `Hello! Welcome to ${businessName}. How can I help you today?`,
+          faqs: faqs.map((f) => ({ question: f.question, answer: f.answer })),
+          is_active: true,
+        })
+        .select()
+        .single();
+
+      if (chatbotRow) {
+        const apiUrl = (process.env.API_URL || "").replace(/\/$/, "");
+        const embedScript = `<!-- Agently Chat Widget -->\n<iframe id="agently-widget-${chatbotRow.id}" src="${apiUrl}/chatbot-widget/${chatbotRow.id}" style="position:fixed;bottom:20px;right:20px;width:420px;height:700px;max-width:90vw;max-height:90vh;border:none;background:transparent;z-index:1000000;overflow:hidden;" scrolling="no" frameborder="0" allow="microphone" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"></iframe>`;
+        await db
+          .from("chatbots")
+          .update({ embed_script: embedScript })
+          .eq("id", chatbotRow.id);
+        await db
+          .from("organizations")
+          .update({ active_chatbot_id: chatbotRow.id })
+          .eq("id", orgId);
       }
-    } catch (e) {
-      console.warn('Vapi sync failed during onboarding:', e.message);
+    } catch (chatbotErr) {
+      console.warn("Chatbot creation warning (non-fatal):", chatbotErr.message);
     }
-  }
 
-  // Create default chatbot with FAQs
-  const chatbotFaqs = faqs.map(f => ({ question: f.question, answer: f.answer }));
-  const { data: chatbotRow } = await db.from('chatbots').insert({
-    organization_id: orgId,
-    voice_agent_id: agentRow.id,
-    name: `${profile.name || 'My'} Chat Assistant`,
-    header_title: profile.name || 'Chat with us',
-    welcome_message: `Hello! Welcome to ${profile.name || 'our business'}. How can I help you today?`,
-    faqs: chatbotFaqs,
-    suggested_prompts: ['What are your hours?', 'How do I book?', 'What services do you offer?'],
-    is_active: true,
-  }).select().single();
-
-  if (chatbotRow) {
-    const apiUrl = (process.env.API_URL || '').replace(/\/$/, '');
-    const widgetUrl = `${apiUrl}/chatbot-widget/${chatbotRow.id}`;
-    const pos = chatbotRow.position || 'right';
-    const opp = pos === 'left' ? 'right' : 'left';
-    const embedScript = `<!-- Agently Chat Widget -->\n<iframe\n  id="agently-widget-${chatbotRow.id}"\n  src="${widgetUrl}"\n  style="position:fixed;bottom:20px;${pos}:20px;${opp}:auto;width:420px;height:700px;max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);border:none;background:transparent;z-index:2147483646;overflow:hidden;"\n  scrolling="no" frameborder="0" allow="microphone"\n  sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"\n  title="Chat widget"\n></iframe>`;
-
-    await db.from('chatbots').update({
-      widget_script_url: widgetUrl,
-      embed_script: embedScript,
-    }).eq('id', chatbotRow.id);
-
-    await db.from('organizations').update({ active_chatbot_id: chatbotRow.id }).eq('id', orgId);
-
-    // Also scrape and save knowledge chunks if website provided
-    if (profile.website && process.env.OPENAI_API_KEY) {
-      scrapeAndSave(orgId, chatbotRow.id, profile.website).catch(e =>
-        console.warn('Background scrape failed:', e.message)
-      );
-    }
-  }
-
-  const { data: updatedOrg } = await db.from('organizations').select('*').eq('id', orgId).single();
-  res.json(updatedOrg);
-}));
+    // Return updated org
+    const { data: updatedOrg } = await db
+      .from("organizations")
+      .select("*")
+      .eq("id", orgId)
+      .single();
+    res.json(updatedOrg);
+  }),
+);
 
 module.exports = router;

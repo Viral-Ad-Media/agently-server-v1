@@ -398,6 +398,11 @@ router.patch(
       updates.twilio_phone_number = body.twilioPhoneNumber;
     if (body.twilioPhoneSid !== undefined)
       updates.twilio_phone_sid = body.twilioPhoneSid;
+    if (body.webhookUrl !== undefined) updates.webhook_url = body.webhookUrl;
+    if (body.escalationWorkingHoursStart !== undefined)
+      updates.escalation_hours_start = body.escalationWorkingHoursStart;
+    if (body.escalationWorkingHoursEnd !== undefined)
+      updates.escalation_hours_end = body.escalationWorkingHoursEnd;
     updates.updated_at = new Date().toISOString();
 
     const { data: agent, error } = await db

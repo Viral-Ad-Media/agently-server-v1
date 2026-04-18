@@ -14,7 +14,7 @@ const {
   serializeMessage,
   serializeOrganization,
 } = require("../../lib/serializers");
-const { buildDashboard } = require("../../lib/dashboard");
+const { buildDashboard, buildAgentStats } = require("../../lib/dashboard");
 
 const router = express.Router();
 
@@ -97,12 +97,17 @@ router.get(
     const calls = callsResult.data || [];
     const messages = messagesResult.data || [];
 
-    // Find active agent for dashboard
-    const activeAgentRow =
-      agentRows.find((a) => a.id === org.active_voice_agent_id) ||
-      agentRows[0] ||
-      null;
-    const dashboard = buildDashboard(org, calls, leads, activeAgentRow);
+    // Build global dashboard (existing)
+    const dashboard = buildDashboard(org, calls, leads, agentRows[0] || null);
+
+    // Build per‑agent analytics
+    const agentStats = await buildAgentStats(
+      db,
+      orgId,
+      agentRows,
+      calls,
+      leads,
+    );
 
     const serializedOrg = serializeOrganization(
       org,
@@ -119,6 +124,7 @@ router.get(
       calls: calls.map(serializeCall),
       conversation: messages.map(serializeMessage),
       dashboard,
+      agentStats, // <-- new field for per‑agent analytics
     });
   }),
 );

@@ -6,11 +6,7 @@ const { v4: uuidv4 } = require("uuid");
 const { getSupabase } = require("../../lib/supabase");
 const { signToken } = require("../../lib/auth");
 const { serializeUser } = require("../../lib/serializers");
-const {
-  sendMagicLinkEmail,
-  sendTeamInviteEmail,
-  sendWelcomeEmail,
-} = require("../../lib/email");
+const { sendMagicLinkEmail, sendWelcomeEmail } = require("../../lib/email");
 const { requireAuth } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 
@@ -69,9 +65,11 @@ router.post(
     }
 
     if (password.length < 8) {
-      return res.status(400).json({
-        error: { message: "Password must be at least 8 characters." },
-      });
+      return res
+        .status(400)
+        .json({
+          error: { message: "Password must be at least 8 characters." },
+        });
     }
 
     const db = getSupabase();
@@ -84,9 +82,11 @@ router.post(
       .single();
 
     if (existing) {
-      return res.status(409).json({
-        error: { message: "An account with this email already exists." },
-      });
+      return res
+        .status(409)
+        .json({
+          error: { message: "An account with this email already exists." },
+        });
     }
 
     // Create organization
@@ -147,11 +147,15 @@ router.post(
       },
     ]);
 
-    // ── Send welcome email (non-blocking) ──────────────────────
+    // Send welcome email (non-blocking)
     try {
-      await sendWelcomeEmail(user.email, user.name, companyName);
+      await sendWelcomeEmail(
+        email.toLowerCase().trim(),
+        name.trim(),
+        companyName.trim(),
+      );
     } catch (emailErr) {
-      console.warn("Welcome email failed to send:", emailErr.message);
+      console.warn("Welcome email failed:", emailErr.message);
     }
 
     const token = signToken({ userId: user.id, orgId: org.id });
@@ -239,11 +243,13 @@ router.post(
     }
 
     if (new Date(linkRecord.expires_at) < new Date()) {
-      return res.status(400).json({
-        error: {
-          message: "This magic link has expired. Please request a new one.",
-        },
-      });
+      return res
+        .status(400)
+        .json({
+          error: {
+            message: "This magic link has expired. Please request a new one.",
+          },
+        });
     }
 
     // Mark token as used
@@ -311,6 +317,7 @@ router.post(
   requireAuth,
   asyncHandler(async (req, res) => {
     // JWT is stateless; client clears the token.
+    // We just acknowledge.
     res.json({ success: true });
   }),
 );
