@@ -33,13 +33,15 @@ function buildEmbed(chatbot, widgetUrl) {
 <iframe
   id="agently-widget-${chatbot.id}"
   src="${widgetUrl}"
-  style="position:fixed;bottom:20px;${pos === "left" ? "left:20px;right:auto" : "right:20px;left:auto"};width:420px;height:700px;max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);border:none;background:transparent;z-index:2147483646;overflow:hidden;"
+  style="position:fixed;bottom:20px;${pos === "left" ? "left:20px;right:auto" : "right:20px;left:auto"};width:420px;height:800px;max-width:90vw;max-height:90vh;border:none;background:transparent;z-index:2147483646;overflow:hidden;outline:none;display:block;visibility:visible;pointer-events:auto;"
   scrolling="no"
   frameborder="0"
   allow="microphone"
-  sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
+  sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads allow-storage-access-by-user-activation"
   referrerpolicy="no-referrer-when-downgrade"
-  loading="lazy"
+  loading="eager"
+  onload="console.info('Agently widget iframe loaded')"
+  onerror="this.style.display='none'; console.error('Agently widget iframe failed to load')"
   title="Chat widget"
 ></iframe>`;
 }
