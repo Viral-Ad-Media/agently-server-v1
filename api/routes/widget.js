@@ -6,6 +6,11 @@ const { asyncHandler } = require("../../middleware/error");
 
 const router = express.Router();
 
+function safeJSONForJS(obj) {
+  // JSON.stringify then escape single quotes and backslashes for JS string literal
+  return JSON.stringify(obj).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
 router.get(
   "/:id",
   asyncHandler(async (req, res) => {
@@ -26,24 +31,50 @@ router.get(
 </body></html>`);
     }
 
+    // Safely parse FAQs and suggested prompts
+    let faqs = [];
+    let prompts = [];
+    try {
+      if (chatbot.faqs) {
+        faqs =
+          typeof chatbot.faqs === "string"
+            ? JSON.parse(chatbot.faqs)
+            : chatbot.faqs;
+      }
+      if (chatbot.suggested_prompts) {
+        prompts =
+          typeof chatbot.suggested_prompts === "string"
+            ? JSON.parse(chatbot.suggested_prompts)
+            : chatbot.suggested_prompts;
+      }
+    } catch (e) {
+      console.error("Error parsing chatbot JSON:", e);
+    }
+
     const apiUrl = (process.env.API_URL || "").replace(/\/$/, "");
+
+    // Escape strings for safe HTML embedding
+    const escapeHtmlStr = (s) =>
+      String(s || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+
     const cfg = {
-      chatbotId: safeStr(id),
-      apiUrl: safeStr(apiUrl),
-      accentColor: safeStr(chatbot.accent_color || "#4f46e5"),
-      headerTitle: safeStr(chatbot.header_title || "Chat with us"),
-      welcomeMessage: safeStr(
+      chatbotId: escapeHtmlStr(id),
+      apiUrl: escapeHtmlStr(apiUrl),
+      accentColor: escapeHtmlStr(chatbot.accent_color || "#4f46e5"),
+      headerTitle: escapeHtmlStr(chatbot.header_title || "Chat with us"),
+      welcomeMessage: escapeHtmlStr(
         chatbot.welcome_message || "Hello! How can I help you today?",
       ),
-      placeholder: safeStr(chatbot.placeholder || "Type your message..."),
-      avatarLabel: safeStr(chatbot.avatar_label || "A"),
+      placeholder: escapeHtmlStr(chatbot.placeholder || "Type your message..."),
+      avatarLabel: escapeHtmlStr(chatbot.avatar_label || "A"),
       position: chatbot.position === "left" ? "left" : "right",
-      suggestedPrompts: JSON.stringify(
-        Array.isArray(chatbot.suggested_prompts)
-          ? chatbot.suggested_prompts
-          : [],
-      ),
-      faqs: JSON.stringify(Array.isArray(chatbot.faqs) ? chatbot.faqs : []),
+      suggestedPrompts: safeJSONForJS(prompts),
+      faqs: safeJSONForJS(faqs),
     };
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -57,21 +88,14 @@ router.get(
   }),
 );
 
-function safeStr(s) {
-  return String(s || "")
-    .replace(/\\/g, "\\\\")
-    .replace(/'/g, "\\'")
-    .replace(/\r?\n/g, "\\n")
-    .replace(/<\/script>/gi, "<\\/script>");
-}
-
 function buildWidgetHtml(cfg) {
+  // The widget HTML is large; we'll embed the script with the safe JSON
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>${cfg.headerTitle.replace(/\\'/g, "'").replace(/\\n/g, "")}</title>
+<title>${cfg.headerTitle}</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html,body{width:100%;height:100%;overflow:hidden;background:transparent;font-family:'Segoe UI',system-ui,-apple-system,sans-serif}
@@ -124,9 +148,9 @@ html,body{width:100%;height:100%;overflow:hidden;background:transparent;font-fam
 <body>
 <div id="cw" class="hide" role="dialog" aria-label="Chat window">
   <div class="hdr">
-    <div class="av" aria-hidden="true">${cfg.avatarLabel.replace(/\\'/g, "'")}</div>
+    <div class="av" aria-hidden="true">${cfg.avatarLabel}</div>
     <div class="ht">
-      <div class="hn">${cfg.headerTitle.replace(/\\'/g, "'").replace(/\\n/g, "")}</div>
+      <div class="hn">${cfg.headerTitle}</div>
       <div class="hs"><span class="dot"></span>Online · Instant replies</div>
     </div>
     <button class="xb" id="xb" aria-label="Close chat"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>
@@ -134,7 +158,7 @@ html,body{width:100%;height:100%;overflow:hidden;background:transparent;font-fam
   <div id="msgs" role="log" aria-live="polite" aria-label="Chat messages"></div>
   <div id="chips" role="list" aria-label="Suggested questions"></div>
   <div class="ir">
-    <textarea id="ci" placeholder="${cfg.placeholder.replace(/\\'/g, "'")}" rows="1" aria-label="Message input"></textarea>
+    <textarea id="ci" placeholder="${cfg.placeholder}" rows="1" aria-label="Message input"></textarea>
     <button id="sb" aria-label="Send message" disabled><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></button>
   </div>
   <div class="pw">Powered by <a href="https://agently.ai" target="_blank" rel="noopener">Agently</a></div>
