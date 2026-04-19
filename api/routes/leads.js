@@ -56,7 +56,7 @@ router.patch(
   requireAdmin,
   asyncHandler(async (req, res) => {
     const { id } = req.params;
-    const { name, phone, email, reason, status, tags } = req.body;
+    const { name, phone, email, reason, status, tags, voiceAgentId } = req.body;
 
     const db = getSupabase();
     const updates = {};
@@ -66,6 +66,7 @@ router.patch(
     if (reason !== undefined) updates.reason = reason;
     if (status !== undefined) updates.status = status;
     if (tags !== undefined) updates.tags = tags;
+    if (voiceAgentId !== undefined) updates.voice_agent_id = voiceAgentId;
     updates.updated_at = new Date().toISOString();
 
     const { data: lead, error } = await db
@@ -85,7 +86,6 @@ router.patch(
 );
 
 // ── PATCH /api/leads/bulk/tags ───────────────────────────────
-// Bulk assign tags to multiple leads
 router.patch(
   "/bulk/tags",
   requireAuth,
@@ -122,7 +122,7 @@ router.patch(
       } else if (action === "remove") {
         newTags = currentTags.filter((t) => !tags.includes(t));
       } else {
-        newTags = tags; // replace
+        newTags = tags;
       }
       await db
         .from("leads")
@@ -138,6 +138,65 @@ router.patch(
       .order("created_at", { ascending: false });
 
     res.json({ success: true, leads: updatedLeads.map(serializeLead) });
+  }),
+);
+
+// ── PATCH /api/leads/bulk/assign-agent ───────────────────────
+router.patch(
+  "/bulk/assign-agent",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const { ids, voiceAgentId } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res
+        .status(400)
+        .json({ error: { message: "ids array is required." } });
+    }
+    if (!voiceAgentId) {
+      return res
+        .status(400)
+        .json({ error: { message: "voiceAgentId is required." } });
+    }
+
+    const db = getSupabase();
+
+    // Verify agent belongs to this org
+    const { data: agent } = await db
+      .from("voice_agents")
+      .select("id")
+      .eq("id", voiceAgentId)
+      .eq("organization_id", req.orgId)
+      .single();
+
+    if (!agent) {
+      return res
+        .status(404)
+        .json({ error: { message: "Voice agent not found." } });
+    }
+
+    // Update leads
+    const { data: updatedLeads, error } = await db
+      .from("leads")
+      .update({
+        voice_agent_id: voiceAgentId,
+        updated_at: new Date().toISOString(),
+      })
+      .in("id", ids)
+      .eq("organization_id", req.orgId)
+      .select();
+
+    if (error) {
+      return res
+        .status(500)
+        .json({ error: { message: "Failed to assign agent." } });
+    }
+
+    res.json({
+      success: true,
+      updated: updatedLeads.length,
+      leads: updatedLeads.map(serializeLead),
+    });
   }),
 );
 
@@ -169,6 +228,7 @@ router.get(
       "Status",
       "Source",
       "Tags",
+      "Voice Agent ID",
       "Created At",
     ];
     const rows = (leads || []).map((l) =>
@@ -181,6 +241,7 @@ router.get(
         l.status || "new",
         l.source || "call",
         Array.isArray(l.tags) ? l.tags.join(",") : "",
+        l.voice_agent_id || "",
         new Date(l.created_at).toISOString(),
       ].join(","),
     );

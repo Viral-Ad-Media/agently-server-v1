@@ -14,19 +14,7 @@ const {
   serializeMessage,
   serializeOrganization,
 } = require("../../lib/serializers");
-
-// Try to import buildAgentStats, but provide a fallback if not available
-let buildAgentStats;
-try {
-  const dashboardLib = require("../../lib/dashboard");
-  buildAgentStats = dashboardLib.buildAgentStats;
-} catch (err) {
-  console.warn(
-    "[bootstrap] buildAgentStats not available, using empty stats:",
-    err.message,
-  );
-  buildAgentStats = async () => [];
-}
+const { buildDashboard, buildAgentStats } = require("../../lib/dashboard");
 
 const router = express.Router();
 
@@ -109,47 +97,17 @@ router.get(
     const calls = callsResult.data || [];
     const messages = messagesResult.data || [];
 
-    // Build global dashboard (using a simple inline function if dashboard module missing)
-    let dashboard;
-    try {
-      const { buildDashboard } = require("../../lib/dashboard");
-      dashboard = buildDashboard(org, calls, leads, agentRows[0] || null);
-    } catch (err) {
-      console.warn("[bootstrap] buildDashboard fallback:", err.message);
-      // Minimal dashboard fallback
-      dashboard = {
-        stats: {
-          totalCalls: calls.length,
-          leadsCaptured: leads.length,
-          missedCalls: 0,
-          avgDurationMinutes: 0,
-        },
-        weeklyFlow: [],
-        outcomeBreakdown: [],
-        recentCalls: calls.slice(0, 5).map(serializeCall),
-        recentLeads: leads.slice(0, 5).map(serializeLead),
-        usage: {
-          calls: org.usage_calls || 0,
-          minutes: org.usage_minutes || 0,
-          callLimit: org.call_limit || 100,
-          minuteLimit: org.minute_limit || 500,
-        },
-        agentStatus: {
-          online: !!agentRows[0],
-          agentName: agentRows[0]?.name || "No agent",
-          phoneNumber: agentRows[0]?.twilio_phone_number || "",
-          direction: agentRows[0]?.direction || "inbound",
-        },
-      };
-    }
+    // Build global dashboard
+    const dashboard = buildDashboard(org, calls, leads, agentRows[0] || null);
 
-    // Build per‑agent stats (safe fallback)
+    // Build per‑agent analytics (only if function exists, otherwise empty array)
     let agentStats = [];
-    try {
+    if (typeof buildAgentStats === "function") {
       agentStats = await buildAgentStats(db, orgId, agentRows, calls, leads);
-    } catch (err) {
-      console.error("[bootstrap] buildAgentStats error:", err.message);
-      agentStats = [];
+    } else {
+      console.warn(
+        "[bootstrap] buildAgentStats not available, skipping agent stats",
+      );
     }
 
     const serializedOrg = serializeOrganization(
