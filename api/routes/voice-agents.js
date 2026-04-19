@@ -6,6 +6,7 @@ const { requireAuth, requireAdmin } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 const { serializeAgent } = require("../../lib/serializers");
 const { updateNumberWebhooks } = require("../../lib/twilio");
+const { scrapeAndStore } = require("../../lib/scraper.service");
 
 const router = express.Router();
 
@@ -214,6 +215,51 @@ router.delete(
     }
 
     res.json({ success: true });
+  }),
+);
+
+
+// ── POST /api/voice-agents/:id/import-knowledge ─────────────
+router.post(
+  "/:id/import-knowledge",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const { website } = req.body || {};
+
+    if (!website?.trim()) {
+      return res
+        .status(400)
+        .json({ error: { message: "website URL is required." } });
+    }
+
+    const db = getSupabase();
+    const { data: agent } = await db
+      .from("voice_agents")
+      .select("id")
+      .eq("id", id)
+      .eq("organization_id", req.orgId)
+      .single();
+
+    if (!agent) {
+      return res
+        .status(404)
+        .json({ error: { message: "Voice agent not found." } });
+    }
+
+    const result = await scrapeAndStore({
+      url: website,
+      organizationId: req.orgId,
+      voiceAgentId: id,
+    });
+
+    res.json({
+      success: true,
+      chunksStored: result.chunksStored,
+      strategy: result.strategy,
+      message: `Imported ${result.chunksStored} knowledge chunks for this voice agent.`,
+    });
   }),
 );
 

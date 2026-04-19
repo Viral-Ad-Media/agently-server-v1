@@ -1,62 +1,140 @@
-"use strict";
+'use strict';
 
-const express = require("express");
-const { getSupabase } = require("../../lib/supabase");
-const { requireAuth, requireAdmin } = require("../../middleware/auth");
-const { asyncHandler } = require("../../middleware/error");
-const { serializeLead } = require("../../lib/serializers");
+const express = require('express');
+const { getSupabase } = require('../../lib/supabase');
+const { requireAuth, requireAdmin } = require('../../middleware/auth');
+const { asyncHandler } = require('../../middleware/error');
+const { serializeLead } = require('../../lib/serializers');
 
 const router = express.Router();
 
-// ── POST /api/leads ──────────────────────────────────────────
+function normalizeTags(tags) {
+  if (!Array.isArray(tags)) return [];
+  return [...new Set(tags.map((tag) => String(tag || '').trim()).filter(Boolean))];
+}
+
+function serializeSchedule(row) {
+  return {
+    id: row.id,
+    name: row.name || '',
+    targetType: row.target_type,
+    leadId: row.lead_id || '',
+    tag: row.tag || '',
+    voiceAgentId: row.voice_agent_id || '',
+    windows: Array.isArray(row.windows) ? row.windows : [],
+    timezone: row.timezone || 'America/New_York',
+    extraContext: row.extra_context || '',
+    isActive: row.is_active ?? true,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at || row.created_at,
+  };
+}
+
+function parseCsv(csv) {
+  const rows = [];
+  let current = '';
+  let row = [];
+  let inQuotes = false;
+
+  for (let index = 0; index < csv.length; index += 1) {
+    const char = csv[index];
+    const next = csv[index + 1];
+
+    if (char === '"') {
+      if (inQuotes && next === '"') {
+        current += '"';
+        index += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (char === ',' && !inQuotes) {
+      row.push(current);
+      current = '';
+      continue;
+    }
+
+    if ((char === '\n' || char === '\r') && !inQuotes) {
+      if (char === '\r' && next === '\n') index += 1;
+      row.push(current);
+      if (row.some((cell) => cell.trim() !== '')) rows.push(row);
+      row = [];
+      current = '';
+      continue;
+    }
+
+    current += char;
+  }
+
+  row.push(current);
+  if (row.some((cell) => cell.trim() !== '')) rows.push(row);
+  return rows;
+}
+
+function cell(row, index) {
+  if (index < 0) return '';
+  return String(row[index] || '').trim();
+}
+
+function parseScheduleWindows(windows) {
+  if (!Array.isArray(windows) || windows.length === 0) {
+    return [{ weekdays: ['mon', 'tue', 'wed', 'thu', 'fri'], time: '10:00' }];
+  }
+  return windows
+    .map((window) => ({
+      weekdays: Array.isArray(window?.weekdays)
+        ? [...new Set(window.weekdays.map((value) => String(value || '').toLowerCase()).filter(Boolean))]
+        : [],
+      time: String(window?.time || '10:00').slice(0, 5),
+    }))
+    .filter((window) => window.weekdays.length > 0 && /^\d{2}:\d{2}$/.test(window.time));
+}
+
 router.post(
-  "/",
+  '/',
   requireAuth,
   requireAdmin,
   asyncHandler(async (req, res) => {
-    const { name, phone, email, reason, status } = req.body;
-
+    const { name, phone, email, reason, status, tags, voiceAgentId, assignmentContext } = req.body || {};
     if (!name) {
-      return res
-        .status(400)
-        .json({ error: { message: "Lead name is required." } });
+      return res.status(400).json({ error: { message: 'Lead name is required.' } });
     }
 
     const db = getSupabase();
-
     const { data: lead, error } = await db
-      .from("leads")
+      .from('leads')
       .insert({
         organization_id: req.orgId,
         name: name.trim(),
-        phone: phone || "",
-        email: email || "",
-        reason: reason || "",
-        status: status || "new",
-        source: "manual",
-        tags: [],
+        phone: phone || '',
+        email: email || '',
+        reason: reason || '',
+        status: status || 'new',
+        source: 'manual',
+        tags: normalizeTags(tags),
+        voice_agent_id: voiceAgentId || null,
+        assignment_context: assignmentContext || '',
       })
       .select()
       .single();
 
     if (error) {
-      return res
-        .status(500)
-        .json({ error: { message: "Failed to create lead." } });
+      return res.status(500).json({ error: { message: error.message || 'Failed to create lead.' } });
     }
 
     res.status(201).json(serializeLead(lead));
   }),
 );
 
-// ── PATCH /api/leads/:id ─────────────────────────────────────
 router.patch(
-  "/:id",
+  '/:id',
   requireAuth,
   requireAdmin,
   asyncHandler(async (req, res) => {
     const { id } = req.params;
-    const { name, phone, email, reason, status, tags, voiceAgentId } = req.body;
+    const { name, phone, email, reason, status, tags, voiceAgentId, assignmentContext } = req.body || {};
 
     const db = getSupabase();
     const updates = {};
@@ -65,283 +143,432 @@ router.patch(
     if (email !== undefined) updates.email = email;
     if (reason !== undefined) updates.reason = reason;
     if (status !== undefined) updates.status = status;
-    if (tags !== undefined) updates.tags = tags;
-    if (voiceAgentId !== undefined) updates.voice_agent_id = voiceAgentId;
+    if (tags !== undefined) updates.tags = normalizeTags(tags);
+    if (voiceAgentId !== undefined) updates.voice_agent_id = voiceAgentId || null;
+    if (assignmentContext !== undefined) updates.assignment_context = assignmentContext || '';
     updates.updated_at = new Date().toISOString();
 
     const { data: lead, error } = await db
-      .from("leads")
+      .from('leads')
       .update(updates)
-      .eq("id", id)
-      .eq("organization_id", req.orgId)
+      .eq('id', id)
+      .eq('organization_id', req.orgId)
       .select()
       .single();
 
     if (error || !lead) {
-      return res.status(404).json({ error: { message: "Lead not found." } });
+      return res.status(404).json({ error: { message: 'Lead not found.' } });
     }
 
     res.json(serializeLead(lead));
   }),
 );
 
-// ── PATCH /api/leads/bulk/tags ───────────────────────────────
 router.patch(
-  "/bulk/tags",
+  '/bulk/tags',
   requireAuth,
   requireAdmin,
   asyncHandler(async (req, res) => {
-    const { ids, tags, action = "add" } = req.body;
+    const { ids, tags, action = 'add' } = req.body || {};
     if (!Array.isArray(ids) || ids.length === 0) {
-      return res
-        .status(400)
-        .json({ error: { message: "ids array is required." } });
+      return res.status(400).json({ error: { message: 'ids array is required.' } });
     }
-    if (!Array.isArray(tags) || tags.length === 0) {
-      return res
-        .status(400)
-        .json({ error: { message: "tags array is required." } });
+
+    const normalizedTags = normalizeTags(tags);
+    if (normalizedTags.length === 0) {
+      return res.status(400).json({ error: { message: 'tags array is required.' } });
     }
 
     const db = getSupabase();
     const { data: leads } = await db
-      .from("leads")
-      .select("id, tags")
-      .in("id", ids)
-      .eq("organization_id", req.orgId);
+      .from('leads')
+      .select('id, tags')
+      .in('id', ids)
+      .eq('organization_id', req.orgId);
 
     if (!leads || leads.length === 0) {
-      return res.status(404).json({ error: { message: "No leads found." } });
+      return res.status(404).json({ error: { message: 'No leads found.' } });
     }
 
     for (const lead of leads) {
-      let currentTags = Array.isArray(lead.tags) ? lead.tags : [];
-      let newTags;
-      if (action === "add") {
-        newTags = [...new Set([...currentTags, ...tags])];
-      } else if (action === "remove") {
-        newTags = currentTags.filter((t) => !tags.includes(t));
-      } else {
-        newTags = tags;
-      }
+      const currentTags = normalizeTags(lead.tags);
+      let nextTags = currentTags;
+      if (action === 'add') nextTags = normalizeTags([...currentTags, ...normalizedTags]);
+      if (action === 'remove') nextTags = currentTags.filter((tag) => !normalizedTags.includes(tag));
+      if (action === 'set') nextTags = normalizedTags;
       await db
-        .from("leads")
-        .update({ tags: newTags, updated_at: new Date().toISOString() })
-        .eq("id", lead.id);
+        .from('leads')
+        .update({ tags: nextTags, updated_at: new Date().toISOString() })
+        .eq('id', lead.id)
+        .eq('organization_id', req.orgId);
     }
 
-    // Return updated leads
     const { data: updatedLeads } = await db
-      .from("leads")
-      .select("*")
-      .in("id", ids)
-      .order("created_at", { ascending: false });
+      .from('leads')
+      .select('*')
+      .in('id', ids)
+      .eq('organization_id', req.orgId)
+      .order('created_at', { ascending: false });
 
-    res.json({ success: true, leads: updatedLeads.map(serializeLead) });
+    res.json({ success: true, leads: (updatedLeads || []).map(serializeLead) });
   }),
 );
 
-// ── PATCH /api/leads/bulk/assign-agent ───────────────────────
 router.patch(
-  "/bulk/assign-agent",
+  '/bulk/assign-agent',
   requireAuth,
   requireAdmin,
   asyncHandler(async (req, res) => {
-    const { ids, voiceAgentId } = req.body;
+    const { ids, voiceAgentId } = req.body || {};
     if (!Array.isArray(ids) || ids.length === 0) {
-      return res
-        .status(400)
-        .json({ error: { message: "ids array is required." } });
+      return res.status(400).json({ error: { message: 'ids array is required.' } });
     }
     if (!voiceAgentId) {
-      return res
-        .status(400)
-        .json({ error: { message: "voiceAgentId is required." } });
+      return res.status(400).json({ error: { message: 'voiceAgentId is required.' } });
     }
 
     const db = getSupabase();
-
-    // Verify agent belongs to this org
     const { data: agent } = await db
-      .from("voice_agents")
-      .select("id")
-      .eq("id", voiceAgentId)
-      .eq("organization_id", req.orgId)
+      .from('voice_agents')
+      .select('id')
+      .eq('id', voiceAgentId)
+      .eq('organization_id', req.orgId)
       .single();
 
     if (!agent) {
-      return res
-        .status(404)
-        .json({ error: { message: "Voice agent not found." } });
+      return res.status(404).json({ error: { message: 'Voice agent not found.' } });
     }
 
-    // Update leads
     const { data: updatedLeads, error } = await db
-      .from("leads")
+      .from('leads')
       .update({
         voice_agent_id: voiceAgentId,
         updated_at: new Date().toISOString(),
       })
-      .in("id", ids)
-      .eq("organization_id", req.orgId)
+      .in('id', ids)
+      .eq('organization_id', req.orgId)
       .select();
 
     if (error) {
-      return res
-        .status(500)
-        .json({ error: { message: "Failed to assign agent." } });
+      return res.status(500).json({ error: { message: error.message || 'Failed to assign agent.' } });
     }
 
     res.json({
       success: true,
-      updated: updatedLeads.length,
-      leads: updatedLeads.map(serializeLead),
+      updated: (updatedLeads || []).length,
+      leads: (updatedLeads || []).map(serializeLead),
     });
   }),
 );
 
-// ── GET /api/leads/export.csv ────────────────────────────────
-router.get(
-  "/export.csv",
-  requireAuth,
-  asyncHandler(async (req, res) => {
-    const db = getSupabase();
-
-    const { data: leads, error } = await db
-      .from("leads")
-      .select("*")
-      .eq("organization_id", req.orgId)
-      .order("created_at", { ascending: false });
-
-    if (error) {
-      return res
-        .status(500)
-        .json({ error: { message: "Failed to export leads." } });
-    }
-
-    const headers = [
-      "ID",
-      "Name",
-      "Phone",
-      "Email",
-      "Reason",
-      "Status",
-      "Source",
-      "Tags",
-      "Voice Agent ID",
-      "Created At",
-    ];
-    const rows = (leads || []).map((l) =>
-      [
-        l.id,
-        `"${(l.name || "").replace(/"/g, '""')}"`,
-        l.phone || "",
-        l.email || "",
-        `"${(l.reason || "").replace(/"/g, '""')}"`,
-        l.status || "new",
-        l.source || "call",
-        Array.isArray(l.tags) ? l.tags.join(",") : "",
-        l.voice_agent_id || "",
-        new Date(l.created_at).toISOString(),
-      ].join(","),
-    );
-
-    const csv = [headers.join(","), ...rows].join("\n");
-
-    res.setHeader("Content-Type", "text/csv");
-    res.setHeader(
-      "Content-Disposition",
-      'attachment; filename="agently-leads.csv"',
-    );
-    res.send(csv);
-  }),
-);
-
-// ── POST /api/leads/import-csv ───────────────────────────────
-router.post(
-  "/import-csv",
+router.patch(
+  '/bulk/assign-agent-by-tag',
   requireAuth,
   requireAdmin,
   asyncHandler(async (req, res) => {
-    const { csv } = req.body;
-    if (!csv || typeof csv !== "string") {
-      return res
-        .status(400)
-        .json({ error: { message: "csv field with CSV text is required." } });
+    const { tag, voiceAgentId } = req.body || {};
+    if (!tag) {
+      return res.status(400).json({ error: { message: 'tag is required.' } });
+    }
+    if (!voiceAgentId) {
+      return res.status(400).json({ error: { message: 'voiceAgentId is required.' } });
     }
 
     const db = getSupabase();
-    const orgId = req.orgId;
-    const lines = csv
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean);
-    if (lines.length < 2) {
-      return res.status(400).json({
-        error: {
-          message: "CSV must have a header row and at least one data row.",
-        },
-      });
+    const { data: agent } = await db
+      .from('voice_agents')
+      .select('id')
+      .eq('id', voiceAgentId)
+      .eq('organization_id', req.orgId)
+      .single();
+    if (!agent) {
+      return res.status(404).json({ error: { message: 'Voice agent not found.' } });
     }
 
-    const headers = lines[0]
-      .split(",")
-      .map((h) => h.replace(/"/g, "").trim().toLowerCase());
-    const idx = {
-      name: headers.findIndex((h) => h.includes("name")),
-      phone: headers.findIndex(
-        (h) => h.includes("phone") || h.includes("mobile"),
-      ),
-      email: headers.findIndex((h) => h.includes("email")),
-      reason: headers.findIndex(
-        (h) =>
-          h.includes("reason") || h.includes("note") || h.includes("message"),
-      ),
-      tags: headers.findIndex((h) => h.includes("tag")),
+    const { data: matchingLeads } = await db
+      .from('leads')
+      .select('*')
+      .eq('organization_id', req.orgId)
+      .contains('tags', [tag]);
+
+    if (!matchingLeads || matchingLeads.length === 0) {
+      return res.status(404).json({ error: { message: 'No leads found for that tag.' } });
+    }
+
+    const ids = matchingLeads.map((lead) => lead.id);
+    const { data: updatedLeads, error } = await db
+      .from('leads')
+      .update({ voice_agent_id: voiceAgentId, updated_at: new Date().toISOString() })
+      .in('id', ids)
+      .eq('organization_id', req.orgId)
+      .select();
+
+    if (error) {
+      return res.status(500).json({ error: { message: error.message || 'Failed to assign agent by tag.' } });
+    }
+
+    res.json({ success: true, updated: (updatedLeads || []).length, leads: (updatedLeads || []).map(serializeLead) });
+  }),
+);
+
+router.get(
+  '/schedules',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const { data, error } = await db
+      .from('lead_outreach_schedules')
+      .select('*')
+      .eq('organization_id', req.orgId)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      return res.status(500).json({ error: { message: error.message || 'Failed to load schedules.' } });
+    }
+
+    res.json({ schedules: (data || []).map(serializeSchedule) });
+  }),
+);
+
+router.post(
+  '/schedules',
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const {
+      name = '',
+      targetType,
+      leadIds = [],
+      tag = '',
+      voiceAgentId,
+      windows = [],
+      timezone = 'America/New_York',
+      extraContext = '',
+      syncExistingLeads = false,
+    } = req.body || {};
+
+    if (!voiceAgentId) {
+      return res.status(400).json({ error: { message: 'voiceAgentId is required.' } });
+    }
+    if (!['lead', 'tag'].includes(targetType)) {
+      return res.status(400).json({ error: { message: 'targetType must be lead or tag.' } });
+    }
+
+    const normalizedWindows = parseScheduleWindows(windows);
+    if (normalizedWindows.length === 0) {
+      return res.status(400).json({ error: { message: 'At least one valid schedule window is required.' } });
+    }
+
+    const db = getSupabase();
+    const { data: agent } = await db
+      .from('voice_agents')
+      .select('id')
+      .eq('id', voiceAgentId)
+      .eq('organization_id', req.orgId)
+      .single();
+    if (!agent) {
+      return res.status(404).json({ error: { message: 'Voice agent not found.' } });
+    }
+
+    let rows = [];
+    if (targetType === 'lead') {
+      if (!Array.isArray(leadIds) || leadIds.length === 0) {
+        return res.status(400).json({ error: { message: 'leadIds is required for lead schedules.' } });
+      }
+      rows = leadIds.map((leadId) => ({
+        organization_id: req.orgId,
+        voice_agent_id: voiceAgentId,
+        target_type: 'lead',
+        lead_id: leadId,
+        tag: '',
+        name,
+        windows: normalizedWindows,
+        timezone,
+        extra_context: extraContext || '',
+      }));
+    } else {
+      if (!String(tag || '').trim()) {
+        return res.status(400).json({ error: { message: 'tag is required for tag schedules.' } });
+      }
+      rows = [{
+        organization_id: req.orgId,
+        voice_agent_id: voiceAgentId,
+        target_type: 'tag',
+        lead_id: null,
+        tag: String(tag).trim(),
+        name,
+        windows: normalizedWindows,
+        timezone,
+        extra_context: extraContext || '',
+      }];
+    }
+
+    const { data, error } = await db.from('lead_outreach_schedules').insert(rows).select();
+    if (error) {
+      return res.status(500).json({ error: { message: error.message || 'Failed to create schedules.' } });
+    }
+
+    if (targetType === 'tag' && syncExistingLeads) {
+      await db
+        .from('leads')
+        .update({ voice_agent_id: voiceAgentId, updated_at: new Date().toISOString() })
+        .eq('organization_id', req.orgId)
+        .contains('tags', [String(tag).trim()]);
+    }
+
+    res.status(201).json({ schedules: (data || []).map(serializeSchedule) });
+  }),
+);
+
+router.patch(
+  '/schedules/:id',
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const body = req.body || {};
+    const updates = {};
+    if (body.name !== undefined) updates.name = body.name;
+    if (body.voiceAgentId !== undefined) updates.voice_agent_id = body.voiceAgentId || null;
+    if (body.windows !== undefined) updates.windows = parseScheduleWindows(body.windows);
+    if (body.timezone !== undefined) updates.timezone = body.timezone;
+    if (body.extraContext !== undefined) updates.extra_context = body.extraContext || '';
+    if (body.isActive !== undefined) updates.is_active = !!body.isActive;
+    updates.updated_at = new Date().toISOString();
+
+    const db = getSupabase();
+    const { data, error } = await db
+      .from('lead_outreach_schedules')
+      .update(updates)
+      .eq('id', id)
+      .eq('organization_id', req.orgId)
+      .select()
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({ error: { message: 'Schedule not found.' } });
+    }
+
+    res.json({ schedule: serializeSchedule(data) });
+  }),
+);
+
+router.delete(
+  '/schedules/:id',
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const db = getSupabase();
+    const { error } = await db
+      .from('lead_outreach_schedules')
+      .delete()
+      .eq('id', id)
+      .eq('organization_id', req.orgId);
+
+    if (error) {
+      return res.status(500).json({ error: { message: error.message || 'Failed to delete schedule.' } });
+    }
+
+    res.json({ success: true });
+  }),
+);
+
+router.get(
+  '/export.csv',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const { data: leads, error } = await db
+      .from('leads')
+      .select('*')
+      .eq('organization_id', req.orgId)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      return res.status(500).json({ error: { message: error.message || 'Failed to export leads.' } });
+    }
+
+    const headers = ['ID', 'Name', 'Phone', 'Email', 'Reason', 'Status', 'Source', 'Tags', 'Voice Agent ID', 'Assignment Context', 'Created At'];
+    const rows = (leads || []).map((lead) => [
+      lead.id,
+      `"${String(lead.name || '').replace(/"/g, '""')}"`,
+      lead.phone || '',
+      lead.email || '',
+      `"${String(lead.reason || '').replace(/"/g, '""')}"`,
+      lead.status || 'new',
+      lead.source || 'call',
+      normalizeTags(lead.tags).join('|'),
+      lead.voice_agent_id || '',
+      `"${String(lead.assignment_context || '').replace(/"/g, '""')}"`,
+      new Date(lead.created_at).toISOString(),
+    ].join(','));
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="agently-leads.csv"');
+    res.send([headers.join(','), ...rows].join('\n'));
+  }),
+);
+
+router.post(
+  '/import-csv',
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const { csv } = req.body || {};
+    if (!csv || typeof csv !== 'string') {
+      return res.status(400).json({ error: { message: 'csv field with CSV text is required.' } });
+    }
+
+    const rows = parseCsv(csv);
+    if (rows.length < 2) {
+      return res.status(400).json({ error: { message: 'CSV must have a header row and at least one data row.' } });
+    }
+
+    const headers = rows[0].map((header) => String(header || '').replace(/"/g, '').trim().toLowerCase());
+    const indexMap = {
+      name: headers.findIndex((header) => header.includes('name')),
+      phone: headers.findIndex((header) => header.includes('phone') || header.includes('mobile')),
+      email: headers.findIndex((header) => header.includes('email')),
+      reason: headers.findIndex((header) => header.includes('reason') || header.includes('note') || header.includes('message')),
+      tags: headers.findIndex((header) => header.includes('tag')),
+      voiceAgentId: headers.findIndex((header) => header.includes('voice agent') || header.includes('agent id')),
+      assignmentContext: headers.findIndex((header) => header.includes('context') || header.includes('assignment')),
     };
 
-    const parseCell = (row, i) =>
-      i >= 0 ? (row[i] || "").replace(/^"|"$/g, "").trim() : "";
+    const payload = rows.slice(1).map((row) => {
+      const tagsCell = cell(row, indexMap.tags);
+      const parsedTags = normalizeTags(tagsCell ? tagsCell.split(/[|;,]/g) : []);
+      return {
+        organization_id: req.orgId,
+        name: cell(row, indexMap.name) || 'Unknown',
+        phone: cell(row, indexMap.phone) || '',
+        email: cell(row, indexMap.email) || '',
+        reason: cell(row, indexMap.reason) || '',
+        tags: parsedTags,
+        voice_agent_id: cell(row, indexMap.voiceAgentId) || null,
+        assignment_context: cell(row, indexMap.assignmentContext) || '',
+        status: 'new',
+        source: 'csv_import',
+      };
+    }).filter((lead) => lead.name !== 'Unknown' || lead.phone || lead.email);
 
-    const rows = lines
-      .slice(1)
-      .map((line) => {
-        const cells = line.split(",");
-        const tagsStr = parseCell(cells, idx.tags);
-        let tags = [];
-        if (tagsStr) {
-          tags = tagsStr
-            .split("|")
-            .map((t) => t.trim())
-            .filter(Boolean);
-        }
-        return {
-          organization_id: orgId,
-          name: parseCell(cells, idx.name) || "Unknown",
-          phone: parseCell(cells, idx.phone) || "",
-          email: parseCell(cells, idx.email) || "",
-          reason: parseCell(cells, idx.reason) || "",
-          tags,
-          status: "new",
-          source: "csv_import",
-        };
-      })
-      .filter((r) => r.name !== "Unknown" || r.phone || r.email);
-
-    if (rows.length === 0) {
-      return res
-        .status(400)
-        .json({ error: { message: "No valid leads found in CSV." } });
+    if (payload.length === 0) {
+      return res.status(400).json({ error: { message: 'No valid leads found in CSV.' } });
     }
 
+    const db = getSupabase();
     let imported = 0;
-    for (let i = 0; i < rows.length; i += 100) {
-      const chunk = rows.slice(i, i + 100);
-      const { data } = await db.from("leads").insert(chunk).select("id");
+    for (let index = 0; index < payload.length; index += 100) {
+      const chunk = payload.slice(index, index + 100);
+      const { data, error } = await db.from('leads').insert(chunk).select('id');
+      if (error) {
+        return res.status(500).json({ error: { message: error.message || 'Failed while importing CSV leads.' } });
+      }
       imported += (data || []).length;
     }
 
-    res.json({ success: true, imported, total: rows.length });
+    res.json({ success: true, imported, total: payload.length });
   }),
 );
 

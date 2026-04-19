@@ -55,6 +55,8 @@ router.post(
           "What services do you offer?",
         ],
         faqs: body.faqs || [],
+        chat_voice: body.chatVoice || 'alloy',
+        chat_languages: body.chatLanguages || ['en'],
       })
       .select()
       .single();
@@ -106,6 +108,8 @@ router.patch(
     if (body.suggestedPrompts !== undefined)
       updates.suggested_prompts = body.suggestedPrompts;
     if (body.faqs !== undefined) updates.faqs = body.faqs;
+    if (body.chatVoice !== undefined) updates.chat_voice = body.chatVoice;
+    if (body.chatLanguages !== undefined) updates.chat_languages = body.chatLanguages;
     updates.updated_at = new Date().toISOString();
 
     // Always recompute embed script (position may have changed)
@@ -147,7 +151,7 @@ router.post(
     const db = getSupabase();
     const { data: chatbot } = await db
       .from("chatbots")
-      .select("id")
+      .select("id, voice_agent_id")
       .eq("id", id)
       .eq("organization_id", req.orgId)
       .single();
@@ -161,6 +165,7 @@ router.post(
       url: website,
       chatbotId: id,
       organizationId: req.orgId,
+      voiceAgentId: chatbot.voice_agent_id || null,
     });
 
     res.json({
@@ -183,7 +188,7 @@ router.post(
 
     const { data: chatbot } = await db
       .from("chatbots")
-      .select("id")
+      .select("id, voice_agent_id")
       .eq("id", id)
       .eq("organization_id", req.orgId)
       .single();

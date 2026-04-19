@@ -19,7 +19,6 @@ const leadsRoutes        = require('./routes/leads');
 const miscRoutes         = require('./routes/misc');
 const widgetRoutes       = require('./routes/widget');
 const chatbotPublicRoutes = require('./routes/chatbot-public');
-const vapiWebhookRoutes  = require('./routes/vapi-webhook');
 const twilioRoutes       = require('./routes/twilio');
 const { errorHandler }   = require('../middleware/error');
 
@@ -72,7 +71,6 @@ app.use('/api/messenger',      messengerRoutes);
 app.use('/api/calls',          callsRoutes);
 app.use('/api/leads',          leadsRoutes);
 app.use('/api/chatbot-public', chatbotPublicRoutes);
-app.use('/api/vapi',           vapiWebhookRoutes);
 app.use('/api/twilio',         twilioRoutes);          // ← NEW: all Twilio routes
 app.use('/api',                miscRoutes);            // team, billing, settings, contact
 

@@ -59,17 +59,39 @@ const WS_URL = () => {
 // ─────────────────────────────────────────────────────────────
 // Helper: lookup org + agent from a Twilio phone number
 // ─────────────────────────────────────────────────────────────
+function normalizePhone(value) {
+  return String(value || "").replace(/[^\d+]/g, "").trim();
+}
+
 async function lookupAgentByPhone(toPhone) {
   const db = getSupabase();
-  // Strip +, spaces, dashes for comparison flexibility
-  const { data: agent } = await db
+  const normalizedTarget = normalizePhone(toPhone);
+  if (!normalizedTarget) return null;
+
+  const exactCandidates = [normalizedTarget];
+  const digitsOnly = normalizedTarget.replace(/\D/g, "");
+  if (digitsOnly && !exactCandidates.includes(digitsOnly)) exactCandidates.push(digitsOnly);
+  if (digitsOnly && !exactCandidates.includes(`+${digitsOnly}`)) exactCandidates.push(`+${digitsOnly}`);
+
+  for (const candidate of exactCandidates) {
+    const { data: agent } = await db
+      .from("voice_agents")
+      .select("*, organizations(id, name)")
+      .eq("twilio_phone_number", candidate)
+      .maybeSingle();
+    if (agent) return agent;
+  }
+
+  const { data: agents } = await db
     .from("voice_agents")
     .select("*, organizations(id, name)")
-    .eq("twilio_phone_number", toPhone)
-    .eq("is_active", true)
-    .maybeSingle();
+    .not("twilio_phone_number", "is", null)
+    .neq("twilio_phone_number", "");
 
-  return agent;
+  return (agents || []).find((agent) => {
+    const agentPhone = normalizePhone(agent.twilio_phone_number);
+    return agentPhone === normalizedTarget || agentPhone.replace(/\D/g, "") === digitsOnly;
+  }) || null;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -131,9 +153,12 @@ router.get("/voice-inbound", handleInboundVoice);
 router.post(
   "/outbound-twiml",
   asyncHandler(async (req, res) => {
-    const callSid = req.body?.CallSid || "";
-    const toPhone = req.body?.To || "";
-    const fromPhone = req.body?.From || "";
+    const callSid = req.body?.CallSid || req.query?.CallSid || "";
+    const toPhone = req.body?.To || req.query?.To || "";
+    const fromPhone = req.body?.From || req.query?.From || "";
+    const leadId = req.body?.leadId || req.query?.leadId || "";
+    const scheduleId = req.body?.scheduleId || req.query?.scheduleId || "";
+    const extraContext = req.body?.extraContext || req.query?.extraContext || "";
 
     // Look up agent by the from number
     const agent = await lookupAgentByPhone(fromPhone);
@@ -145,7 +170,16 @@ router.post(
     }
 
     const wsBase = WS_URL();
-    const wsUrl = `${wsBase}/api/twilio/ws?orgId=${agent.organization_id}&agentId=${agent.id}&callSid=${callSid}&callerPhone=${encodeURIComponent(toPhone)}`;
+    const params = new URLSearchParams({
+      orgId: agent.organization_id,
+      agentId: agent.id,
+      callSid,
+      callerPhone: toPhone,
+    });
+    if (leadId) params.set('leadId', leadId);
+    if (scheduleId) params.set('scheduleId', scheduleId);
+    if (extraContext) params.set('extraContext', extraContext);
+    const wsUrl = `${wsBase}/api/twilio/ws?${params.toString()}`;
 
     const twiml = buildOutboundTwiml({ agentRow: agent, wsUrl });
     res.setHeader("Content-Type", "text/xml");
