@@ -257,8 +257,7 @@ router.post(
           header.includes("voice agent") || header.includes("agent id"),
       ),
       assignmentContext: headers.findIndex(
-        (header) =>
-          header.includes("context") || header.includes("assignment"),
+        (header) => header.includes("context") || header.includes("assignment"),
       ),
     };
 
@@ -294,10 +293,7 @@ router.post(
     let imported = 0;
     for (let index = 0; index < payload.length; index += 100) {
       const chunk = payload.slice(index, index + 100);
-      const { data, error } = await db
-        .from("leads")
-        .insert(chunk)
-        .select("id");
+      const { data, error } = await db.from("leads").insert(chunk).select("id");
       if (error) {
         return res.status(500).json({
           error: {
