@@ -103,6 +103,7 @@ function parseScheduleWindows(windows) {
     );
 }
 
+// ── POST /api/leads ────────────────────────────────────────────
 router.post(
   "/",
   requireAuth,
@@ -152,53 +153,163 @@ router.post(
   }),
 );
 
-router.patch(
-  "/:id",
+// ── GET /api/leads/export.csv ──────────────────────────────────
+// NOTE: Must be before /:id to avoid "export.csv" being treated as an id
+router.get(
+  "/export.csv",
   requireAuth,
-  requireAdmin,
   asyncHandler(async (req, res) => {
-    const { id } = req.params;
-    const {
-      name,
-      phone,
-      email,
-      reason,
-      status,
-      tags,
-      voiceAgentId,
-      assignmentContext,
-    } = req.body || {};
-
     const db = getSupabase();
-    const updates = {};
-    if (name !== undefined) updates.name = name;
-    if (phone !== undefined) updates.phone = phone;
-    if (email !== undefined) updates.email = email;
-    if (reason !== undefined) updates.reason = reason;
-    if (status !== undefined) updates.status = status;
-    if (tags !== undefined) updates.tags = normalizeTags(tags);
-    if (voiceAgentId !== undefined)
-      updates.voice_agent_id = voiceAgentId || null;
-    if (assignmentContext !== undefined)
-      updates.assignment_context = assignmentContext || "";
-    updates.updated_at = new Date().toISOString();
-
-    const { data: lead, error } = await db
+    const { data: leads, error } = await db
       .from("leads")
-      .update(updates)
-      .eq("id", id)
+      .select("*")
       .eq("organization_id", req.orgId)
-      .select()
-      .single();
+      .order("created_at", { ascending: false });
 
-    if (error || !lead) {
-      return res.status(404).json({ error: { message: "Lead not found." } });
+    if (error) {
+      return res.status(500).json({
+        error: { message: error.message || "Failed to export leads." },
+      });
     }
 
-    res.json(serializeLead(lead));
+    const headers = [
+      "ID",
+      "Name",
+      "Phone",
+      "Email",
+      "Reason",
+      "Status",
+      "Source",
+      "Tags",
+      "Voice Agent ID",
+      "Assignment Context",
+      "Created At",
+    ];
+    const rows = (leads || []).map((lead) =>
+      [
+        lead.id,
+        `"${String(lead.name || "").replace(/"/g, '""')}"`,
+        lead.phone || "",
+        lead.email || "",
+        `"${String(lead.reason || "").replace(/"/g, '""')}"`,
+        lead.status || "new",
+        lead.source || "call",
+        normalizeTags(lead.tags).join("|"),
+        lead.voice_agent_id || "",
+        `"${String(lead.assignment_context || "").replace(/"/g, '""')}"`,
+        new Date(lead.created_at).toISOString(),
+      ].join(","),
+    );
+
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader(
+      "Content-Disposition",
+      'attachment; filename="agently-leads.csv"',
+    );
+    res.send([headers.join(","), ...rows].join("\n"));
   }),
 );
 
+// ── POST /api/leads/import-csv ─────────────────────────────────
+// NOTE: Must be before /:id
+router.post(
+  "/import-csv",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const { csv } = req.body || {};
+    if (!csv || typeof csv !== "string") {
+      return res
+        .status(400)
+        .json({ error: { message: "csv field with CSV text is required." } });
+    }
+
+    const rows = parseCsv(csv);
+    if (rows.length < 2) {
+      return res.status(400).json({
+        error: {
+          message: "CSV must have a header row and at least one data row.",
+        },
+      });
+    }
+
+    const headers = rows[0].map((header) =>
+      String(header || "")
+        .replace(/"/g, "")
+        .trim()
+        .toLowerCase(),
+    );
+    const indexMap = {
+      name: headers.findIndex((header) => header.includes("name")),
+      phone: headers.findIndex(
+        (header) => header.includes("phone") || header.includes("mobile"),
+      ),
+      email: headers.findIndex((header) => header.includes("email")),
+      reason: headers.findIndex(
+        (header) =>
+          header.includes("reason") ||
+          header.includes("note") ||
+          header.includes("message"),
+      ),
+      tags: headers.findIndex((header) => header.includes("tag")),
+      voiceAgentId: headers.findIndex(
+        (header) =>
+          header.includes("voice agent") || header.includes("agent id"),
+      ),
+      assignmentContext: headers.findIndex(
+        (header) => header.includes("context") || header.includes("assignment"),
+      ),
+    };
+
+    const payload = rows
+      .slice(1)
+      .map((row) => {
+        const tagsCell = cell(row, indexMap.tags);
+        const parsedTags = normalizeTags(
+          tagsCell ? tagsCell.split(/[|;,]/g) : [],
+        );
+        return {
+          organization_id: req.orgId,
+          name: cell(row, indexMap.name) || "Unknown",
+          phone: cell(row, indexMap.phone) || "",
+          email: cell(row, indexMap.email) || "",
+          reason: cell(row, indexMap.reason) || "",
+          tags: parsedTags,
+          voice_agent_id: cell(row, indexMap.voiceAgentId) || null,
+          assignment_context: cell(row, indexMap.assignmentContext) || "",
+          status: "new",
+          source: "csv_import",
+        };
+      })
+      .filter((lead) => lead.name !== "Unknown" || lead.phone || lead.email);
+
+    if (payload.length === 0) {
+      return res
+        .status(400)
+        .json({ error: { message: "No valid leads found in CSV." } });
+    }
+
+    const db = getSupabase();
+    let imported = 0;
+    for (let index = 0; index < payload.length; index += 100) {
+      const chunk = payload.slice(index, index + 100);
+      const { data, error } = await db.from("leads").insert(chunk).select("id");
+      if (error) {
+        return res.status(500).json({
+          error: {
+            message: error.message || "Failed while importing CSV leads.",
+          },
+        });
+      }
+      imported += (data || []).length;
+    }
+
+    res.json({ success: true, imported, total: payload.length });
+  }),
+);
+
+// ── PATCH /api/leads/bulk/tags ─────────────────────────────────
+// NOTE: All /bulk/* routes MUST be before PATCH /:id
 router.patch(
   "/bulk/tags",
   requireAuth,
@@ -255,6 +366,7 @@ router.patch(
   }),
 );
 
+// ── PATCH /api/leads/bulk/assign-agent ────────────────────────
 router.patch(
   "/bulk/assign-agent",
   requireAuth,
@@ -310,6 +422,7 @@ router.patch(
   }),
 );
 
+// ── PATCH /api/leads/bulk/assign-agent-by-tag ─────────────────
 router.patch(
   "/bulk/assign-agent-by-tag",
   requireAuth,
@@ -363,7 +476,9 @@ router.patch(
 
     if (error) {
       return res.status(500).json({
-        error: { message: error.message || "Failed to assign agent by tag." },
+        error: {
+          message: error.message || "Failed to assign agent by tag.",
+        },
       });
     }
 
@@ -375,6 +490,38 @@ router.patch(
   }),
 );
 
+// ── DELETE /api/leads/bulk ─────────────────────────────────────
+// FIX: MUST be before DELETE /:id — otherwise "bulk" is treated as an id
+router.delete(
+  "/bulk",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const { ids } = req.body || {};
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res
+        .status(400)
+        .json({ error: { message: "ids array is required." } });
+    }
+
+    const db = getSupabase();
+    const { error } = await db
+      .from("leads")
+      .delete()
+      .in("id", ids)
+      .eq("organization_id", req.orgId);
+
+    if (error) {
+      return res.status(500).json({
+        error: { message: error.message || "Failed to delete leads." },
+      });
+    }
+    res.json({ success: true, deleted: ids.length });
+  }),
+);
+
+// ── GET /api/leads/schedules ───────────────────────────────────
+// NOTE: Must be before /:id
 router.get(
   "/schedules",
   requireAuth,
@@ -396,6 +543,7 @@ router.get(
   }),
 );
 
+// ── POST /api/leads/schedules ──────────────────────────────────
 router.post(
   "/schedules",
   requireAuth,
@@ -508,6 +656,7 @@ router.post(
   }),
 );
 
+// ── PATCH /api/leads/schedules/:id ────────────────────────────
 router.patch(
   "/schedules/:id",
   requireAuth,
@@ -546,6 +695,7 @@ router.patch(
   }),
 );
 
+// ── DELETE /api/leads/schedules/:id ───────────────────────────
 router.delete(
   "/schedules/:id",
   requireAuth,
@@ -569,158 +719,57 @@ router.delete(
   }),
 );
 
-router.get(
-  "/export.csv",
-  requireAuth,
-  asyncHandler(async (req, res) => {
-    const db = getSupabase();
-    const { data: leads, error } = await db
-      .from("leads")
-      .select("*")
-      .eq("organization_id", req.orgId)
-      .order("created_at", { ascending: false });
-
-    if (error) {
-      return res.status(500).json({
-        error: { message: error.message || "Failed to export leads." },
-      });
-    }
-
-    const headers = [
-      "ID",
-      "Name",
-      "Phone",
-      "Email",
-      "Reason",
-      "Status",
-      "Source",
-      "Tags",
-      "Voice Agent ID",
-      "Assignment Context",
-      "Created At",
-    ];
-    const rows = (leads || []).map((lead) =>
-      [
-        lead.id,
-        `"${String(lead.name || "").replace(/"/g, '""')}"`,
-        lead.phone || "",
-        lead.email || "",
-        `"${String(lead.reason || "").replace(/"/g, '""')}"`,
-        lead.status || "new",
-        lead.source || "call",
-        normalizeTags(lead.tags).join("|"),
-        lead.voice_agent_id || "",
-        `"${String(lead.assignment_context || "").replace(/"/g, '""')}"`,
-        new Date(lead.created_at).toISOString(),
-      ].join(","),
-    );
-
-    res.setHeader("Content-Type", "text/csv");
-    res.setHeader(
-      "Content-Disposition",
-      'attachment; filename="agently-leads.csv"',
-    );
-    res.send([headers.join(","), ...rows].join("\n"));
-  }),
-);
-
-router.post(
-  "/import-csv",
+// ── PATCH /api/leads/:id ───────────────────────────────────────
+// NOTE: Wildcard — must come AFTER all named PATCH routes
+router.patch(
+  "/:id",
   requireAuth,
   requireAdmin,
   asyncHandler(async (req, res) => {
-    const { csv } = req.body || {};
-    if (!csv || typeof csv !== "string") {
-      return res
-        .status(400)
-        .json({ error: { message: "csv field with CSV text is required." } });
-    }
-
-    const rows = parseCsv(csv);
-    if (rows.length < 2) {
-      return res.status(400).json({
-        error: {
-          message: "CSV must have a header row and at least one data row.",
-        },
-      });
-    }
-
-    const headers = rows[0].map((header) =>
-      String(header || "")
-        .replace(/"/g, "")
-        .trim()
-        .toLowerCase(),
-    );
-    const indexMap = {
-      name: headers.findIndex((header) => header.includes("name")),
-      phone: headers.findIndex(
-        (header) => header.includes("phone") || header.includes("mobile"),
-      ),
-      email: headers.findIndex((header) => header.includes("email")),
-      reason: headers.findIndex(
-        (header) =>
-          header.includes("reason") ||
-          header.includes("note") ||
-          header.includes("message"),
-      ),
-      tags: headers.findIndex((header) => header.includes("tag")),
-      voiceAgentId: headers.findIndex(
-        (header) =>
-          header.includes("voice agent") || header.includes("agent id"),
-      ),
-      assignmentContext: headers.findIndex(
-        (header) => header.includes("context") || header.includes("assignment"),
-      ),
-    };
-
-    const payload = rows
-      .slice(1)
-      .map((row) => {
-        const tagsCell = cell(row, indexMap.tags);
-        const parsedTags = normalizeTags(
-          tagsCell ? tagsCell.split(/[|;,]/g) : [],
-        );
-        return {
-          organization_id: req.orgId,
-          name: cell(row, indexMap.name) || "Unknown",
-          phone: cell(row, indexMap.phone) || "",
-          email: cell(row, indexMap.email) || "",
-          reason: cell(row, indexMap.reason) || "",
-          tags: parsedTags,
-          voice_agent_id: cell(row, indexMap.voiceAgentId) || null,
-          assignment_context: cell(row, indexMap.assignmentContext) || "",
-          status: "new",
-          source: "csv_import",
-        };
-      })
-      .filter((lead) => lead.name !== "Unknown" || lead.phone || lead.email);
-
-    if (payload.length === 0) {
-      return res
-        .status(400)
-        .json({ error: { message: "No valid leads found in CSV." } });
-    }
+    const { id } = req.params;
+    const {
+      name,
+      phone,
+      email,
+      reason,
+      status,
+      tags,
+      voiceAgentId,
+      assignmentContext,
+    } = req.body || {};
 
     const db = getSupabase();
-    let imported = 0;
-    for (let index = 0; index < payload.length; index += 100) {
-      const chunk = payload.slice(index, index + 100);
-      const { data, error } = await db.from("leads").insert(chunk).select("id");
-      if (error) {
-        return res.status(500).json({
-          error: {
-            message: error.message || "Failed while importing CSV leads.",
-          },
-        });
-      }
-      imported += (data || []).length;
+    const updates = {};
+    if (name !== undefined) updates.name = name;
+    if (phone !== undefined) updates.phone = phone;
+    if (email !== undefined) updates.email = email;
+    if (reason !== undefined) updates.reason = reason;
+    if (status !== undefined) updates.status = status;
+    if (tags !== undefined) updates.tags = normalizeTags(tags);
+    if (voiceAgentId !== undefined)
+      updates.voice_agent_id = voiceAgentId || null;
+    if (assignmentContext !== undefined)
+      updates.assignment_context = assignmentContext || "";
+    updates.updated_at = new Date().toISOString();
+
+    const { data: lead, error } = await db
+      .from("leads")
+      .update(updates)
+      .eq("id", id)
+      .eq("organization_id", req.orgId)
+      .select()
+      .single();
+
+    if (error || !lead) {
+      return res.status(404).json({ error: { message: "Lead not found." } });
     }
 
-    res.json({ success: true, imported, total: payload.length });
+    res.json(serializeLead(lead));
   }),
 );
 
 // ── DELETE /api/leads/:id ──────────────────────────────────────
+// NOTE: Wildcard — must come AFTER DELETE /bulk and DELETE /schedules/:id
 router.delete(
   "/:id",
   requireAuth,
@@ -740,35 +789,6 @@ router.delete(
       });
     }
     res.json({ success: true });
-  }),
-);
-
-// ── DELETE /api/leads/bulk ──────────────────────────────────────
-router.delete(
-  "/bulk",
-  requireAuth,
-  requireAdmin,
-  asyncHandler(async (req, res) => {
-    const { ids } = req.body || {};
-    if (!Array.isArray(ids) || ids.length === 0) {
-      return res
-        .status(400)
-        .json({ error: { message: "ids array is required." } });
-    }
-
-    const db = getSupabase();
-    const { error } = await db
-      .from("leads")
-      .delete()
-      .in("id", ids)
-      .eq("organization_id", req.orgId);
-
-    if (error) {
-      return res.status(500).json({
-        error: { message: error.message || "Failed to delete leads." },
-      });
-    }
-    res.json({ success: true, deleted: ids.length });
   }),
 );
 
