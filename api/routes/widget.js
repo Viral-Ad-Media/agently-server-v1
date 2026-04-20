@@ -27,31 +27,32 @@ router.get(
     }
 
     const apiUrl = (process.env.API_URL || "").replace(/\/$/, "");
+
+    // FIX: read lang/voice from query params (set by embed script) or fall back to DB values
+    const queryLangs = req.query.langs ? req.query.langs.split(',').filter(Boolean) : null;
+    const queryVoice = req.query.voice || null;
+
+    const chatLanguages = queryLangs || (Array.isArray(chatbot.chat_languages) ? chatbot.chat_languages : ['en']);
+    const chatVoice = queryVoice || chatbot.chat_voice || 'alloy';
+
     const cfg = {
       chatbotId: safeStr(id),
       apiUrl: safeStr(apiUrl),
       accentColor: safeStr(chatbot.accent_color || "#4f46e5"),
       headerTitle: safeStr(chatbot.header_title || "Chat with us"),
-      welcomeMessage: safeStr(
-        chatbot.welcome_message || "Hello! How can I help you today?",
-      ),
+      welcomeMessage: safeStr(chatbot.welcome_message || "Hello! How can I help you today?"),
       placeholder: safeStr(chatbot.placeholder || "Type your message..."),
       avatarLabel: safeStr(chatbot.avatar_label || "A"),
       position: chatbot.position === "left" ? "left" : "right",
-      suggestedPrompts: JSON.stringify(
-        Array.isArray(chatbot.suggested_prompts)
-          ? chatbot.suggested_prompts
-          : [],
-      ),
+      suggestedPrompts: JSON.stringify(Array.isArray(chatbot.suggested_prompts) ? chatbot.suggested_prompts : []),
       faqs: JSON.stringify(Array.isArray(chatbot.faqs) ? chatbot.faqs : []),
+      chatLanguages: JSON.stringify(chatLanguages),
+      chatVoice: safeStr(chatVoice),
     };
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("X-Frame-Options", "ALLOWALL");
-    res.setHeader(
-      "Content-Security-Policy",
-      "frame-ancestors *; default-src 'self' 'unsafe-inline' 'unsafe-eval' https:;",
-    );
+    res.setHeader("Content-Security-Policy", "frame-ancestors *; default-src 'self' 'unsafe-inline' 'unsafe-eval' https:;");
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     res.send(buildWidgetHtml(cfg));
   }),
@@ -65,6 +66,12 @@ function safeStr(s) {
     .replace(/<\/script>/gi, "<\\/script>");
 }
 
+const LANG_NAMES = {
+  en: 'English', es: 'Español', fr: 'Français', de: 'Deutsch',
+  it: 'Italiano', pt: 'Português', ar: 'العربية', zh: '中文',
+  ja: '日本語', ko: '한국어', hi: 'हिन्दी', nl: 'Nederlands',
+};
+
 function buildWidgetHtml(cfg) {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -74,12 +81,15 @@ function buildWidgetHtml(cfg) {
 <title>${cfg.headerTitle.replace(/\\'/g, "'").replace(/\\n/g, "")}</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-html,body{width:100%;height:100%;overflow:hidden;background:transparent !important;font-family:'Segoe UI',system-ui,-apple-system,sans-serif} body{margin:0!important;padding:0!important;display:block!important;visibility:visible!important} body>*:not(#agently-root):not(script){display:none!important}
+html,body{width:100%;height:100%;overflow:hidden;background:transparent !important;font-family:'Segoe UI',system-ui,-apple-system,sans-serif}
+body{margin:0!important;padding:0!important;display:block!important;visibility:visible!important}
+body>*:not(#agently-root):not(script){display:none!important}
 :root{--a:${cfg.accentColor};--ad:${cfg.accentColor}cc;--al:${cfg.accentColor}18}
-#agently-root{position:absolute!important;bottom:20px!important;${cfg.position}:20px!important;left:auto;right:auto;width:420px;height:800px;max-width:90vw;max-height:90vh;overflow:visible;display:block!important;visibility:visible!important;z-index:2147483647} #launcher{position:absolute;bottom:0;${cfg.position}:20px;width:56px;height:56px;background:var(--a);border-radius:50%;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(0,0,0,.22);color:#fff;z-index:2147483646;transition:transform .2s,box-shadow .2s;}
+#agently-root{position:absolute!important;bottom:20px!important;${cfg.position}:20px!important;left:auto;right:auto;width:420px;height:800px;max-width:90vw;max-height:90vh;overflow:visible;display:block!important;visibility:visible!important;z-index:2147483647}
+#launcher{position:absolute;bottom:0;${cfg.position}:20px;width:56px;height:56px;background:var(--a);border-radius:50%;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(0,0,0,.22);color:#fff;z-index:2147483646;transition:transform .2s,box-shadow .2s;}
 #launcher:hover{transform:scale(1.08);box-shadow:0 6px 24px rgba(0,0,0,.28)}
 #launcher svg{pointer-events:none}
-#cw{position:absolute;bottom:68px;${cfg.position}:16px;width:370px;max-width:calc(100vw - 32px);height:560px;max-height:calc(100vh - 104px);background:#fff;border-radius:20px;box-shadow:0 12px 48px rgba(0,0,0,.18),0 2px 8px rgba(0,0,0,.08);display:flex;flex-direction:column;overflow:hidden;z-index:2147483647;transform-origin:bottom ${cfg.position};transition:transform .25s cubic-bezier(.34,1.56,.64,1),opacity .2s;}
+#cw{position:absolute;bottom:68px;${cfg.position}:16px;width:370px;max-width:calc(100vw - 32px);height:580px;max-height:calc(100vh - 104px);background:#fff;border-radius:20px;box-shadow:0 12px 48px rgba(0,0,0,.18),0 2px 8px rgba(0,0,0,.08);display:flex;flex-direction:column;overflow:hidden;z-index:2147483647;transform-origin:bottom ${cfg.position};transition:transform .25s cubic-bezier(.34,1.56,.64,1),opacity .2s;}
 #cw.hide{transform:scale(.85) translateY(12px);opacity:0;pointer-events:none}
 .hdr{background:var(--a);color:#fff;padding:14px 16px;display:flex;align-items:center;gap:11px;flex-shrink:0;}
 .av{width:36px;height:36px;border-radius:50%;background:rgba(255,255,255,.22);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:14px;flex-shrink:0;letter-spacing:-.02em;}
@@ -89,15 +99,26 @@ html,body{width:100%;height:100%;overflow:hidden;background:transparent !importa
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
 .xb{background:none;border:none;color:#fff;cursor:pointer;padding:6px;border-radius:8px;display:flex;align-items:center;justify-content:center;opacity:.8;transition:opacity .2s,background .2s;margin-left:4px}
 .xb:hover{opacity:1;background:rgba(255,255,255,.15)}
+/* Language bar */
+#lang-bar{display:flex;gap:6px;padding:8px 12px;border-bottom:1px solid #eef2f7;background:#f8fafc;flex-shrink:0;overflow-x:auto;align-items:center;}
+#lang-bar:empty{display:none}
+#lang-bar::-webkit-scrollbar{display:none}
+.lang-btn{white-space:nowrap;background:#fff;border:1.5px solid #e2e8f0;border-radius:999px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer;color:#374151;transition:border-color .15s,color .15s,background .15s;flex-shrink:0;}
+.lang-btn.active{border-color:var(--a);color:var(--a);background:var(--al)}
+.lang-lbl{font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-right:2px;flex-shrink:0}
 #msgs{flex:1;overflow-y:auto;padding:14px 14px 8px;display:flex;flex-direction:column;gap:10px;background:#f8fafc;scroll-behavior:smooth;}
 #msgs::-webkit-scrollbar{width:4px}
 #msgs::-webkit-scrollbar-thumb{background:#e2e8f0;border-radius:4px}
 .bubble{max-width:84%;display:flex;flex-direction:column}
 .bubble.bot{align-self:flex-start}
 .bubble.usr{align-self:flex-end;align-items:flex-end}
-.btext{padding:10px 14px;border-radius:18px;font-size:13.5px;line-height:1.55;word-break:break-word;}
+.btext{padding:10px 14px;border-radius:18px;font-size:13.5px;line-height:1.6;word-break:break-word;}
 .bot .btext{background:#fff;border:1px solid #e8edf2;border-bottom-left-radius:4px;color:#1e293b;}
 .usr .btext{background:var(--a);color:#fff;border-bottom-right-radius:4px;}
+.btext p{margin:0 0 8px}.btext p:last-child{margin-bottom:0}
+.btext ul,.btext ol{margin:6px 0 6px 18px;padding:0}
+.btext li{margin-bottom:3px}
+.btext a{color:inherit;text-decoration:underline}
 .btime{font-size:10px;color:#94a3b8;margin-top:3px;padding:0 4px}
 .typing .btext{padding:12px 16px}
 .tdots{display:flex;gap:4px;align-items:center}
@@ -132,6 +153,7 @@ html,body{width:100%;height:100%;overflow:hidden;background:transparent !importa
     </div>
     <button class="xb" id="xb" aria-label="Close chat"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>
   </div>
+  <div id="lang-bar" role="list" aria-label="Language selector"></div>
   <div id="msgs" role="log" aria-live="polite" aria-label="Chat messages"></div>
   <div id="chips" role="list" aria-label="Suggested questions"></div>
   <div class="ir">
@@ -148,13 +170,18 @@ html,body{width:100%;height:100%;overflow:hidden;background:transparent !importa
 <script>
 (function() {
   'use strict';
-  console.log('Agently widget script loaded'); window.addEventListener('error', function(e){ console.error('Agently widget runtime error', e && e.message ? e.message : e); });
+  console.log('Agently widget script loaded');
+  window.addEventListener('error', function(e){ console.error('Agently widget runtime error', e && e.message ? e.message : e); });
+
   var CID = '${cfg.chatbotId}';
   var API = '${cfg.apiUrl}';
   var WELCOME = '${cfg.welcomeMessage}';
   var FAQS = ${cfg.faqs};
   var PROMPTS = ${cfg.suggestedPrompts};
+  var LANGUAGES = ${cfg.chatLanguages};
+  var LANG_NAMES = ${JSON.stringify(LANG_NAMES)};
 
+  var currentLang = LANGUAGES[0] || 'en';
   var isOpen = false;
   var greeted = false;
   var sending = false;
@@ -169,12 +196,33 @@ html,body{width:100%;height:100%;overflow:hidden;background:transparent !importa
   var sb = document.getElementById('sb');
   var icoChat = document.getElementById('ico-chat');
   var icoClose = document.getElementById('ico-close');
+  var langBar = document.getElementById('lang-bar');
 
-  if (!cw || !launcher) {
-    console.error('Critical elements missing');
-    return;
+  if (!cw || !launcher) { console.error('Critical elements missing'); return; }
+
+  /* ── Language bar ── */
+  if (LANGUAGES.length > 1) {
+    var lbl = document.createElement('span');
+    lbl.className = 'lang-lbl';
+    lbl.textContent = 'Lang:';
+    langBar.appendChild(lbl);
+
+    LANGUAGES.forEach(function(code) {
+      var btn = document.createElement('button');
+      btn.className = 'lang-btn' + (code === currentLang ? ' active' : '');
+      btn.textContent = LANG_NAMES[code] || code.toUpperCase();
+      btn.dataset.lang = code;
+      btn.onclick = function() {
+        currentLang = code;
+        langBar.querySelectorAll('.lang-btn').forEach(function(b) {
+          b.classList.toggle('active', b.dataset.lang === code);
+        });
+      };
+      langBar.appendChild(btn);
+    });
   }
 
+  /* ── Suggested prompts ── */
   PROMPTS.forEach(function(p) {
     var btn = document.createElement('button');
     btn.className = 'chip';
@@ -186,20 +234,13 @@ html,body{width:100%;height:100%;overflow:hidden;background:transparent !importa
   var sessionLoaded = false;
 
   function toggle() {
-    console.log('toggle called, isOpen:', isOpen);
     isOpen = !isOpen;
     cw.classList.toggle('hide', !isOpen);
     launcher.setAttribute('aria-expanded', String(isOpen));
     icoChat.style.display = isOpen ? 'none' : '';
     icoClose.style.display = isOpen ? '' : 'none';
-    if (isOpen && !sessionLoaded) {
-      sessionLoaded = true;
-      loadSession();
-    }
-    if (isOpen && !greeted) {
-      greeted = true;
-      setTimeout(function() { addBotMsg(WELCOME); }, 200);
-    }
+    if (isOpen && !sessionLoaded) { sessionLoaded = true; loadSession(); }
+    if (isOpen && !greeted) { greeted = true; setTimeout(function() { addBotMsg(WELCOME); }, 200); }
     if (isOpen) { setTimeout(function() { ci.focus(); }, 250); }
   }
 
@@ -212,10 +253,7 @@ html,body{width:100%;height:100%;overflow:hidden;background:transparent !importa
     sb.disabled = !this.value.trim();
   };
   ci.onkeydown = function(e) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      if (!sb.disabled) sendMessage();
-    }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!sb.disabled) sendMessage(); }
   };
   sb.onclick = function() { sendMessage(); };
 
@@ -223,20 +261,49 @@ html,body{width:100%;height:100%;overflow:hidden;background:transparent !importa
     return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 
+  /* FIX: renderMd properly handles \\n escape sequences and formats output as HTML */
   function renderMd(text) {
     var s = String(text || '');
-    s = s.replace(/\\n/g, '\n').replace(/\\t/g, ' ');
+    // Decode escaped newlines first
+    s = s.replace(/\\\\n/g, '\\n').replace(/\\n/g, '\\n');
+    // Escape HTML
     s = s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-    s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-    s = s.replace(/\*([^\*\n]+?)\*/g, '<em>$1</em>');
-    s = s.replace(/_([^_\n]+?)_/g, '<em>$1</em>');
-    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline">$1</a>');
-    s = s.replace(/(^|\s)(https?:\/\/[^\s<]+)/g, '$1<a href="$2" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline">$2</a>');
-    s = s.replace(/(^|\n)[\*\-•] (.+)/g, '$1<li>$2</li>');
-    if (s.includes('<li>')) s = s.replace(/(<li>.*<\/li>)/gs, '<ul style="margin:6px 0 6px 16px;padding:0">$1</ul>');
-    s = s.replace(/(^|\n)\d+\. (.+)/g, '$1<li>$2</li>');
-    s = s.replace(/\n/g, '<br>');
-    return s;
+    // Bold and italic
+    s = s.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>');
+    s = s.replace(/\\*([^\\*\\n]+?)\\*/g, '<em>$1</em>');
+    s = s.replace(/_([^_\\n]+?)_/g, '<em>$1</em>');
+    // Links
+    s = s.replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    s = s.replace(/(^|\\s)(https?:\\/\\/[^\\s<]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
+    // Lists
+    var lines = s.split('\\n');
+    var out = [];
+    var inUl = false, inOl = false;
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      var ulMatch = line.match(/^[*\\-•] (.+)/);
+      var olMatch = line.match(/^\\d+\\. (.+)/);
+      if (ulMatch) {
+        if (!inUl) { out.push('<ul>'); inUl = true; }
+        if (inOl) { out.push('</ol>'); inOl = false; }
+        out.push('<li>' + ulMatch[1] + '</li>');
+      } else if (olMatch) {
+        if (!inOl) { out.push('<ol>'); inOl = true; }
+        if (inUl) { out.push('</ul>'); inUl = false; }
+        out.push('<li>' + olMatch[1] + '</li>');
+      } else {
+        if (inUl) { out.push('</ul>'); inUl = false; }
+        if (inOl) { out.push('</ol>'); inOl = false; }
+        if (line.trim() === '') {
+          out.push('<br>');
+        } else {
+          out.push('<p>' + line + '</p>');
+        }
+      }
+    }
+    if (inUl) out.push('</ul>');
+    if (inOl) out.push('</ol>');
+    return out.join('');
   }
 
   var SESS_KEY = 'agently_chat_' + CID;
@@ -249,13 +316,8 @@ html,body{width:100%;height:100%;overflow:hidden;background:transparent !importa
       if (!Array.isArray(saved)) return;
       saved.forEach(function(m) {
         if (m.role && m.text) {
-          if (m.role === 'model') {
-            history.push({ role: 'model', text: m.text });
-            addMsg('bot', m.text, true);
-          } else {
-            history.push({ role: 'user', text: m.text });
-            addMsg('usr', m.text, true);
-          }
+          if (m.role === 'model') { history.push({ role: 'model', text: m.text }); addMsg('bot', m.text, true); }
+          else { history.push({ role: 'user', text: m.text }); addMsg('usr', m.text, true); }
         }
       });
       greeted = true;
@@ -283,19 +345,12 @@ html,body{width:100%;height:100%;overflow:hidden;background:transparent !importa
     return wrap;
   }
 
-  function addBotMsg(text) {
-    history.push({ role: 'model', text: text });
-    return addMsg('bot', text);
-  }
-  function addUserMsg(text) {
-    history.push({ role: 'user', text: text });
-    return addMsg('usr', text);
-  }
+  function addBotMsg(text) { history.push({ role: 'model', text: text }); return addMsg('bot', text); }
+  function addUserMsg(text) { history.push({ role: 'user', text: text }); return addMsg('usr', text); }
 
   function showTyping() {
     var wrap = document.createElement('div');
-    wrap.id = 'typ';
-    wrap.className = 'bubble bot typing';
+    wrap.id = 'typ'; wrap.className = 'bubble bot typing';
     var inner = document.createElement('div');
     inner.className = 'btext';
     inner.innerHTML = '<div class="tdots"><div class="td"></div><div class="td"></div><div class="td"></div></div>';
@@ -303,10 +358,7 @@ html,body{width:100%;height:100%;overflow:hidden;background:transparent !importa
     msgs.appendChild(wrap);
     msgs.scrollTop = msgs.scrollHeight;
   }
-  function hideTyping() {
-    var t = document.getElementById('typ');
-    if (t) t.remove();
-  }
+  function hideTyping() { var t = document.getElementById('typ'); if (t) t.remove(); }
 
   function localAnswer(q) {
     var lq = q.toLowerCase();
@@ -330,39 +382,29 @@ html,body{width:100%;height:100%;overflow:hidden;background:transparent !importa
     sending = true;
     addUserMsg(text);
     showTyping();
+
     var local = localAnswer(text);
     if (local) {
-      setTimeout(function() {
-        hideTyping();
-        addBotMsg(local);
-        sending = false;
-        ci.focus();
-      }, 500);
+      setTimeout(function() { hideTyping(); addBotMsg(local); sending = false; ci.focus(); }, 500);
       return;
     }
+
     fetch(API + '/api/chatbot-public/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        message: text,
-        chatbotId: CID,
-        history: history.slice(-12)
-      })
+      body: JSON.stringify({ message: text, chatbotId: CID, history: history.slice(-12), language: currentLang })
     })
     .then(function(r) { return r.json(); })
     .then(function(d) {
       hideTyping();
-      var reply = d.response || d.error?.message || "I'm here to help! Could you rephrase that?";
+      var reply = (d.response || (d.error && d.error.message) || "I'm here to help! Could you rephrase that?");
       addBotMsg(reply);
     })
     .catch(function() {
       hideTyping();
       addBotMsg("Sorry, I'm having trouble connecting right now. Please try again in a moment.");
     })
-    .finally(function() {
-      sending = false;
-      ci.focus();
-    });
+    .finally(function() { sending = false; ci.focus(); });
   }
 })();
 </script>

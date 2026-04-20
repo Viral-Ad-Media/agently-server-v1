@@ -570,6 +570,53 @@ router.post(
 
     res.json({ success: true, imported, total: payload.length });
   }),
+
+// ── DELETE /api/leads/:id ──────────────────────────────────────
+// FIX: individual lead deletion (confirmed on frontend before calling)
+router.delete(
+  '/:id',
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const db = getSupabase();
+    const { error } = await db
+      .from('leads')
+      .delete()
+      .eq('id', id)
+      .eq('organization_id', req.orgId);
+
+    if (error) {
+      return res.status(500).json({ error: { message: error.message || 'Failed to delete lead.' } });
+    }
+    res.json({ success: true });
+  }),
+);
+
+// ── DELETE /api/leads/bulk ──────────────────────────────────────
+// FIX: bulk lead deletion (confirmed on frontend before calling)
+router.delete(
+  '/bulk',
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const { ids } = req.body || {};
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: { message: 'ids array is required.' } });
+    }
+
+    const db = getSupabase();
+    const { error } = await db
+      .from('leads')
+      .delete()
+      .in('id', ids)
+      .eq('organization_id', req.orgId);
+
+    if (error) {
+      return res.status(500).json({ error: { message: error.message || 'Failed to delete leads.' } });
+    }
+    res.json({ success: true, deleted: ids.length });
+  }),
 );
 
 module.exports = router;
