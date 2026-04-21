@@ -27,6 +27,8 @@ function serializeSchedule(row) {
     timezone: row.timezone || "America/New_York",
     extraContext: row.extra_context || "",
     isActive: row.is_active ?? true,
+    startDate: row.start_date || "",
+    endDate: row.end_date || "",
     createdAt: row.created_at,
     updatedAt: row.updated_at || row.created_at,
   };
@@ -559,6 +561,8 @@ router.post(
       timezone = "America/New_York",
       extraContext = "",
       syncExistingLeads = false,
+      startDate = null,
+      endDate = null,
     } = req.body || {};
 
     if (!voiceAgentId) {
@@ -609,6 +613,8 @@ router.post(
         windows: normalizedWindows,
         timezone,
         extra_context: extraContext || "",
+        start_date: startDate || null,
+        end_date: endDate || null,
       }));
     } else {
       if (!String(tag || "").trim()) {
@@ -627,6 +633,8 @@ router.post(
           windows: normalizedWindows,
           timezone,
           extra_context: extraContext || "",
+          start_date: startDate || null,
+          end_date: endDate || null,
         },
       ];
     }
@@ -674,6 +682,8 @@ router.patch(
     if (body.extraContext !== undefined)
       updates.extra_context = body.extraContext || "";
     if (body.isActive !== undefined) updates.is_active = !!body.isActive;
+    if (body.startDate !== undefined) updates.start_date = body.startDate || null;
+    if (body.endDate !== undefined) updates.end_date = body.endDate || null;
     updates.updated_at = new Date().toISOString();
 
     const db = getSupabase();
