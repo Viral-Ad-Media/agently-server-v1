@@ -11,7 +11,25 @@
     }
   ],
   "routes": [
-    { "src": "/health", "dest": "/api/index.js" },
+    {
+      "src": "/api/(.*)",
+      "methods": [
+        "OPTIONS"
+      ],
+      "headers": {
+        "Access-Control-Allow-Origin": "$HTTP_ORIGIN",
+        "Access-Control-Allow-Credentials": "true",
+        "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type,Authorization,X-Requested-With",
+        "Access-Control-Max-Age": "86400"
+      },
+      "status": 204,
+      "continue": false
+    },
+    {
+      "src": "/health",
+      "dest": "/api/index.js"
+    },
     {
       "src": "/chatbot-widget/(.*)",
       "dest": "/api/index.js",
@@ -20,6 +38,28 @@
         "Content-Security-Policy": "frame-ancestors *; default-src 'self' 'unsafe-inline' 'unsafe-eval' https: data: blob:;"
       }
     },
-    { "src": "/api/(.*)", "dest": "/api/index.js" }
+    {
+      "src": "/api/(.*)",
+      "dest": "/api/index.js"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        {
+          "key": "Access-Control-Allow-Credentials",
+          "value": "true"
+        },
+        {
+          "key": "Access-Control-Allow-Methods",
+          "value": "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+        },
+        {
+          "key": "Access-Control-Allow-Headers",
+          "value": "Content-Type,Authorization,X-Requested-With"
+        }
+      ]
+    }
   ]
 }
