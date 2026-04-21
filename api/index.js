@@ -6,7 +6,6 @@ try {
 } catch (_) {}
 
 const express = require("express");
-const cors = require("cors");
 
 const authRoutes = require("./routes/auth");
 const bootstrapRoutes = require("./routes/bootstrap");
@@ -22,33 +21,64 @@ const miscRoutes = require("./routes/misc");
 const widgetRoutes = require("./routes/widget");
 const chatbotPublicRoutes = require("./routes/chatbot-public");
 const twilioRoutes = require("./routes/twilio");
-const { errorHandler } = require("../middleware/error");
+// const { errorHandler } = require("../../middleware/error");
 
 const app = express();
 
-// ── CORS ──────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// CORS — must be the VERY FIRST middleware
+// Reads ALLOWED_ORIGINS from env var. No hardcoded URLs.
+// ═══════════════════════════════════════════════════════════════
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map((o) => o.trim())
   .filter(Boolean);
 
-const corsOptions = {
-  origin(origin, cb) {
-    if (!origin) return cb(null, true); // server-to-server / curl
-    if (process.env.NODE_ENV !== "production") return cb(null, true); // dev: allow all
-    if (!allowedOrigins.length) return cb(null, true); // no allowlist = allow all
-    if (allowedOrigins.includes(origin)) return cb(null, true); // in allowlist
-    cb(new Error(`CORS: ${origin} not allowed`));
-  },
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
-  optionsSuccessStatus: 200,
-};
+function isOriginAllowed(origin) {
+  if (!origin) return true; // server-to-server / curl
+  if (process.env.NODE_ENV !== "production") return true; // dev = allow all
+  if (allowedOrigins.length === 0) return true; // no allowlist = allow all
+  return allowedOrigins.includes(origin);
+}
 
-app.use(cors(corsOptions));
-// Handle OPTIONS preflight for every route — must come after cors() but before routes
-app.options("*", cors(corsOptions));
+function setCorsHeaders(req, res) {
+  const origin = req.headers.origin;
+  if (origin && isOriginAllowed(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader(
+      "Access-Control-Allow-Methods",
+      "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+    );
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      req.headers["access-control-request-headers"] ||
+        "Content-Type,Authorization,X-Requested-With",
+    );
+    res.setHeader("Access-Control-Max-Age", "86400");
+  }
+}
+
+// FIRST middleware — handles CORS for ALL requests including OPTIONS preflight
+app.use((req, res, next) => {
+  setCorsHeaders(req, res);
+
+  // Respond to preflight immediately. MUST send 204 with no body.
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
+  // Block disallowed origins from real requests
+  const origin = req.headers.origin;
+  if (origin && !isOriginAllowed(origin)) {
+    return res
+      .status(403)
+      .json({ error: { message: `CORS: ${origin} not allowed` } });
+  }
+
+  next();
+});
 
 // Allow chatbot widget pages to be iframed from any domain
 app.use((req, res, next) => {
@@ -81,25 +111,37 @@ app.use("/api/onboarding", onboardingRoutes);
 app.use("/api/agent", agentRoutes);
 app.use("/api/voice-agents", voiceAgentRoutes);
 app.use("/api/chatbots", chatbotRoutes);
-app.use("/api/chatbots", chatbotDeployRoutes); // /deploy + /deploy-status
+app.use("/api/chatbots", chatbotDeployRoutes);
 app.use("/api/messenger", messengerRoutes);
 app.use("/api/calls", callsRoutes);
 app.use("/api/leads", leadsRoutes);
 app.use("/api/chatbot-public", chatbotPublicRoutes);
-app.use("/api/twilio", twilioRoutes); // ← NEW: all Twilio routes
-app.use("/api", miscRoutes); // team, billing, settings, contact
+app.use("/api/twilio", twilioRoutes);
+app.use("/api", miscRoutes);
 
 app.use("/chatbot-widget", widgetRoutes);
 
 app.use((_req, res) =>
   res.status(404).json({ error: { message: "Route not found." } }),
 );
-app.use(errorHandler);
 
-// ── WebSocket support for ConversationRelay ───────────────────
-// Vercel Serverless does NOT natively support long-lived WebSockets.
-// For production voice, deploy the WS server separately (see DEPLOYMENT.md).
-// For local dev, attach ws to the same HTTP server via attachWebSocket(server).
+// ═══════════════════════════════════════════════════════════════
+// Error handler — MUST re-apply CORS headers, because if the cors
+// middleware threw an error, they may not be set yet.
+// ═══════════════════════════════════════════════════════════════
+app.use((err, req, res, next) => {
+  setCorsHeaders(req, res);
+  console.error("Unhandled error:", err);
+  const status = err.status || err.statusCode || 500;
+  res.status(status).json({
+    error: {
+      message: err.message || "An unexpected error occurred.",
+      ...(process.env.NODE_ENV !== "production" && { stack: err.stack }),
+    },
+  });
+});
+
+// ── WebSocket support (local dev only) ────────────────────────
 function attachWebSocket(server) {
   try {
     const { WebSocketServer } = require("ws");
