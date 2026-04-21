@@ -27,8 +27,6 @@ function serializeSchedule(row) {
     timezone: row.timezone || "America/New_York",
     extraContext: row.extra_context || "",
     isActive: row.is_active ?? true,
-    startDate: row.start_date || "",
-    endDate: row.end_date || "",
     createdAt: row.created_at,
     updatedAt: row.updated_at || row.created_at,
   };
@@ -80,6 +78,14 @@ function parseCsv(csv) {
 function cell(row, index) {
   if (index < 0) return "";
   return String(row[index] || "").trim();
+}
+
+// Validate a string is a UUID; return it if valid, else null.
+// Prevents CSV-supplied voice_agent_id strings from breaking the FK constraint.
+function validUuidOrNull(s) {
+  if (!s) return null;
+  const v = String(s).trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v) ? v : null;
 }
 
 function parseScheduleWindows(windows) {
@@ -277,7 +283,7 @@ router.post(
           email: cell(row, indexMap.email) || "",
           reason: cell(row, indexMap.reason) || "",
           tags: parsedTags,
-          voice_agent_id: cell(row, indexMap.voiceAgentId) || null,
+          voice_agent_id: validUuidOrNull(cell(row, indexMap.voiceAgentId)),
           assignment_context: cell(row, indexMap.assignmentContext) || "",
           status: "new",
           source: "csv_import",
@@ -561,8 +567,6 @@ router.post(
       timezone = "America/New_York",
       extraContext = "",
       syncExistingLeads = false,
-      startDate = null,
-      endDate = null,
     } = req.body || {};
 
     if (!voiceAgentId) {
@@ -613,8 +617,6 @@ router.post(
         windows: normalizedWindows,
         timezone,
         extra_context: extraContext || "",
-        start_date: startDate || null,
-        end_date: endDate || null,
       }));
     } else {
       if (!String(tag || "").trim()) {
@@ -633,8 +635,6 @@ router.post(
           windows: normalizedWindows,
           timezone,
           extra_context: extraContext || "",
-          start_date: startDate || null,
-          end_date: endDate || null,
         },
       ];
     }
@@ -682,8 +682,6 @@ router.patch(
     if (body.extraContext !== undefined)
       updates.extra_context = body.extraContext || "";
     if (body.isActive !== undefined) updates.is_active = !!body.isActive;
-    if (body.startDate !== undefined) updates.start_date = body.startDate || null;
-    if (body.endDate !== undefined) updates.end_date = body.endDate || null;
     updates.updated_at = new Date().toISOString();
 
     const db = getSupabase();

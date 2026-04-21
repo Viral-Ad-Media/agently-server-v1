@@ -2,13 +2,11 @@
 
 const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
-const { asyncHandler } = require("../../middleware/error");
 
 const router = express.Router();
 
-router.get(
-  "/:id",
-  asyncHandler(async (req, res) => {
+router.get("/:id", async (req, res) => {
+  try {
     const { id } = req.params;
     const db = getSupabase();
 
@@ -27,24 +25,32 @@ router.get(
     }
 
     const apiUrl = (process.env.API_URL || "").replace(/\/$/, "");
+    const queryLangs = req.query.langs
+      ? String(req.query.langs).split(",").filter(Boolean)
+      : null;
+    const queryVoice = req.query.voice ? String(req.query.voice) : null;
 
-    // FIX: read lang/voice from query params (set by embed script) or fall back to DB values
-    const queryLangs = req.query.langs ? req.query.langs.split(',').filter(Boolean) : null;
-    const queryVoice = req.query.voice || null;
-
-    const chatLanguages = queryLangs || (Array.isArray(chatbot.chat_languages) ? chatbot.chat_languages : ['en']);
-    const chatVoice = queryVoice || chatbot.chat_voice || 'alloy';
+    const chatLanguages =
+      queryLangs ||
+      (Array.isArray(chatbot.chat_languages) ? chatbot.chat_languages : ["en"]);
+    const chatVoice = queryVoice || chatbot.chat_voice || "alloy";
 
     const cfg = {
       chatbotId: safeStr(id),
       apiUrl: safeStr(apiUrl),
       accentColor: safeStr(chatbot.accent_color || "#4f46e5"),
       headerTitle: safeStr(chatbot.header_title || "Chat with us"),
-      welcomeMessage: safeStr(chatbot.welcome_message || "Hello! How can I help you today?"),
+      welcomeMessage: safeStr(
+        chatbot.welcome_message || "Hello! How can I help you today?",
+      ),
       placeholder: safeStr(chatbot.placeholder || "Type your message..."),
       avatarLabel: safeStr(chatbot.avatar_label || "A"),
       position: chatbot.position === "left" ? "left" : "right",
-      suggestedPrompts: JSON.stringify(Array.isArray(chatbot.suggested_prompts) ? chatbot.suggested_prompts : []),
+      suggestedPrompts: JSON.stringify(
+        Array.isArray(chatbot.suggested_prompts)
+          ? chatbot.suggested_prompts
+          : [],
+      ),
       faqs: JSON.stringify(Array.isArray(chatbot.faqs) ? chatbot.faqs : []),
       chatLanguages: JSON.stringify(chatLanguages),
       chatVoice: safeStr(chatVoice),
@@ -52,11 +58,22 @@ router.get(
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("X-Frame-Options", "ALLOWALL");
-    res.setHeader("Content-Security-Policy", "frame-ancestors *; default-src 'self' 'unsafe-inline' 'unsafe-eval' https:;");
+    res.setHeader(
+      "Content-Security-Policy",
+      "frame-ancestors *; default-src 'self' 'unsafe-inline' 'unsafe-eval' https:;",
+    );
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     res.send(buildWidgetHtml(cfg));
-  }),
-);
+  } catch (e) {
+    console.error("[widget] handler error:", e);
+    // Return a visible fallback instead of crashing the whole function
+    res.status(500).setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!DOCTYPE html><html><head><title>Error</title></head>
+<body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f8fafc;">
+<div style="text-align:center;color:#94a3b8"><p style="font-size:48px;margin:0">⚠️</p><p>Widget temporarily unavailable.</p></div>
+</body></html>`);
+  }
+});
 
 function safeStr(s) {
   return String(s || "")
@@ -67,9 +84,18 @@ function safeStr(s) {
 }
 
 const LANG_NAMES = {
-  en: 'English', es: 'Español', fr: 'Français', de: 'Deutsch',
-  it: 'Italiano', pt: 'Português', ar: 'العربية', zh: '中文',
-  ja: '日本語', ko: '한국어', hi: 'हिन्दी', nl: 'Nederlands',
+  en: "English",
+  es: "Español",
+  fr: "Français",
+  de: "Deutsch",
+  it: "Italiano",
+  pt: "Português",
+  ar: "العربية",
+  zh: "中文",
+  ja: "日本語",
+  ko: "한국어",
+  hi: "हिन्दी",
+  nl: "Nederlands",
 };
 
 function buildWidgetHtml(cfg) {
