@@ -274,6 +274,7 @@ body>*:not(#agently-root):not(script){display:none!important}
   var CID = '${cfg.chatbotId}';
   var API = '${cfg.apiUrl}';
   var WELCOME = '${cfg.welcomeMessage}';
+  var PLACEHOLDER = '${cfg.placeholder}';
   var FAQS = ${cfg.faqs};
   var PROMPTS = ${cfg.suggestedPrompts};
   var LANGUAGES = ${cfg.chatLanguages};
@@ -589,7 +590,7 @@ body>*:not(#agently-root):not(script){display:none!important}
     .finally(function() {
       ci.disabled = false;
       mic.disabled = false;
-      ci.placeholder = '${cfg.placeholder.replace(/\\'/g, "'")}';
+      ci.placeholder = PLACEHOLDER;
       sb.disabled = !ci.value.trim();
     });
   }
