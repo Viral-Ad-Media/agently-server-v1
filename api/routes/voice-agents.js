@@ -9,6 +9,39 @@ const { updateNumberWebhooks } = require("../../lib/twilio");
 
 const router = express.Router();
 
+// ── GET /api/voice-agents ────────────────────────────────────
+// Returns all voice agents for the org, including their FAQs.
+// Used by the Leads page dropdown and any other page that needs the agent list.
+router.get(
+  "/",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const { data: agents, error } = await db
+      .from("voice_agents")
+      .select("*")
+      .eq("organization_id", req.orgId)
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      return res.status(500).json({ error: { message: "Failed to fetch voice agents." } });
+    }
+
+    const agentsWithFaqs = await Promise.all(
+      (agents || []).map(async (agent) => {
+        const { data: faqs } = await db
+          .from("faqs")
+          .select("*")
+          .eq("voice_agent_id", agent.id)
+          .order("created_at", { ascending: true });
+        return serializeAgent(agent, faqs || []);
+      })
+    );
+
+    res.json(agentsWithFaqs);
+  })
+);
+
 // ── POST /api/voice-agents ───────────────────────────────────
 router.post(
   "/",

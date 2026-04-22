@@ -12,11 +12,15 @@ const { asyncHandler } = require("../../middleware/error");
 
 const router = express.Router();
 
-// ── POST /api/auth/login ─────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// POST /api/auth/login
+// Body: { email: string, password: string }
+// ─────────────────────────────────────────────────────────────
 router.post(
   "/login",
   asyncHandler(async (req, res) => {
-    const { email, password } = req.body;
+    const { email, password } = req.body || {};
+
     if (!email || !password) {
       return res
         .status(400)
@@ -24,12 +28,15 @@ router.post(
     }
 
     const db = getSupabase();
+
     const { data: user, error } = await db
       .from("users")
       .select("id, name, email, role, avatar, password_hash, organization_id")
       .eq("email", email.toLowerCase().trim())
       .single();
 
+    // Use a generic message for both "not found" and "wrong password"
+    // to avoid leaking which emails are registered.
     if (error || !user || !user.password_hash) {
       return res
         .status(401)
@@ -45,18 +52,18 @@ router.post(
 
     const token = signToken({ userId: user.id, orgId: user.organization_id });
 
-    res.json({
-      token,
-      user: serializeUser(user),
-    });
+    return res.json({ token, user: serializeUser(user) });
   }),
 );
 
-// ── POST /api/auth/register ──────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// POST /api/auth/register
+// Body: { name, companyName, email, password }
+// ─────────────────────────────────────────────────────────────
 router.post(
   "/register",
   asyncHandler(async (req, res) => {
-    const { name, companyName, email, password } = req.body;
+    const { name, companyName, email, password } = req.body || {};
 
     if (!name || !companyName || !email || !password) {
       return res
@@ -65,31 +72,28 @@ router.post(
     }
 
     if (password.length < 8) {
-      return res
-        .status(400)
-        .json({
-          error: { message: "Password must be at least 8 characters." },
-        });
+      return res.status(400).json({
+        error: { message: "Password must be at least 8 characters." },
+      });
     }
 
     const db = getSupabase();
+    const normalizedEmail = email.toLowerCase().trim();
 
-    // Check if email already exists
+    // Check for existing account
     const { data: existing } = await db
       .from("users")
       .select("id")
-      .eq("email", email.toLowerCase().trim())
+      .eq("email", normalizedEmail)
       .single();
 
     if (existing) {
-      return res
-        .status(409)
-        .json({
-          error: { message: "An account with this email already exists." },
-        });
+      return res.status(409).json({
+        error: { message: "An account with this email already exists." },
+      });
     }
 
-    // Create organization
+    // Create organization first
     const { data: org, error: orgErr } = await db
       .from("organizations")
       .insert({
@@ -105,7 +109,7 @@ router.post(
       .single();
 
     if (orgErr || !org) {
-      console.error("Org creation error:", orgErr);
+      console.error("[register] org creation failed:", orgErr);
       return res
         .status(500)
         .json({ error: { message: "Failed to create organization." } });
@@ -120,7 +124,7 @@ router.post(
       .insert({
         organization_id: org.id,
         name: name.trim(),
-        email: email.toLowerCase().trim(),
+        email: normalizedEmail,
         password_hash: passwordHash,
         role: "Owner",
       })
@@ -128,15 +132,15 @@ router.post(
       .single();
 
     if (userErr || !user) {
-      console.error("User creation error:", userErr);
-      // Cleanup org
+      console.error("[register] user creation failed:", userErr);
+      // Roll back the org we just created
       await db.from("organizations").delete().eq("id", org.id);
       return res
         .status(500)
         .json({ error: { message: "Failed to create user account." } });
     }
 
-    // Create seed invoices for new org
+    // Seed a blank invoice record for billing history
     await db.from("invoices").insert([
       {
         id: `INV-${Date.now()}-001`,
@@ -147,129 +151,130 @@ router.post(
       },
     ]);
 
-    // Send welcome email (non-blocking)
+    // Send welcome email — non-blocking, never fail registration because of it
     try {
-      await sendWelcomeEmail(
-        email.toLowerCase().trim(),
-        name.trim(),
-        companyName.trim(),
-      );
+      await sendWelcomeEmail(normalizedEmail, name.trim(), companyName.trim());
     } catch (emailErr) {
-      console.warn("Welcome email failed:", emailErr.message);
+      console.warn("[register] welcome email failed:", emailErr.message);
     }
 
     const token = signToken({ userId: user.id, orgId: org.id });
 
-    res.status(201).json({
-      token,
-      user: serializeUser(user),
-    });
+    return res.status(201).json({ token, user: serializeUser(user) });
   }),
 );
 
-// ── POST /api/auth/magic-link ────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// POST /api/auth/magic-link
+// Body: { email: string }
+// Sends a one-time sign-in link to the user's email.
+// ─────────────────────────────────────────────────────────────
 router.post(
   "/magic-link",
   asyncHandler(async (req, res) => {
-    const { email } = req.body;
+    const { email } = req.body || {};
+
     if (!email) {
       return res.status(400).json({ error: { message: "Email is required." } });
     }
 
     const db = getSupabase();
-    const token = uuidv4().replace(/-/g, "") + uuidv4().replace(/-/g, "");
-    const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString(); // 15 minutes
     const normalizedEmail = email.toLowerCase().trim();
 
-    // Invalidate any existing tokens for this email
+    // Generate a secure token (two UUIDs concatenated, no hyphens)
+    const token = uuidv4().replace(/-/g, "") + uuidv4().replace(/-/g, "");
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString(); // 15 minutes
+
+    // Invalidate any existing unused tokens for this email
     await db
       .from("magic_link_tokens")
       .update({ used: true })
       .eq("email", normalizedEmail)
       .eq("used", false);
 
-    // Insert new token
+    // Store the new token
     await db.from("magic_link_tokens").insert({
       email: normalizedEmail,
       token,
       expires_at: expiresAt,
     });
 
-    const appUrl = process.env.APP_URL || "http://localhost:3000";
-    const apiUrl = process.env.API_URL || "http://localhost:4000";
+    const appUrl = (process.env.APP_URL || "http://localhost:3000").trim();
     const magicLinkUrl = `${appUrl}/#/login?magic=${token}`;
-    const verifyEndpoint = `${apiUrl}/api/auth/magic-link/verify`;
 
-    // Send email (non-blocking, don't fail if email fails)
+    // Send the email — non-blocking
     try {
       await sendMagicLinkEmail(normalizedEmail, magicLinkUrl);
     } catch (emailErr) {
-      console.warn("Magic link email failed:", emailErr.message);
+      console.warn("[magic-link] email failed:", emailErr.message);
     }
 
-    res.json({
+    return res.json({
       message: "Magic link sent. Check your email.",
       email: normalizedEmail,
       magicLinkToken: token,
-      verifyEndpoint,
-      // Only return URL in dev mode
+      // Only expose the URL in non-production (useful for local dev testing)
       magicLinkUrl: process.env.NODE_ENV !== "production" ? magicLinkUrl : null,
     });
   }),
 );
 
-// ── POST /api/auth/magic-link/verify ────────────────────────
+// ─────────────────────────────────────────────────────────────
+// POST /api/auth/magic-link/verify
+// Body: { token: string }
+// ─────────────────────────────────────────────────────────────
 router.post(
   "/magic-link/verify",
   asyncHandler(async (req, res) => {
-    const { token } = req.body;
+    const { token } = req.body || {};
+
     if (!token) {
       return res.status(400).json({ error: { message: "Token is required." } });
     }
 
     const db = getSupabase();
 
-    const { data: linkRecord, error } = await db
+    const { data: record, error } = await db
       .from("magic_link_tokens")
       .select("*")
       .eq("token", token)
       .eq("used", false)
       .single();
 
-    if (error || !linkRecord) {
+    if (error || !record) {
       return res
         .status(400)
-        .json({ error: { message: "Invalid or expired magic link." } });
+        .json({ error: { message: "Invalid or already-used magic link." } });
     }
 
-    if (new Date(linkRecord.expires_at) < new Date()) {
-      return res
-        .status(400)
-        .json({
-          error: {
-            message: "This magic link has expired. Please request a new one.",
-          },
-        });
+    if (new Date(record.expires_at) < new Date()) {
+      return res.status(400).json({
+        error: {
+          message: "This magic link has expired. Please request a new one.",
+        },
+      });
     }
 
-    // Mark token as used
+    // Mark the token as used immediately to prevent replay
     await db
       .from("magic_link_tokens")
       .update({ used: true })
-      .eq("id", linkRecord.id);
+      .eq("id", record.id);
 
-    // Find or create user
+    // Find the existing user or auto-create one for new sign-ups
     let user;
     const { data: existingUser } = await db
       .from("users")
       .select("id, name, email, role, avatar, organization_id")
-      .eq("email", linkRecord.email)
+      .eq("email", record.email)
       .single();
 
     if (existingUser) {
       user = existingUser;
     } else {
-      // Auto-create org and user for new magic link signups
+      // Auto-create org + user for first-time magic link sign-ups
+      const emailName = record.email.split("@")[0];
+
       const { data: newOrg } = await db
         .from("organizations")
         .insert({
@@ -284,13 +289,12 @@ router.post(
         .select()
         .single();
 
-      const emailName = linkRecord.email.split("@")[0];
       const { data: newUser } = await db
         .from("users")
         .insert({
           organization_id: newOrg.id,
           name: emailName,
-          email: linkRecord.email,
+          email: record.email,
           role: "Owner",
         })
         .select()
@@ -299,26 +303,31 @@ router.post(
       user = newUser;
     }
 
+    if (!user) {
+      return res
+        .status(500)
+        .json({ error: { message: "Failed to resolve user account." } });
+    }
+
     const authToken = signToken({
       userId: user.id,
       orgId: user.organization_id,
     });
 
-    res.json({
-      token: authToken,
-      user: serializeUser(user),
-    });
+    return res.json({ token: authToken, user: serializeUser(user) });
   }),
 );
 
-// ── POST /api/auth/logout ────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// POST /api/auth/logout
+// JWT is stateless — we just acknowledge the logout.
+// The client should discard its stored token.
+// ─────────────────────────────────────────────────────────────
 router.post(
   "/logout",
   requireAuth,
-  asyncHandler(async (req, res) => {
-    // JWT is stateless; client clears the token.
-    // We just acknowledge.
-    res.json({ success: true });
+  asyncHandler(async (_req, res) => {
+    return res.json({ success: true });
   }),
 );
 
