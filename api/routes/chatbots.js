@@ -5,7 +5,8 @@ const { getSupabase } = require("../../lib/supabase");
 const { requireAuth, requireAdmin } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 const { serializeChatbot } = require("../../lib/serializers");
-const { scrapeAndStore } = require("../../lib/scraper.service"); // chunks‑only
+// scraper.service is required lazily inside the scrape route so that a missing
+// cheerio dep does not take down the entire /api/chatbots router at load time.
 
 const router = express.Router();
 
@@ -55,8 +56,8 @@ router.post(
           "What services do you offer?",
         ],
         faqs: body.faqs || [],
-        chat_voice: body.chatVoice || 'alloy',
-        chat_languages: body.chatLanguages || ['en'],
+        chat_voice: body.chatVoice || "alloy",
+        chat_languages: body.chatLanguages || ["en"],
       })
       .select()
       .single();
@@ -109,7 +110,8 @@ router.patch(
       updates.suggested_prompts = body.suggestedPrompts;
     if (body.faqs !== undefined) updates.faqs = body.faqs;
     if (body.chatVoice !== undefined) updates.chat_voice = body.chatVoice;
-    if (body.chatLanguages !== undefined) updates.chat_languages = body.chatLanguages;
+    if (body.chatLanguages !== undefined)
+      updates.chat_languages = body.chatLanguages;
     updates.updated_at = new Date().toISOString();
 
     // Always recompute embed script (position may have changed)
@@ -158,6 +160,25 @@ router.post(
 
     if (!chatbot) {
       return res.status(404).json({ error: { message: "Chatbot not found." } });
+    }
+
+    // Lazy-load the scraper so a missing cheerio dep surfaces a clear error
+    // instead of bringing down the whole /api/chatbots router at module load.
+    let scrapeAndStore;
+    try {
+      ({ scrapeAndStore } = require("../../lib/scraper.service"));
+    } catch (depErr) {
+      console.error(
+        "[chatbots] scraper.service failed to load:",
+        depErr.message,
+      );
+      return res.status(500).json({
+        error: {
+          message:
+            "Website scraping is temporarily unavailable. A server dependency is missing (cheerio). Please contact support.",
+          detail: depErr.message,
+        },
+      });
     }
 
     // Use chunks‑only scraper (no FAQ generation)
