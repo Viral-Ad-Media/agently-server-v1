@@ -983,8 +983,9 @@ body>*:not(#agently-root):not(script){display:none!important}
         var chunkText = decoder.decode(r.value, { stream: true });
         leftover += chunkText;
 
-        // Parse SSE lines
-        var lines = leftover.split('\n');
+        // Parse SSE lines (note: must use \\n so a real newline survives
+        // being embedded inside this template literal string)
+        var lines = leftover.split('\\n');
         leftover = lines.pop(); // keep any incomplete tail for next iteration
 
         for (var i = 0; i < lines.length; i++) {
