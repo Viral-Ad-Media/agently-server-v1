@@ -168,14 +168,14 @@ body>*:not(#agently-root):not(script){display:none!important}
 #mic{background:#fff;border:1.5px solid #e2e8f0;color:#64748b;border-radius:12px;width:42px;height:42px;display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;transition:all .2s;}
 #mic:hover{border-color:var(--a);color:var(--a);background:var(--al)}
 #mic:disabled{opacity:.45;cursor:not-allowed}
-#mic.recording{background:#ef4444;color:#fff;border-color:#ef4444;animation:recPulse 1.1s ease-in-out infinite;}
-@keyframes recPulse{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,.55)}50%{box-shadow:0 0 0 8px rgba(239,68,68,0)}}
+#mic.recording{background:var(--a);color:#fff;border-color:var(--a);animation:recPulse 1.1s ease-in-out infinite;}
+@keyframes recPulse{0%,100%{box-shadow:0 0 0 0 rgba(79,70,229,.55)}50%{box-shadow:0 0 0 8px rgba(79,70,229,0)}}
 /* Recording indicator overlay — shown in place of input during capture */
-#recBar{flex:1;display:none;align-items:center;gap:10px;padding:10px 13px;border:1.5px solid #ef4444;border-radius:12px;background:#fef2f2;color:#b91c1c;font-size:13px;font-weight:600;min-height:42px;}
+#recBar{flex:1;display:none;align-items:center;gap:10px;padding:10px 13px;border:1.5px solid var(--a);border-radius:12px;background:var(--al);color:var(--a);font-size:13px;font-weight:600;min-height:42px;}
 #recBar.on{display:flex}
-#recBar .dotRed{width:9px;height:9px;background:#ef4444;border-radius:50%;animation:pulse 1.2s infinite;flex-shrink:0}
+#recBar .dotRed{width:9px;height:9px;background:var(--a);border-radius:50%;animation:pulse 1.2s infinite;flex-shrink:0}
 #recBar .recWave{display:flex;align-items:center;gap:2px;flex:1;height:18px;overflow:hidden}
-#recBar .recWave span{display:block;width:3px;background:#ef4444;border-radius:2px;animation:wave 1s ease-in-out infinite;}
+#recBar .recWave span{display:block;width:3px;background:var(--a);border-radius:2px;animation:wave 1s ease-in-out infinite;}
 #recBar .recWave span:nth-child(1){animation-delay:-.9s}
 #recBar .recWave span:nth-child(2){animation-delay:-.75s}
 #recBar .recWave span:nth-child(3){animation-delay:-.6s}
@@ -184,13 +184,37 @@ body>*:not(#agently-root):not(script){display:none!important}
 #recBar .recWave span:nth-child(6){animation-delay:-.15s}
 #recBar .recWave span:nth-child(7){animation-delay:0s}
 @keyframes wave{0%,100%{height:5px}50%{height:18px}}
-#recBar .recTime{font-variant-numeric:tabular-nums;color:#7f1d1d;font-size:12px;flex-shrink:0}
+#recBar .recTime{font-variant-numeric:tabular-nums;color:var(--a);opacity:.8;font-size:12px;flex-shrink:0}
 /* Speaker toggle in header */
 #spk{background:none;border:none;color:#fff;cursor:pointer;padding:6px;border-radius:8px;display:flex;align-items:center;justify-content:center;opacity:.6;transition:opacity .2s,background .2s;}
 #spk:hover{opacity:1;background:rgba(255,255,255,.15)}
 #spk.on{opacity:1;background:rgba(255,255,255,.2)}
 #spk.playing{animation:spkPulse 1.4s ease-in-out infinite}
 @keyframes spkPulse{0%,100%{transform:scale(1)}50%{transform:scale(1.12)}}
+/* ═══ VOICE MODE OVERLAY ═══ */
+#vMode{position:absolute;inset:0;background:linear-gradient(180deg,#0f172a 0%,#1e293b 100%);display:none;flex-direction:column;align-items:center;justify-content:space-between;padding:32px 24px;z-index:10;color:#fff;}
+#vMode.on{display:flex}
+.vmTop{display:flex;align-items:center;justify-content:space-between;width:100%;}
+.vmLabel{font-size:11px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:rgba(255,255,255,.5)}
+.vmLang{font-size:11px;color:rgba(255,255,255,.6);padding:4px 10px;border:1px solid rgba(255,255,255,.15);border-radius:999px;background:rgba(255,255,255,.04)}
+.vmCenter{display:flex;flex-direction:column;align-items:center;gap:20px;flex:1;justify-content:center}
+.vmOrb{width:180px;height:180px;border-radius:50%;background:radial-gradient(circle at 30% 30%,var(--a) 0%,var(--ad) 60%,rgba(0,0,0,.3) 100%);box-shadow:0 0 60px var(--a),inset 0 0 40px rgba(255,255,255,.1);transition:transform .1s ease-out;position:relative;}
+.vmOrb::before{content:'';position:absolute;inset:-10px;border-radius:50%;border:2px solid var(--a);opacity:.35;animation:orbRing 2.4s ease-in-out infinite}
+.vmOrb::after{content:'';position:absolute;inset:-22px;border-radius:50%;border:1.5px solid var(--a);opacity:.18;animation:orbRing 2.4s ease-in-out infinite;animation-delay:-.8s}
+@keyframes orbRing{0%,100%{transform:scale(1);opacity:.1}50%{transform:scale(1.18);opacity:.45}}
+.vmOrb.listening{animation:orbBreath 1.8s ease-in-out infinite}
+.vmOrb.speaking{animation:orbSpeak .9s ease-in-out infinite}
+.vmOrb.thinking{animation:orbSpin 1.4s linear infinite}
+@keyframes orbBreath{0%,100%{transform:scale(1)}50%{transform:scale(1.06)}}
+@keyframes orbSpeak{0%,100%{transform:scale(1)}50%{transform:scale(1.1)}}
+@keyframes orbSpin{0%{transform:rotate(0) scale(.96)}50%{transform:rotate(180deg) scale(1.02)}100%{transform:rotate(360deg) scale(.96)}}
+.vmStatus{font-size:16px;font-weight:600;color:rgba(255,255,255,.95);text-align:center;min-height:22px;letter-spacing:.01em;}
+.vmHint{font-size:12px;color:rgba(255,255,255,.45);text-align:center;max-width:260px;line-height:1.5}
+.vmActions{display:flex;gap:10px;width:100%;justify-content:center;}
+.vmBtn{background:rgba(255,255,255,.08);color:#fff;border:1px solid rgba(255,255,255,.15);padding:10px 18px;border-radius:999px;font-size:12px;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:6px;transition:all .15s}
+.vmBtn:hover{background:rgba(255,255,255,.14)}
+.vmBtn.vmEnd{background:#dc2626;border-color:#dc2626}
+.vmBtn.vmEnd:hover{background:#b91c1c}
 .pw{text-align:center;font-size:10.5px;color:#94a3b8;padding:5px 14px 7px;background:#fff;border-top:1px solid #f1f5f9;flex-shrink:0;letter-spacing:.01em;}
 .pw a{color:var(--a);text-decoration:none;font-weight:600}
 .pw a:hover{text-decoration:underline}
@@ -205,6 +229,7 @@ body>*:not(#agently-root):not(script){display:none!important}
       <div class="hn">${cfg.headerTitle.replace(/\\'/g, "'").replace(/\\n/g, "")}</div>
       <div class="hs"><span class="dot"></span>Online · Instant replies</div>
     </div>
+    <button class="xb" id="vmBtn" aria-label="Start voice conversation" title="Start voice conversation"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg></button>
     <button class="xb" id="spk" aria-label="Toggle voice replies" title="Voice replies off"><svg id="ico-spk-off" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="22" y1="9" x2="16" y2="15"/><line x1="16" y1="9" x2="22" y2="15"/></svg><svg id="ico-spk-on" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button>
     <button class="xb" id="xb" aria-label="Close chat"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>
   </div>
@@ -218,6 +243,22 @@ body>*:not(#agently-root):not(script){display:none!important}
     <button id="sb" aria-label="Send message" disabled><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></button>
   </div>
   <div class="pw">Powered by <a href="https://agently.ai" target="_blank" rel="noopener">Agently</a></div>
+
+  <!-- ═══ VOICE MODE OVERLAY (sits inside chat window) ═══ -->
+  <div id="vMode" role="dialog" aria-label="Voice conversation">
+    <div class="vmTop">
+      <span class="vmLabel">Voice Mode</span>
+      <span class="vmLang" id="vmLang">EN</span>
+    </div>
+    <div class="vmCenter">
+      <div class="vmOrb" id="vmOrb"></div>
+      <div class="vmStatus" id="vmStatus">Tap to start speaking…</div>
+      <div class="vmHint" id="vmHint">Speak naturally. I'll wait for you to pause, then reply out loud.</div>
+    </div>
+    <div class="vmActions">
+      <button class="vmBtn vmEnd" id="vmEnd" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>End conversation</button>
+    </div>
+  </div>
 </div>
 <button id="launcher" aria-label="Open chat" aria-expanded="false">
   <svg id="ico-chat" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
@@ -260,10 +301,28 @@ body>*:not(#agently-root):not(script){display:none!important}
   var icoSpkOn = document.getElementById('ico-spk-on');
   var recBar = document.getElementById('recBar');
   var recTime = document.getElementById('recTime');
+  var vmBtn = document.getElementById('vmBtn');
+  var vMode = document.getElementById('vMode');
+  var vmOrb = document.getElementById('vmOrb');
+  var vmStatus = document.getElementById('vmStatus');
+  var vmHint = document.getElementById('vmHint');
+  var vmLangEl = document.getElementById('vmLang');
+  var vmEnd = document.getElementById('vmEnd');
 
   if (!cw || !launcher) { console.error('Critical elements missing'); return; }
 
   /* ── Language bar ── */
+  function setActiveLang(code) {
+    if (!code || LANGUAGES.indexOf(code) === -1) return false;
+    if (code === currentLang) return false;
+    currentLang = code;
+    var buttons = langBar.querySelectorAll('.lang-btn');
+    for (var i = 0; i < buttons.length; i++) {
+      buttons[i].classList.toggle('active', buttons[i].dataset.lang === code);
+    }
+    return true;
+  }
+
   if (LANGUAGES.length > 1) {
     var lbl = document.createElement('span');
     lbl.className = 'lang-lbl';
@@ -275,12 +334,7 @@ body>*:not(#agently-root):not(script){display:none!important}
       btn.className = 'lang-btn' + (code === currentLang ? ' active' : '');
       btn.textContent = LANG_NAMES[code] || code.toUpperCase();
       btn.dataset.lang = code;
-      btn.onclick = function() {
-        currentLang = code;
-        langBar.querySelectorAll('.lang-btn').forEach(function(b) {
-          b.classList.toggle('active', b.dataset.lang === code);
-        });
-      };
+      btn.onclick = function() { setActiveLang(code); };
       langBar.appendChild(btn);
     });
   }
@@ -305,10 +359,13 @@ body>*:not(#agently-root):not(script){display:none!important}
     if (isOpen && !sessionLoaded) { sessionLoaded = true; loadSession(); }
     if (isOpen && !greeted) { greeted = true; setTimeout(function() { addBotMsg(WELCOME); }, 200); }
     if (isOpen) { setTimeout(function() { ci.focus(); }, 250); }
-    // Closing the widget: stop any active recording and any TTS playback
+    // Closing the widget: stop any active recording, exit conversation loop,
+    // and stop any TTS playback.
     if (!isOpen) {
+      conversationMode = false;
       if (recording) { try { stopRecording(); } catch(_) {} }
       stopPlayback();
+      if (vmActive) { void endVoiceMode(); }
     }
   }
 
@@ -329,6 +386,7 @@ body>*:not(#agently-root):not(script){display:none!important}
    * VOICE FEATURES: speaker toggle + mic recording + TTS playback
    * ══════════════════════════════════════════════════════════ */
   var speakMode = false;          // true when user has toggled voice replies ON
+  var conversationMode = false;   // true when we're in the record → reply → TTS → record loop
   var recording = false;
   var mediaRecorder = null;
   var audioChunks = [];
@@ -344,18 +402,24 @@ body>*:not(#agently-root):not(script){display:none!important}
     mic.style.display = 'none';
   }
 
-  /* Speaker toggle — turns auto-play of TTS on bot replies on/off */
+  /* Speaker toggle — turns voice replies on/off.
+   * When ON: replies auto-play as TTS, and tapping mic enters a continuous
+   * record → reply → speak → record conversation loop.
+   * When OFF: back to text-only (plus one-shot voice messages via mic). */
   if (spk) {
     spk.onclick = function() {
       speakMode = !speakMode;
       spk.classList.toggle('on', speakMode);
-      spk.title = speakMode ? 'Voice replies on' : 'Voice replies off';
+      spk.title = speakMode ? 'Voice conversation mode on' : 'Voice conversation mode off';
       if (icoSpkOff && icoSpkOn) {
         icoSpkOff.style.display = speakMode ? 'none' : '';
         icoSpkOn.style.display = speakMode ? '' : 'none';
       }
-      // If turning off, stop any currently-playing audio
-      if (!speakMode) stopPlayback();
+      // If turning off, stop playback and exit the conversation loop
+      if (!speakMode) {
+        conversationMode = false;
+        stopPlayback();
+      }
     };
   }
 
@@ -408,10 +472,20 @@ body>*:not(#agently-root):not(script){display:none!important}
     }
   }
 
-  /* Mic button — toggle recording */
+  /* Mic button — toggle recording.
+   * If the user taps mic while speaker is ON, this starts a continuous
+   * voice conversation loop (record → reply → speak → record…).
+   * Tapping mic a second time stops the current recording and cancels the loop. */
   if (mic) {
     mic.onclick = function() {
-      if (recording) { stopRecording(); return; }
+      if (recording) {
+        // User pressed mic to stop — exit conversation loop too
+        conversationMode = false;
+        stopRecording();
+        return;
+      }
+      // Entering conversation mode: user pressed mic AND speaker is on
+      if (speakMode) conversationMode = true;
       startRecording();
     };
   }
@@ -489,12 +563,21 @@ body>*:not(#agently-root):not(script){display:none!important}
       return r.ok ? r.json() : r.json().then(function(e) { throw new Error((e && e.error && e.error.message) || 'Transcription failed'); });
     })
     .then(function(data) {
+      // Whisper tells us which language the user spoke. If it's one of the
+      // configured languages, switch to it so the bot replies in the same
+      // language (and TTS uses that language's voicing).
+      if (data && data.language) {
+        setActiveLang(data.language);
+      }
       ci.value = (data && data.text) || '';
       if (ci.value.trim()) {
         // Auto-resize and auto-send the transcribed message
         ci.style.height = 'auto';
         ci.style.height = Math.min(ci.scrollHeight, 100) + 'px';
         sendMessage();
+      } else if (conversationMode && speakMode) {
+        // Empty transcription while in conversation mode — re-listen instead of giving up
+        setTimeout(function() { if (speakMode && conversationMode) startRecording(); }, 400);
       }
     })
     .catch(function(err) {
@@ -530,18 +613,544 @@ body>*:not(#agently-root):not(script){display:none!important}
         if (spk) spk.classList.remove('playing');
         URL.revokeObjectURL(url);
         currentAudio = null;
+        // Conversation loop: TTS just finished → auto-listen for the next message
+        if (conversationMode && speakMode && !recording) {
+          setTimeout(function() {
+            if (conversationMode && speakMode && !recording) startRecording();
+          }, 350);
+        }
       };
       currentAudio.onerror = function() {
         if (spk) spk.classList.remove('playing');
         currentAudio = null;
+        // Even if audio errored, try to continue the loop (fallback UX)
+        if (conversationMode && speakMode && !recording) {
+          setTimeout(function() {
+            if (conversationMode && speakMode && !recording) startRecording();
+          }, 350);
+        }
       };
       currentAudio.play().catch(function(err) {
         // Autoplay policies may block — user needs to interact once first
         console.warn('Audio play blocked:', err);
         if (spk) spk.classList.remove('playing');
+        // Don't loop if playback was blocked — user needs to interact
+        conversationMode = false;
       });
     })
     .catch(function(err) { console.warn('TTS failed:', err); });
+  }
+  /* ══════════════════════════════════════════════════════════ */
+
+  /* ══════════════════════════════════════════════════════════
+   * VOICE CONVERSATION MODE
+   * Continuous listen → transcribe → stream → speak → listen loop.
+   * Uses Web Audio API for VAD (voice activity detection),
+   * SSE for streaming AI reply, sentence-queue TTS for low-latency
+   * speech, and interrupt-on-speech while bot is speaking.
+   * ══════════════════════════════════════════════════════════ */
+  var vmActive = false;
+  var vmStream = null;
+  var vmRecorder = null;
+  var vmChunks = [];
+  var vmAudioCtx = null;
+  var vmAnalyser = null;
+  var vmRafId = null;
+  var vmPhase = 'idle';          // 'idle' | 'listening' | 'thinking' | 'speaking'
+  var vmSpeechStarted = false;
+  var vmSilenceStart = null;
+  var vmInterruptCheck = false;  // true while bot is speaking — watch for user to cut in
+  var vmTTSQueue = {};           // seq -> { url, text, aborted }
+  var vmTTSExpected = 0;
+  var vmTTSSeqCounter = 0;
+  var vmCurrentAudio = null;
+  var vmAbortController = null;  // aborts in-flight SSE on interrupt / end
+
+  // VAD tuning — empirically good for phone/laptop mics with echo cancellation on
+  var VAD_SPEECH_RMS = 0.022;
+  var VAD_INTERRUPT_RMS = 0.045; // needs to be LOUDER than TTS leak
+  var VAD_MIN_SPEECH_MS = 300;   // ignore tiny blips
+  var VAD_SILENCE_END_MS = 1100; // wait this long after silence before sending
+  var VAD_MAX_RECORDING_MS = 15000; // hard cap per turn
+
+  function vmSetPhase(phase, statusText, hintText) {
+    vmPhase = phase;
+    if (vmOrb) {
+      vmOrb.classList.remove('listening', 'speaking', 'thinking');
+      if (phase === 'listening') vmOrb.classList.add('listening');
+      else if (phase === 'speaking') vmOrb.classList.add('speaking');
+      else if (phase === 'thinking') vmOrb.classList.add('thinking');
+    }
+    if (vmStatus && statusText != null) vmStatus.textContent = statusText;
+    if (vmHint && hintText != null) vmHint.textContent = hintText;
+  }
+
+  function vmLocalize(en, es) {
+    return currentLang === 'es' ? es : en;
+  }
+
+  if (vmBtn) {
+    vmBtn.onclick = function() { void startVoiceMode(); };
+  }
+  if (vmEnd) {
+    vmEnd.onclick = function() { void endVoiceMode(); };
+  }
+
+  async function startVoiceMode() {
+    if (vmActive) return;
+    if (!hasMediaRecorder) {
+      addBotMsg(vmLocalize(
+        'Your browser does not support voice conversations.',
+        'Tu navegador no admite conversaciones por voz.'
+      ));
+      return;
+    }
+    // Stop any text-mode recording or TTS that was in progress
+    if (recording) { try { stopRecording(); } catch (_) {} }
+    stopPlayback();
+
+    vmActive = true;
+    if (vMode) vMode.classList.add('on');
+    if (vmLangEl) vmLangEl.textContent = (currentLang || 'en').toUpperCase();
+    vmSetPhase('idle', vmLocalize('Requesting microphone…', 'Solicitando micrófono…'), '');
+
+    try {
+      vmStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+    } catch (err) {
+      console.error('Mic permission', err);
+      vmSetPhase('idle',
+        vmLocalize('Microphone access denied.', 'Acceso al micrófono denegado.'),
+        vmLocalize('Please allow microphone access and try again.', 'Permite el acceso al micrófono e inténtalo de nuevo.')
+      );
+      vmActive = false;
+      setTimeout(function() { if (vMode) vMode.classList.remove('on'); }, 2500);
+      return;
+    }
+
+    // Build one analyser that stays alive for the whole session
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      vmAudioCtx = new AC();
+      vmAnalyser = vmAudioCtx.createAnalyser();
+      vmAnalyser.fftSize = 1024;
+      vmAnalyser.smoothingTimeConstant = 0.6;
+      var source = vmAudioCtx.createMediaStreamSource(vmStream);
+      source.connect(vmAnalyser);
+    } catch (e) {
+      console.error('AudioContext failed', e);
+      await endVoiceMode();
+      return;
+    }
+
+    startListening();
+  }
+
+  async function endVoiceMode() {
+    if (!vmActive && !vMode.classList.contains('on')) return;
+    vmActive = false;
+
+    if (vmAbortController) { try { vmAbortController.abort(); } catch (_) {} vmAbortController = null; }
+    if (vmRafId) { cancelAnimationFrame(vmRafId); vmRafId = null; }
+    if (vmRecorder && vmRecorder.state !== 'inactive') { try { vmRecorder.stop(); } catch (_) {} }
+    vmRecorder = null;
+    vmChunks = [];
+
+    if (vmCurrentAudio) { try { vmCurrentAudio.pause(); } catch (_) {} vmCurrentAudio = null; }
+    Object.keys(vmTTSQueue).forEach(function(k) {
+      var entry = vmTTSQueue[k];
+      if (entry && entry.url) URL.revokeObjectURL(entry.url);
+    });
+    vmTTSQueue = {};
+    vmTTSExpected = 0;
+    vmTTSSeqCounter = 0;
+
+    if (vmStream) { try { vmStream.getTracks().forEach(function(t) { t.stop(); }); } catch (_) {} vmStream = null; }
+    if (vmAudioCtx) { try { vmAudioCtx.close(); } catch (_) {} vmAudioCtx = null; }
+    vmAnalyser = null;
+
+    vmSetPhase('idle', '', '');
+    if (vmOrb) vmOrb.classList.remove('listening', 'speaking', 'thinking');
+    if (vMode) vMode.classList.remove('on');
+  }
+
+  function getAudioRms() {
+    if (!vmAnalyser) return 0;
+    var bufLen = vmAnalyser.fftSize;
+    var buf = new Uint8Array(bufLen);
+    vmAnalyser.getByteTimeDomainData(buf);
+    var sum = 0;
+    for (var i = 0; i < bufLen; i++) {
+      var v = (buf[i] - 128) / 128;
+      sum += v * v;
+    }
+    return Math.sqrt(sum / bufLen);
+  }
+
+  function startListening() {
+    if (!vmActive) return;
+    vmSetPhase('listening',
+      vmLocalize('Listening…', 'Escuchando…'),
+      vmLocalize('Speak naturally. I will reply when you pause.', 'Habla con naturalidad. Responderé cuando hagas una pausa.')
+    );
+
+    vmChunks = [];
+    vmSpeechStarted = false;
+    vmSilenceStart = null;
+    vmInterruptCheck = false;
+
+    var mimeType = pickMimeType();
+    try {
+      vmRecorder = mimeType ? new MediaRecorder(vmStream, { mimeType: mimeType }) : new MediaRecorder(vmStream);
+    } catch (err) {
+      console.error('MediaRecorder init (vm) failed', err);
+      void endVoiceMode();
+      return;
+    }
+
+    vmRecorder.ondataavailable = function(e) {
+      if (e.data && e.data.size > 0) vmChunks.push(e.data);
+    };
+
+    var turnStart = Date.now();
+    var finalized = false;
+
+    vmRecorder.onstop = function() {
+      if (finalized) return;
+      finalized = true;
+      if (!vmActive) return;
+      var blob = new Blob(vmChunks, { type: mimeType || 'audio/webm' });
+      if (!vmSpeechStarted || blob.size < 1200) {
+        // Nothing meaningful captured — keep listening
+        if (vmActive) startListening();
+        return;
+      }
+      void handleUserTurn(blob);
+    };
+
+    try { vmRecorder.start(); } catch (err) {
+      console.error('vmRecorder.start', err);
+      void endVoiceMode();
+      return;
+    }
+
+    // Orb pulse loop driven by real audio amplitude
+    var lastLog = 0;
+    function tick() {
+      if (!vmActive) return;
+      var rms = getAudioRms();
+
+      // Drive the orb scale for live visual feedback while listening
+      if (vmOrb && vmPhase === 'listening') {
+        var scale = 1 + Math.min(rms * 6, 0.35);
+        vmOrb.style.transform = 'scale(' + scale.toFixed(3) + ')';
+      }
+
+      var now = Date.now();
+
+      if (vmPhase === 'listening') {
+        if (rms > VAD_SPEECH_RMS) {
+          vmSpeechStarted = true;
+          vmSilenceStart = null;
+        } else if (vmSpeechStarted) {
+          if (vmSilenceStart == null) vmSilenceStart = now;
+          else if (now - vmSilenceStart > VAD_SILENCE_END_MS) {
+            // End of utterance — stop recorder, rest is handled in onstop
+            if (vmRecorder && vmRecorder.state !== 'inactive') {
+              try { vmRecorder.stop(); } catch (_) {}
+            }
+            return; // don't schedule next tick — onstop will kick off next phase
+          }
+        }
+        // Hard cap: if the user keeps going forever, cut them off
+        if (vmSpeechStarted && now - turnStart > VAD_MAX_RECORDING_MS) {
+          if (vmRecorder && vmRecorder.state !== 'inactive') {
+            try { vmRecorder.stop(); } catch (_) {}
+          }
+          return;
+        }
+      } else if (vmInterruptCheck && vmPhase === 'speaking') {
+        // Bot is talking — if user speaks loudly, interrupt
+        if (rms > VAD_INTERRUPT_RMS) {
+          handleInterrupt();
+          return;
+        }
+      }
+
+      vmRafId = requestAnimationFrame(tick);
+    }
+    vmRafId = requestAnimationFrame(tick);
+  }
+
+  async function handleUserTurn(audioBlob) {
+    if (!vmActive) return;
+    vmSetPhase('thinking',
+      vmLocalize('Thinking…', 'Pensando…'),
+      ''
+    );
+
+    // 1) Transcribe
+    var transcript = '';
+    try {
+      var r = await fetch(API + '/api/chatbot-public/transcribe?chatbotId=' + encodeURIComponent(CID), {
+        method: 'POST',
+        headers: { 'Content-Type': audioBlob.type || 'audio/webm' },
+        body: audioBlob,
+      });
+      if (!r.ok) throw new Error('transcribe failed');
+      var tj = await r.json();
+      transcript = (tj && tj.text || '').trim();
+    } catch (e) {
+      console.warn('transcribe failed', e);
+    }
+
+    if (!vmActive) return;
+    if (!transcript) {
+      // Nothing heard — go back to listening
+      if (vmActive) startListening();
+      return;
+    }
+
+    // Show the user's message in the chat log too
+    addUserMsg(transcript);
+
+    // 2) Stream the reply from /chat-stream and TTS sentence-by-sentence
+    await streamAndSpeak(transcript);
+
+    // 3) Loop: back to listening (unless ended mid-flight)
+    if (vmActive) startListening();
+  }
+
+  async function streamAndSpeak(userText) {
+    vmSetPhase('speaking',
+      vmLocalize('Speaking…', 'Hablando…'),
+      vmLocalize('Tap to interrupt — just start speaking.', 'Toca para interrumpir: simplemente habla.')
+    );
+    vmInterruptCheck = true;
+    // Resume orb animation loop (tick returns early when phase is 'speaking' but we still want interrupt detection)
+    if (!vmRafId) {
+      vmRafId = requestAnimationFrame(function spkTick() {
+        if (!vmActive) return;
+        var rms = getAudioRms();
+        if (vmInterruptCheck && rms > VAD_INTERRUPT_RMS) {
+          handleInterrupt();
+          return;
+        }
+        vmRafId = requestAnimationFrame(spkTick);
+      });
+    }
+
+    // Reset TTS queue for this turn
+    vmTTSQueue = {};
+    vmTTSExpected = 0;
+    vmTTSSeqCounter = 0;
+
+    vmAbortController = new AbortController();
+    var fullReply = '';
+    var sentenceBuffer = '';
+
+    try {
+      var resp = await fetch(API + '/api/chatbot-public/chat-stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: userText,
+          chatbotId: CID,
+          history: history.slice(-12),
+          language: currentLang,
+        }),
+        signal: vmAbortController.signal,
+      });
+
+      if (!resp.ok || !resp.body) {
+        // Fall back to non-streaming /chat
+        return await fallbackNonStreaming(userText);
+      }
+
+      var reader = resp.body.getReader();
+      var decoder = new TextDecoder();
+      var leftover = '';
+
+      while (true) {
+        var r = await reader.read();
+        if (r.done || !vmActive) break;
+        var chunkText = decoder.decode(r.value, { stream: true });
+        leftover += chunkText;
+
+        // Parse SSE lines
+        var lines = leftover.split('\n');
+        leftover = lines.pop(); // keep any incomplete tail for next iteration
+
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i].trim();
+          if (!line || line.indexOf('data:') !== 0) continue;
+          var dataStr = line.slice(5).trim();
+          if (!dataStr) continue;
+          var obj;
+          try { obj = JSON.parse(dataStr); } catch (_) { continue; }
+
+          if (obj.error) {
+            throw new Error(obj.error);
+          }
+          if (obj.done) {
+            // Flush any remaining text in buffer
+            if (sentenceBuffer.trim()) {
+              queueSentenceTTS(sentenceBuffer.trim());
+              sentenceBuffer = '';
+            }
+            break;
+          }
+          if (obj.token) {
+            fullReply += obj.token;
+            sentenceBuffer += obj.token;
+            // Detect sentence boundaries for TTS chunking
+            var match;
+            while ((match = sentenceBuffer.match(/^([\s\S]*?[.!?…]+)(\s+|$)/))) {
+              var sentence = match[1].trim();
+              if (sentence) queueSentenceTTS(sentence);
+              sentenceBuffer = sentenceBuffer.slice(match[0].length);
+            }
+          }
+        }
+      }
+
+      // Final flush
+      if (sentenceBuffer.trim()) {
+        queueSentenceTTS(sentenceBuffer.trim());
+      }
+
+      // Record the full reply in the chat log (as a model message)
+      if (fullReply.trim()) {
+        addBotMsg(fullReply.trim());
+      }
+
+      // Wait for all queued TTS audio to finish playing before returning
+      await waitForTTSQueueToDrain();
+    } catch (err) {
+      if (err && err.name === 'AbortError') {
+        // Interrupted — clean exit
+      } else {
+        console.warn('streamAndSpeak failed', err);
+        if (fullReply.trim()) addBotMsg(fullReply.trim());
+      }
+    } finally {
+      vmInterruptCheck = false;
+      vmAbortController = null;
+    }
+  }
+
+  async function fallbackNonStreaming(userText) {
+    try {
+      var r = await fetch(API + '/api/chatbot-public/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: userText,
+          chatbotId: CID,
+          history: history.slice(-12),
+          language: currentLang,
+        }),
+      });
+      var d = await r.json();
+      var reply = (d && d.response) || '';
+      if (reply) {
+        addBotMsg(reply);
+        // Split into sentences and queue
+        var parts = reply.match(/[^.!?…]+[.!?…]+|\S[^.!?…]*$/g) || [reply];
+        for (var i = 0; i < parts.length; i++) {
+          var sent = parts[i].trim();
+          if (sent) queueSentenceTTS(sent);
+        }
+        await waitForTTSQueueToDrain();
+      }
+    } catch (e) {
+      console.warn('fallback /chat failed', e);
+    }
+  }
+
+  function queueSentenceTTS(sentence) {
+    if (!vmActive) return;
+    var seq = vmTTSSeqCounter++;
+    vmTTSQueue[seq] = { pending: true };
+
+    fetch(API + '/api/chatbot-public/speak', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: sentence, chatbotId: CID }),
+    })
+    .then(function(r) { return r.ok ? r.blob() : null; })
+    .then(function(blob) {
+      if (!vmActive) return;
+      if (!blob) { delete vmTTSQueue[seq]; return; }
+      vmTTSQueue[seq] = { url: URL.createObjectURL(blob), pending: false };
+      playTTSInOrder();
+    })
+    .catch(function(err) {
+      console.warn('sentence TTS failed', err);
+      delete vmTTSQueue[seq];
+    });
+  }
+
+  function playTTSInOrder() {
+    if (!vmActive) return;
+    if (vmCurrentAudio) return; // already playing — let onended drive the next one
+    while (vmTTSQueue[vmTTSExpected] && vmTTSQueue[vmTTSExpected].pending) return;
+    var entry = vmTTSQueue[vmTTSExpected];
+    if (!entry) return;
+    delete vmTTSQueue[vmTTSExpected];
+    vmTTSExpected++;
+
+    if (!entry.url) { playTTSInOrder(); return; }
+
+    vmCurrentAudio = new Audio(entry.url);
+    vmCurrentAudio.onended = function() {
+      URL.revokeObjectURL(entry.url);
+      vmCurrentAudio = null;
+      playTTSInOrder();
+    };
+    vmCurrentAudio.onerror = function() {
+      vmCurrentAudio = null;
+      playTTSInOrder();
+    };
+    vmCurrentAudio.play().catch(function(err) {
+      console.warn('vm audio play blocked', err);
+      vmCurrentAudio = null;
+    });
+  }
+
+  function waitForTTSQueueToDrain() {
+    return new Promise(function(resolve) {
+      var start = Date.now();
+      function check() {
+        if (!vmActive) return resolve();
+        var hasPending = Object.keys(vmTTSQueue).length > 0;
+        var isPlaying = !!vmCurrentAudio;
+        if (!hasPending && !isPlaying) return resolve();
+        // Safety cap: don't wait more than 30s for audio to finish
+        if (Date.now() - start > 30000) return resolve();
+        setTimeout(check, 120);
+      }
+      check();
+    });
+  }
+
+  function handleInterrupt() {
+    // Stop streaming, stop TTS playback, go back to listening
+    vmInterruptCheck = false;
+    if (vmAbortController) { try { vmAbortController.abort(); } catch (_) {} }
+    if (vmCurrentAudio) { try { vmCurrentAudio.pause(); } catch (_) {} vmCurrentAudio = null; }
+    Object.keys(vmTTSQueue).forEach(function(k) {
+      var e = vmTTSQueue[k];
+      if (e && e.url) URL.revokeObjectURL(e.url);
+    });
+    vmTTSQueue = {};
+    if (vmRafId) { cancelAnimationFrame(vmRafId); vmRafId = null; }
+    if (vmActive) startListening();
   }
   /* ══════════════════════════════════════════════════════════ */
 

@@ -140,6 +140,97 @@ function buildLanguageInstruction(selectedLanguageCode, allowedLanguageCodes) {
 // POST /api/chatbot-public/chat  (no auth — used by the widget)
 // Body: { message, chatbotId, history?, language? }
 // ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// Shared: fetch chatbot + voice agent, build system prompt.
+// Reused by both /chat and /chat-stream.
+// ─────────────────────────────────────────────────────────────
+async function buildChatContext(db, chatbotId, requestedLanguage) {
+  // Chatbot row (include voice_agent_id so we can pick up the tone)
+  const { data: chatbot, error } = await db
+    .from("chatbots")
+    .select(
+      "id, organization_id, header_title, welcome_message, custom_prompt, faqs, chat_languages, voice_agent_id",
+    )
+    .eq("id", chatbotId)
+    .single();
+
+  if (error || !chatbot) return { error: "Chatbot not found." };
+
+  // Linked voice agent — source of the "tone" the user configured
+  let agentTone = "Professional";
+  if (chatbot.voice_agent_id) {
+    const { data: agent } = await db
+      .from("voice_agents")
+      .select("tone")
+      .eq("id", chatbot.voice_agent_id)
+      .single();
+    if (agent && agent.tone) agentTone = agent.tone;
+  }
+
+  const faqs = Array.isArray(chatbot.faqs) ? chatbot.faqs : [];
+  const allowedLanguages =
+    Array.isArray(chatbot.chat_languages) && chatbot.chat_languages.length > 0
+      ? chatbot.chat_languages
+      : ["en"];
+  const selectedLanguage =
+    requestedLanguage && allowedLanguages.includes(requestedLanguage)
+      ? requestedLanguage
+      : allowedLanguages[0];
+
+  const knowledgeBase = await buildKnowledgeBase(db, chatbotId, faqs);
+  const languageBlock = buildLanguageInstruction(
+    selectedLanguage,
+    allowedLanguages,
+  );
+  const toneBlock = buildToneInstruction(agentTone);
+  const businessName = chatbot.header_title || "this business";
+
+  const basePrompt =
+    chatbot.custom_prompt && chatbot.custom_prompt.trim()
+      ? chatbot.custom_prompt.trim()
+      : [
+          `You are a helpful AI assistant for ${businessName}.`,
+          `Your job is to answer questions about ${businessName} using the information provided in the KNOWLEDGE BASE below.`,
+          "",
+          "BEHAVIOUR:",
+          `• Answer CONFIDENTLY using facts from the KNOWLEDGE BASE — including the owner's name, services, experience, contact details, social links, and anything else present there.`,
+          `• Do NOT say "I cannot provide that information" if the information is in the KNOWLEDGE BASE — USE it.`,
+          `• Be concise: 2–3 sentences for normal replies (voice mode playback gets long very quickly).`,
+          `• If a question genuinely isn't covered by the KNOWLEDGE BASE, briefly say so and offer to connect them with a human.`,
+          `• Never invent facts that aren't in the KNOWLEDGE BASE.`,
+          `• Format with plain paragraphs. Use "- " for bullet lists. Never use literal "\\n" escape sequences — use real line breaks only.`,
+        ].join("\n");
+
+  const systemPrompt = [
+    basePrompt,
+    toneBlock,
+    languageBlock,
+    "",
+    knowledgeBase
+      ? `KNOWLEDGE BASE:\n${knowledgeBase}`
+      : "KNOWLEDGE BASE:\n(No business-specific information has been loaded yet. Politely say you don't have that information and offer to connect them with a human.)",
+  ].join("\n\n");
+
+  return { chatbot, systemPrompt, selectedLanguage, agentTone };
+}
+
+function buildToneInstruction(tone) {
+  const t = (tone || "Professional").toLowerCase();
+  const map = {
+    professional:
+      "Maintain a PROFESSIONAL tone: clear, courteous, business-appropriate. Avoid slang.",
+    friendly:
+      "Maintain a FRIENDLY tone: warm, conversational, approachable. Light humor okay.",
+    empathetic:
+      "Maintain an EMPATHETIC tone: acknowledge feelings, be patient and understanding.",
+  };
+  return `TONE: ${map[t] || map.professional}`;
+}
+
+// ─────────────────────────────────────────────────────────────
+// POST /api/chatbot-public/chat  (no auth — used by the widget)
+// Body: { message, chatbotId, history?, language? }
+// ─────────────────────────────────────────────────────────────
 router.post(
   "/chat",
   asyncHandler(async (req, res) => {
@@ -163,67 +254,12 @@ router.post(
     }
 
     const db = getSupabase();
-
-    // Fetch the chatbot (include chat_languages so we can enforce the allowed set)
-    const { data: chatbot, error } = await db
-      .from("chatbots")
-      .select(
-        "id, organization_id, header_title, welcome_message, custom_prompt, faqs, chat_languages",
-      )
-      .eq("id", chatbotId)
-      .single();
-
-    if (error || !chatbot) {
-      return res.status(404).json({ error: { message: "Chatbot not found." } });
+    const ctx = await buildChatContext(db, chatbotId, language);
+    if (ctx.error) {
+      return res.status(404).json({ error: { message: ctx.error } });
     }
 
-    const faqs = Array.isArray(chatbot.faqs) ? chatbot.faqs : [];
-    const allowedLanguages =
-      Array.isArray(chatbot.chat_languages) && chatbot.chat_languages.length > 0
-        ? chatbot.chat_languages
-        : ["en"];
-
-    // Default to the first allowed language if the widget sent an invalid one
-    const selectedLanguage =
-      language && allowedLanguages.includes(language)
-        ? language
-        : allowedLanguages[0];
-
-    // Build the full knowledge base (FAQs + scraped website chunks)
-    const knowledgeBase = await buildKnowledgeBase(db, chatbotId, faqs);
-
-    // Build the system prompt — confident, knowledge-anchored, strictly localized
-    const businessName = chatbot.header_title || "this business";
-    const languageBlock = buildLanguageInstruction(
-      selectedLanguage,
-      allowedLanguages,
-    );
-
-    const basePrompt =
-      chatbot.custom_prompt && chatbot.custom_prompt.trim()
-        ? chatbot.custom_prompt.trim()
-        : [
-            `You are a helpful AI assistant for ${businessName}.`,
-            `Your job is to answer questions about ${businessName} using the information provided in the KNOWLEDGE BASE below.`,
-            "",
-            "BEHAVIOUR:",
-            `• Answer CONFIDENTLY using facts from the KNOWLEDGE BASE — including the owner's name, services, experience, contact details, social links, and anything else present there.`,
-            `• Do NOT say "I cannot provide that information" if the information is in the KNOWLEDGE BASE — USE it.`,
-            `• Be concise and friendly: 2–4 sentences for normal replies.`,
-            `• If a question genuinely isn't covered by the KNOWLEDGE BASE, briefly say so and offer to connect them with a human.`,
-            `• Never invent facts that aren't in the KNOWLEDGE BASE.`,
-            `• Format with plain paragraphs. Use "- " for bullet lists. Never use literal "\\n" escape sequences — use real line breaks only.`,
-          ].join("\n");
-
-    const systemPrompt = [
-      basePrompt,
-      languageBlock,
-      "",
-      knowledgeBase
-        ? `KNOWLEDGE BASE:\n${knowledgeBase}`
-        : "KNOWLEDGE BASE:\n(No business-specific information has been loaded yet. Politely say you don't have that information and offer to connect them with a human.)",
-    ].join("\n\n");
-
+    const { chatbot, systemPrompt, selectedLanguage } = ctx;
     const chatHistory = Array.isArray(history) ? history.slice(-16) : [];
 
     let response;
@@ -278,6 +314,106 @@ router.post(
     }
 
     return res.json({ response });
+  }),
+);
+
+// ─────────────────────────────────────────────────────────────
+// POST /api/chatbot-public/chat-stream  (no auth, SSE)
+// Body: { message, chatbotId, history?, language? }
+// Response: Server-Sent Events
+//   data: {"token":"Hello"}
+//   data: {"token":" world"}
+//   data: {"done":true}
+//   data: {"error":"..."}  (on failure)
+// Lets the widget speak sentences as they stream in instead of
+// waiting for the full reply — critical for voice-mode latency.
+// ─────────────────────────────────────────────────────────────
+router.post(
+  "/chat-stream",
+  asyncHandler(async (req, res) => {
+    const { message, chatbotId, history, language } = req.body || {};
+
+    if (!message || typeof message !== "string" || !message.trim()) {
+      return res
+        .status(400)
+        .json({ error: { message: "message is required." } });
+    }
+    if (!chatbotId) {
+      return res
+        .status(400)
+        .json({ error: { message: "chatbotId is required." } });
+    }
+    if (isRateLimited(chatbotId)) {
+      return res.status(429).json({ error: { message: "Too many requests." } });
+    }
+
+    const db = getSupabase();
+    const ctx = await buildChatContext(db, chatbotId, language);
+    if (ctx.error) {
+      return res.status(404).json({ error: { message: ctx.error } });
+    }
+    const { systemPrompt } = ctx;
+    const chatHistory = Array.isArray(history) ? history.slice(-16) : [];
+
+    // SSE headers — disable buffering so tokens flush immediately
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no"); // nginx / proxy hint
+    res.flushHeaders && res.flushHeaders();
+
+    const send = (obj) => {
+      try {
+        res.write(`data: ${JSON.stringify(obj)}\n\n`);
+      } catch (_) {
+        /* socket closed */
+      }
+    };
+
+    try {
+      const openai = getOpenAI();
+
+      const messages = [
+        { role: "system", content: systemPrompt },
+        ...chatHistory.map((m) => ({
+          role: m.role === "model" ? "assistant" : "user",
+          content: m.text || m.content || "",
+        })),
+        { role: "user", content: message.trim() },
+      ];
+
+      const stream = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages,
+        stream: true,
+        max_tokens: 300,
+        temperature: 0.65,
+      });
+
+      // Abort the OpenAI stream if the client disconnects mid-response
+      let clientClosed = false;
+      req.on("close", () => {
+        clientClosed = true;
+        try {
+          stream.controller && stream.controller.abort();
+        } catch (_) {}
+      });
+
+      for await (const chunk of stream) {
+        if (clientClosed) break;
+        const token = chunk.choices[0]?.delta?.content || "";
+        if (token) send({ token });
+      }
+
+      if (!clientClosed) send({ done: true });
+    } catch (err) {
+      console.error("[chatbot-public/chat-stream] failed:", err.message);
+      send({ error: err.message || "Streaming failed." });
+    } finally {
+      try {
+        res.end();
+      } catch (_) {}
+    }
   }),
 );
 
@@ -364,18 +500,36 @@ router.post(
       const openai = getOpenAI();
       const audioFile = await toFile(audioBuffer, filename, { type: fileType });
 
+      // verbose_json gives us the detected language alongside the transcript
       const transcription = await openai.audio.transcriptions.create({
         file: audioFile,
         model: "whisper-1",
-        response_format: "text",
+        response_format: "verbose_json",
       });
 
-      const text =
-        typeof transcription === "string"
-          ? transcription
-          : transcription.text || "";
+      // Whisper returns full language names (e.g. "english", "spanish").
+      // Map to ISO codes so the widget can match them against its chat_languages list.
+      const LANG_NAME_TO_CODE = {
+        english: "en",
+        spanish: "es",
+        french: "fr",
+        german: "de",
+        italian: "it",
+        portuguese: "pt",
+        arabic: "ar",
+        chinese: "zh",
+        mandarin: "zh",
+        japanese: "ja",
+        korean: "ko",
+        hindi: "hi",
+        dutch: "nl",
+      };
+      const rawLang = String(transcription.language || "").toLowerCase();
+      const language =
+        LANG_NAME_TO_CODE[rawLang] || rawLang.slice(0, 2) || null;
 
-      return res.json({ text: (text || "").trim() });
+      const text = (transcription.text || "").trim();
+      return res.json({ text, language });
     } catch (err) {
       console.error("[chatbot-public/transcribe] failed:", err.message);
       return res.status(500).json({
