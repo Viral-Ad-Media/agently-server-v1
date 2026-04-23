@@ -58,6 +58,8 @@ router.post(
         faqs: body.faqs || [],
         chat_voice: body.chatVoice || "alloy",
         chat_languages: body.chatLanguages || ["en"],
+        collect_leads:
+          body.collectLeads !== undefined ? !!body.collectLeads : true,
       })
       .select()
       .single();
@@ -112,6 +114,8 @@ router.patch(
     if (body.chatVoice !== undefined) updates.chat_voice = body.chatVoice;
     if (body.chatLanguages !== undefined)
       updates.chat_languages = body.chatLanguages;
+    if (body.collectLeads !== undefined)
+      updates.collect_leads = !!body.collectLeads;
     updates.updated_at = new Date().toISOString();
 
     // Always recompute embed script (position may have changed)

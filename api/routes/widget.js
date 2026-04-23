@@ -35,6 +35,17 @@ router.get("/:id", async (req, res) => {
       (Array.isArray(chatbot.chat_languages) ? chatbot.chat_languages : ["en"]);
     const chatVoice = queryVoice || chatbot.chat_voice || "alloy";
 
+    // Look up the linked voice agent's name — used as the default lead tag
+    let agentName = chatbot.name || chatbot.header_title || "Assistant";
+    if (chatbot.voice_agent_id) {
+      const { data: agent } = await db
+        .from("voice_agents")
+        .select("name")
+        .eq("id", chatbot.voice_agent_id)
+        .single();
+      if (agent && agent.name) agentName = agent.name;
+    }
+
     const cfg = {
       chatbotId: safeStr(id),
       apiUrl: safeStr(apiUrl),
@@ -54,6 +65,9 @@ router.get("/:id", async (req, res) => {
       faqs: JSON.stringify(Array.isArray(chatbot.faqs) ? chatbot.faqs : []),
       chatLanguages: JSON.stringify(chatLanguages),
       chatVoice: safeStr(chatVoice),
+      // Lead capture feature — ON by default (only OFF if explicitly set to false)
+      collectLeads: chatbot.collect_leads !== false,
+      agentName: safeStr(agentName),
     };
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -191,6 +205,28 @@ body>*:not(#agently-root):not(script){display:none!important}
 #spk.on{opacity:1;background:rgba(255,255,255,.2)}
 #spk.playing{animation:spkPulse 1.4s ease-in-out infinite}
 @keyframes spkPulse{0%,100%{transform:scale(1)}50%{transform:scale(1.12)}}
+/* ═══ LEAD CAPTURE FORM (inline in chat) ═══ */
+.leadForm{background:#fff;border:1.5px solid var(--a);border-radius:16px;padding:14px 14px 12px;margin:2px 12px 10px;box-shadow:0 4px 14px rgba(0,0,0,.04);animation:fadeIn .3s ease-out}
+.leadForm.submitted{opacity:.6;pointer-events:none}
+.leadForm .lfTitle{font-size:12px;font-weight:800;color:var(--a);letter-spacing:.05em;text-transform:uppercase;margin-bottom:6px;display:flex;align-items:center;gap:6px}
+.leadForm .lfIcon{width:14px;height:14px;flex-shrink:0}
+.leadForm .lfHint{font-size:11.5px;color:#64748b;margin-bottom:10px;line-height:1.4}
+.leadForm .lfField{margin-bottom:8px}
+.leadForm .lfLabel{display:block;font-size:10.5px;font-weight:700;color:#475569;letter-spacing:.03em;margin-bottom:4px;text-transform:uppercase}
+.leadForm .lfInput{width:100%;padding:9px 11px;border:1.5px solid #e2e8f0;border-radius:10px;font-size:13px;font-family:inherit;outline:none;box-sizing:border-box;transition:border-color .2s;background:#f8fafc}
+.leadForm .lfInput:focus{border-color:var(--a);background:#fff}
+.leadForm .lfInput.invalid{border-color:#ef4444;background:#fef2f2}
+.leadForm .lfRow{display:flex;gap:8px;margin-bottom:8px}
+.leadForm .lfRow .lfField{flex:1;margin-bottom:0}
+.leadForm .lfError{font-size:11px;color:#ef4444;margin-top:4px;display:none}
+.leadForm .lfError.show{display:block}
+.leadForm .lfActions{display:flex;gap:8px;margin-top:6px}
+.leadForm .lfSubmit{flex:1;background:var(--a);color:#fff;border:none;padding:10px 14px;border-radius:10px;font-size:12.5px;font-weight:700;cursor:pointer;transition:opacity .2s}
+.leadForm .lfSubmit:hover{opacity:.9}
+.leadForm .lfSubmit:disabled{opacity:.5;cursor:not-allowed}
+.leadForm .lfSkip{background:transparent;color:#94a3b8;border:none;padding:10px 12px;font-size:12px;font-weight:600;cursor:pointer}
+.leadForm .lfSkip:hover{color:#475569}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 /* ═══ VOICE MODE OVERLAY ═══ */
 #vMode{position:absolute;inset:0;background:linear-gradient(180deg,#0f172a 0%,#1e293b 100%);display:none;flex-direction:column;align-items:center;justify-content:space-between;padding:32px 24px;z-index:10;color:#fff;}
 #vMode.on{display:flex}
@@ -275,6 +311,14 @@ body>*:not(#agently-root):not(script){display:none!important}
   var API = '${cfg.apiUrl}';
   var WELCOME = '${cfg.welcomeMessage}';
   var PLACEHOLDER = '${cfg.placeholder}';
+  var COLLECT_LEADS = ${cfg.collectLeads};
+  var AGENT_NAME = '${cfg.agentName}';
+  // Browser-side conversation persistence with idle TTL.
+  // Conversations are NEVER stored server-side — they live in sessionStorage
+  // and auto-expire after 10 minutes of inactivity.
+  var STORAGE_KEY = 'agently:' + CID;
+  var IDLE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+  var LEAD_CAPTURED_KEY = 'agently:' + CID + ':leadCaptured';
   var FAQS = ${cfg.faqs};
   var PROMPTS = ${cfg.suggestedPrompts};
   var LANGUAGES = ${cfg.chatLanguages};
@@ -1026,9 +1070,11 @@ body>*:not(#agently-root):not(script){display:none!important}
         queueSentenceTTS(sentenceBuffer.trim());
       }
 
-      // Record the full reply in the chat log (as a model message)
+      // Record the full reply in the chat log (as a model message).
+      // Also detect and process any [CAPTURE_LEAD: ...] token before showing/speaking.
       if (fullReply.trim()) {
-        addBotMsg(fullReply.trim());
+        var cleaned = parseAndCaptureLeadFromText(fullReply.trim());
+        addBotMsg(cleaned);
       }
 
       // Wait for all queued TTS audio to finish playing before returning
@@ -1038,7 +1084,10 @@ body>*:not(#agently-root):not(script){display:none!important}
         // Interrupted — clean exit
       } else {
         console.warn('streamAndSpeak failed', err);
-        if (fullReply.trim()) addBotMsg(fullReply.trim());
+        if (fullReply.trim()) {
+          var cleanedErr = parseAndCaptureLeadFromText(fullReply.trim());
+          addBotMsg(cleanedErr);
+        }
       }
     } finally {
       vmInterruptCheck = false;
@@ -1077,13 +1126,17 @@ body>*:not(#agently-root):not(script){display:none!important}
 
   function queueSentenceTTS(sentence) {
     if (!vmActive) return;
+    // Strip any [CAPTURE_LEAD: ...] token from what we speak — the user
+    // shouldn't hear the bot say "open square bracket capture underscore lead".
+    var spoken = String(sentence || '').replace(/\\[CAPTURE_LEAD:[^\\]]*\\]/gi, '').trim();
+    if (!spoken) return;
     var seq = vmTTSSeqCounter++;
     vmTTSQueue[seq] = { pending: true };
 
     fetch(API + '/api/chatbot-public/speak', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: sentence, chatbotId: CID }),
+      body: JSON.stringify({ text: spoken, chatbotId: CID }),
     })
     .then(function(r) { return r.ok ? r.blob() : null; })
     .then(function(blob) {
@@ -1212,8 +1265,26 @@ body>*:not(#agently-root):not(script){display:none!important}
       var raw = sessionStorage.getItem(SESS_KEY);
       if (!raw) return;
       var saved = JSON.parse(raw);
-      if (!Array.isArray(saved)) return;
-      saved.forEach(function(m) {
+
+      // Support both old format (bare array) and new format ({ts, history})
+      var savedAt = 0;
+      var list = null;
+      if (Array.isArray(saved)) {
+        list = saved;
+        savedAt = 0; // legacy — don't expire
+      } else if (saved && typeof saved === 'object') {
+        savedAt = saved.ts || 0;
+        list = Array.isArray(saved.history) ? saved.history : null;
+      }
+      if (!Array.isArray(list)) return;
+
+      // Idle TTL: if last activity was more than 10 minutes ago, wipe.
+      if (savedAt && (Date.now() - savedAt) > IDLE_TTL_MS) {
+        sessionStorage.removeItem(SESS_KEY);
+        return;
+      }
+
+      list.forEach(function(m) {
         if (m.role && m.text) {
           if (m.role === 'model') { history.push({ role: 'model', text: m.text }); addMsg('bot', m.text, true); }
           else { history.push({ role: 'user', text: m.text }); addMsg('usr', m.text, true); }
@@ -1224,7 +1295,12 @@ body>*:not(#agently-root):not(script){display:none!important}
   }
 
   function saveSession() {
-    try { sessionStorage.setItem(SESS_KEY, JSON.stringify(history.slice(-40))); } catch(e) {}
+    try {
+      sessionStorage.setItem(SESS_KEY, JSON.stringify({
+        ts: Date.now(),
+        history: history.slice(-40),
+      }));
+    } catch(e) {}
   }
 
   function addMsg(role, text, skipSave) {
@@ -1305,8 +1381,256 @@ body>*:not(#agently-root):not(script){display:none!important}
       var msg = "Sorry, I'm having trouble connecting right now. Please try again in a moment.";
       addBotMsg(msg);
     })
-    .finally(function() { sending = false; ci.focus(); });
+    .finally(function() { sending = false; ci.focus(); maybeTriggerLeadCapture(); });
   }
+
+  /* ══════════════════════════════════════════════════════════
+   * LEAD CAPTURE
+   * In-chat form for text mode + spoken capture for voice mode.
+   * Only runs when COLLECT_LEADS = true and lead not yet captured.
+   * Lead state lives in sessionStorage (browser-side, no server storage).
+   * ══════════════════════════════════════════════════════════ */
+  var leadFormVisible = false;
+  var leadAttempts = 0;
+  var MAX_LEAD_ATTEMPTS = 2; // don't pester users — try twice, then give up
+
+  function leadAlreadyCaptured() {
+    try { return sessionStorage.getItem(LEAD_CAPTURED_KEY) === 'true'; }
+    catch (_) { return false; }
+  }
+
+  function markLeadCaptured() {
+    try { sessionStorage.setItem(LEAD_CAPTURED_KEY, 'true'); } catch (_) {}
+  }
+
+  function leadL10n(key) {
+    var dict = {
+      en: {
+        ask: "To serve you better, may I have your details? Just your name and either an email or phone number would be perfect.",
+        title: "Quick details",
+        hint: "Name and one of email or phone is required.",
+        name: "Name *",
+        phone: "Phone",
+        email: "Email",
+        submit: "Save details",
+        skip: "Maybe later",
+        thanks: "Thanks! How else can I help?",
+        needName: "Please enter your name.",
+        needContact: "Please enter a phone number or email.",
+        invalidEmail: "That email doesn't look right.",
+        savedFail: "Couldn't save those details — please try again.",
+        textDisabled: "Please complete the form above to continue.",
+      },
+      es: {
+        ask: "Para atenderte mejor, ¿puedo pedirte tus datos? Solo tu nombre y un correo o teléfono.",
+        title: "Datos rápidos",
+        hint: "Nombre y uno de correo o teléfono son obligatorios.",
+        name: "Nombre *",
+        phone: "Teléfono",
+        email: "Correo",
+        submit: "Guardar datos",
+        skip: "Quizá más tarde",
+        thanks: "¡Gracias! ¿En qué más puedo ayudarte?",
+        needName: "Por favor ingresa tu nombre.",
+        needContact: "Por favor ingresa un teléfono o correo.",
+        invalidEmail: "Ese correo no se ve correcto.",
+        savedFail: "No pude guardar los datos — inténtalo de nuevo.",
+        textDisabled: "Por favor completa el formulario para continuar.",
+      },
+    };
+    return (dict[currentLang] || dict.en)[key];
+  }
+
+  function setInputDisabledByLead(disabled) {
+    if (!ci) return;
+    ci.disabled = disabled;
+    sb.disabled = disabled || !ci.value.trim();
+    if (mic) mic.disabled = disabled;
+    ci.placeholder = disabled ? leadL10n('textDisabled') : PLACEHOLDER;
+  }
+
+  function maybeTriggerLeadCapture() {
+    if (!COLLECT_LEADS) return;
+    if (leadAlreadyCaptured()) return;
+    if (leadFormVisible) return;
+    if (vmActive) return; // voice-mode handles its own capture
+    if (leadAttempts >= MAX_LEAD_ATTEMPTS) return;
+
+    // Wait until we've had a real exchange (greeting + at least one user msg + one bot reply)
+    var userMsgs = history.filter(function(m){ return m.role === 'user'; }).length;
+    var botMsgs = history.filter(function(m){ return m.role === 'model'; }).length;
+    if (userMsgs < 1 || botMsgs < 2) return;
+
+    leadAttempts++;
+    setTimeout(function() {
+      addBotMsg(leadL10n('ask'));
+      renderLeadForm();
+    }, 600);
+  }
+
+  function renderLeadForm() {
+    if (leadFormVisible || leadAlreadyCaptured()) return;
+    leadFormVisible = true;
+    setInputDisabledByLead(true);
+
+    var form = document.createElement('div');
+    form.className = 'leadForm';
+    form.id = 'leadForm';
+    form.innerHTML =
+      '<div class="lfTitle">' +
+        '<svg class="lfIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' +
+        '<span>' + leadL10n('title') + '</span>' +
+      '</div>' +
+      '<div class="lfHint">' + leadL10n('hint') + '</div>' +
+      '<div class="lfField">' +
+        '<label class="lfLabel">' + leadL10n('name') + '</label>' +
+        '<input class="lfInput" id="lfName" type="text" autocomplete="name" />' +
+      '</div>' +
+      '<div class="lfRow">' +
+        '<div class="lfField">' +
+          '<label class="lfLabel">' + leadL10n('phone') + '</label>' +
+          '<input class="lfInput" id="lfPhone" type="tel" autocomplete="tel" />' +
+        '</div>' +
+        '<div class="lfField">' +
+          '<label class="lfLabel">' + leadL10n('email') + '</label>' +
+          '<input class="lfInput" id="lfEmail" type="email" autocomplete="email" />' +
+        '</div>' +
+      '</div>' +
+      '<div class="lfError" id="lfError"></div>' +
+      '<div class="lfActions">' +
+        '<button class="lfSkip" type="button" id="lfSkip">' + leadL10n('skip') + '</button>' +
+        '<button class="lfSubmit" type="button" id="lfSubmit">' + leadL10n('submit') + '</button>' +
+      '</div>';
+
+    msgs.appendChild(form);
+    msgs.scrollTop = msgs.scrollHeight;
+
+    var nameEl = form.querySelector('#lfName');
+    var phoneEl = form.querySelector('#lfPhone');
+    var emailEl = form.querySelector('#lfEmail');
+    var errEl = form.querySelector('#lfError');
+    var submitBtn = form.querySelector('#lfSubmit');
+    var skipBtn = form.querySelector('#lfSkip');
+
+    setTimeout(function() { try { nameEl.focus(); } catch(_) {} }, 100);
+
+    function showErr(msg) {
+      errEl.textContent = msg;
+      errEl.classList.add('show');
+    }
+    function clearErr() { errEl.classList.remove('show'); }
+
+    function validateAndSubmit() {
+      clearErr();
+      var name = (nameEl.value || '').trim();
+      var phone = (phoneEl.value || '').trim();
+      var email = (emailEl.value || '').trim();
+
+      if (!name) {
+        nameEl.classList.add('invalid');
+        showErr(leadL10n('needName'));
+        return;
+      }
+      nameEl.classList.remove('invalid');
+
+      if (!phone && !email) {
+        phoneEl.classList.add('invalid');
+        emailEl.classList.add('invalid');
+        showErr(leadL10n('needContact'));
+        return;
+      }
+      phoneEl.classList.remove('invalid');
+      emailEl.classList.remove('invalid');
+
+      if (email && !/.+@.+\\..+/.test(email)) {
+        emailEl.classList.add('invalid');
+        showErr(leadL10n('invalidEmail'));
+        return;
+      }
+
+      submitBtn.disabled = true;
+      submitBtn.textContent = '…';
+
+      fetch(API + '/api/chatbot-public/capture-lead', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chatbotId: CID,
+          name: name,
+          phone: phone,
+          email: email,
+        }),
+      })
+      .then(function(r) {
+        if (!r.ok) return r.json().then(function(j) { throw new Error((j && j.error && j.error.message) || 'failed'); });
+        return r.json();
+      })
+      .then(function() {
+        markLeadCaptured();
+        form.classList.add('submitted');
+        leadFormVisible = false;
+        setInputDisabledByLead(false);
+        addBotMsg(leadL10n('thanks'));
+      })
+      .catch(function(err) {
+        submitBtn.disabled = false;
+        submitBtn.textContent = leadL10n('submit');
+        showErr(err.message || leadL10n('savedFail'));
+      });
+    }
+
+    submitBtn.onclick = validateAndSubmit;
+    skipBtn.onclick = function() {
+      form.remove();
+      leadFormVisible = false;
+      setInputDisabledByLead(false);
+    };
+
+    // Enter on any field submits
+    [nameEl, phoneEl, emailEl].forEach(function(el) {
+      el.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') { e.preventDefault(); validateAndSubmit(); }
+      });
+    });
+  }
+
+  /* Voice-mode lead capture — invoked from streamAndSpeak when token detected.
+   * The system prompt (built server-side) is augmented to instruct the model:
+   * after greeting + first answer, ask for the visitor's name + email/phone,
+   * read it back for confirmation, and on confirmation emit a token like:
+   *   [CAPTURE_LEAD: name=Jane Doe; phone=+1234567890; email=jane@x.com]
+   * The widget regex-matches this token in the streamed text, strips it
+   * before TTS, and POSTs the parsed values to /capture-lead. */
+  function parseAndCaptureLeadFromText(text) {
+    if (!COLLECT_LEADS || leadAlreadyCaptured() || !text) return text;
+    var re = /\\[CAPTURE_LEAD:\\s*([^\\]]+)\\]/i;
+    var m = text.match(re);
+    if (!m) return text;
+    var payload = m[1] || '';
+    var name = '', phone = '', email = '';
+    payload.split(/[;,]/).forEach(function(part) {
+      var kv = part.split('=');
+      if (kv.length < 2) return;
+      var k = kv[0].trim().toLowerCase();
+      var v = kv.slice(1).join('=').trim();
+      if (k === 'name') name = v;
+      else if (k === 'phone') phone = v;
+      else if (k === 'email') email = v;
+    });
+    if (name && (phone || email)) {
+      fetch(API + '/api/chatbot-public/capture-lead', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chatbotId: CID, name: name, phone: phone, email: email }),
+      })
+      .then(function(r) { if (r.ok) markLeadCaptured(); })
+      .catch(function() {});
+    }
+    // Strip the token from the text we display / speak
+    return text.replace(re, '').trim();
+  }
+  /* ══════════════════════════════════════════════════════════ */
+
 })();
 </script>
 </body>

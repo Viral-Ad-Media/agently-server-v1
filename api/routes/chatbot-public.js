@@ -145,26 +145,31 @@ function buildLanguageInstruction(selectedLanguageCode, allowedLanguageCodes) {
 // Reused by both /chat and /chat-stream.
 // ─────────────────────────────────────────────────────────────
 async function buildChatContext(db, chatbotId, requestedLanguage) {
-  // Chatbot row (include voice_agent_id so we can pick up the tone)
+  // Chatbot row (include voice_agent_id so we can pick up the tone,
+  // and collect_leads so we can inform the widget whether to try capture)
   const { data: chatbot, error } = await db
     .from("chatbots")
     .select(
-      "id, organization_id, header_title, welcome_message, custom_prompt, faqs, chat_languages, voice_agent_id",
+      "id, organization_id, header_title, welcome_message, custom_prompt, faqs, chat_languages, voice_agent_id, collect_leads, name",
     )
     .eq("id", chatbotId)
     .single();
 
   if (error || !chatbot) return { error: "Chatbot not found." };
 
-  // Linked voice agent — source of the "tone" the user configured
+  // Linked voice agent — source of the "tone" the user configured AND the name/tag used on captured leads
   let agentTone = "Professional";
+  let agentName = chatbot.name || chatbot.header_title || "Assistant";
   if (chatbot.voice_agent_id) {
     const { data: agent } = await db
       .from("voice_agents")
-      .select("tone")
+      .select("tone, name")
       .eq("id", chatbot.voice_agent_id)
       .single();
-    if (agent && agent.tone) agentTone = agent.tone;
+    if (agent) {
+      if (agent.tone) agentTone = agent.tone;
+      if (agent.name) agentName = agent.name;
+    }
   }
 
   const faqs = Array.isArray(chatbot.faqs) ? chatbot.faqs : [];
@@ -205,13 +210,16 @@ async function buildChatContext(db, chatbotId, requestedLanguage) {
     basePrompt,
     toneBlock,
     languageBlock,
+    buildLeadCaptureInstruction(chatbot, selectedLanguage),
     "",
     knowledgeBase
       ? `KNOWLEDGE BASE:\n${knowledgeBase}`
       : "KNOWLEDGE BASE:\n(No business-specific information has been loaded yet. Politely say you don't have that information and offer to connect them with a human.)",
-  ].join("\n\n");
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 
-  return { chatbot, systemPrompt, selectedLanguage, agentTone };
+  return { chatbot, systemPrompt, selectedLanguage, agentTone, agentName };
 }
 
 function buildToneInstruction(tone) {
@@ -225,6 +233,24 @@ function buildToneInstruction(tone) {
       "Maintain an EMPATHETIC tone: acknowledge feelings, be patient and understanding.",
   };
   return `TONE: ${map[t] || map.professional}`;
+}
+
+// Lead capture sub-prompt — only injected when collect_leads is on.
+// In text mode, the widget renders an in-chat form so the model just needs
+// to softly mention it. In voice mode, the model collects details verbally
+// and emits a [CAPTURE_LEAD: ...] token on confirmation, which the widget
+// regex-matches, strips, and POSTs to /capture-lead.
+function buildLeadCaptureInstruction(chatbot, lang) {
+  if (chatbot.collect_leads === false) return "";
+  const askEn = `After the visitor's first 1-2 messages, gently invite them to share their name plus either an email or phone number — frame it as helping you serve them better. Keep it natural, one sentence. Do NOT push if they ignore or decline.`;
+  const askEs = `Tras los primeros 1-2 mensajes del visitante, invítale amablemente a compartir su nombre y un correo o teléfono — enmárcalo como ayuda para atenderle mejor. Mantenlo natural, una frase. NO insistas si lo ignora o rechaza.`;
+  const tokenRule = `When (and only when) the visitor has explicitly confirmed their details verbally (e.g. "yes that's right"), emit EXACTLY this token at the end of your reply on its own line:\n[CAPTURE_LEAD: name=<full name>; phone=<phone or empty>; email=<email or empty>]\nDo not emit the token before confirmation. Do not emit it more than once. The token will be stripped before the visitor sees it — never refer to it.`;
+  return [
+    "LEAD CAPTURE:",
+    lang === "es" ? askEs : askEn,
+    "When the visitor provides their details, read them back briefly for confirmation (name, phone/email) and ask if it is correct.",
+    tokenRule,
+  ].join("\n");
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -434,9 +460,11 @@ router.post(
         .json({ error: { message: "chatbotId query parameter is required." } });
     }
     if (isRateLimited(chatbotId)) {
-      return res.status(429).json({
-        error: { message: "Too many requests. Please wait a moment." },
-      });
+      return res
+        .status(429)
+        .json({
+          error: { message: "Too many requests. Please wait a moment." },
+        });
     }
 
     // Verify the chatbot exists (prevents random UUIDs from burning quota)
@@ -558,9 +586,11 @@ router.post(
         .json({ error: { message: "chatbotId is required." } });
     }
     if (isRateLimited(chatbotId)) {
-      return res.status(429).json({
-        error: { message: "Too many requests. Please wait a moment." },
-      });
+      return res
+        .status(429)
+        .json({
+          error: { message: "Too many requests. Please wait a moment." },
+        });
     }
 
     const db = getSupabase();
@@ -661,6 +691,224 @@ router.patch(
     }
 
     return res.json({ success: true });
+  }),
+);
+
+// ─────────────────────────────────────────────────────────────
+// GET /api/chatbot-public/config/:chatbotId  (no auth)
+// Returns the minimal config the widget needs at runtime
+// (kept separate from the widget HTML render so the widget can
+// re-check flags without a full page reload).
+// ─────────────────────────────────────────────────────────────
+router.get(
+  "/config/:chatbotId",
+  asyncHandler(async (req, res) => {
+    const { chatbotId } = req.params;
+    if (!chatbotId) {
+      return res
+        .status(400)
+        .json({ error: { message: "chatbotId is required." } });
+    }
+
+    const db = getSupabase();
+    const { data: chatbot, error } = await db
+      .from("chatbots")
+      .select(
+        "id, header_title, chat_languages, chat_voice, collect_leads, voice_agent_id, accent_color",
+      )
+      .eq("id", chatbotId)
+      .single();
+
+    if (error || !chatbot) {
+      return res.status(404).json({ error: { message: "Chatbot not found." } });
+    }
+
+    let agentName = chatbot.header_title || "Assistant";
+    if (chatbot.voice_agent_id) {
+      const { data: agent } = await db
+        .from("voice_agents")
+        .select("name")
+        .eq("id", chatbot.voice_agent_id)
+        .single();
+      if (agent && agent.name) agentName = agent.name;
+    }
+
+    return res.json({
+      id: chatbot.id,
+      agentName,
+      chatLanguages: chatbot.chat_languages || ["en"],
+      chatVoice: chatbot.chat_voice || "alloy",
+      collectLeads: chatbot.collect_leads !== false,
+      accentColor: chatbot.accent_color || "#4f46e5",
+    });
+  }),
+);
+
+// ─────────────────────────────────────────────────────────────
+// POST /api/chatbot-public/capture-lead  (no auth — widget-initiated)
+// Body: { chatbotId, name, phone?, email?, reason? }
+// Rule: name is required, and AT LEAST ONE of phone/email must be present.
+// Creates a row in the org's leads table with:
+//   - source = 'chatbot'
+//   - voice_agent_id = chatbot's linked voice agent (so it appears under that agent)
+//   - tags = [agent name, 'chatbot'] (so it's easy to filter in the CRM)
+// ─────────────────────────────────────────────────────────────
+router.post(
+  "/capture-lead",
+  asyncHandler(async (req, res) => {
+    const { chatbotId, name, phone, email, reason } = req.body || {};
+
+    if (!chatbotId) {
+      return res
+        .status(400)
+        .json({ error: { message: "chatbotId is required." } });
+    }
+    if (!name || typeof name !== "string" || !name.trim()) {
+      return res.status(400).json({ error: { message: "Name is required." } });
+    }
+    const hasPhone = phone && String(phone).trim().length > 0;
+    const hasEmail = email && String(email).trim().length > 0;
+    if (!hasPhone && !hasEmail) {
+      return res
+        .status(400)
+        .json({
+          error: { message: "Please provide a phone number or email address." },
+        });
+    }
+
+    // Very light validation — don't be strict (international formats, etc.)
+    if (hasEmail && !/.+@.+\..+/.test(String(email))) {
+      return res
+        .status(400)
+        .json({
+          error: { message: "That email address does not look valid." },
+        });
+    }
+
+    // Rate limit so a bad actor can't flood the leads table
+    if (isRateLimited(chatbotId)) {
+      return res
+        .status(429)
+        .json({
+          error: {
+            message: "Too many requests. Please try again in a moment.",
+          },
+        });
+    }
+
+    const db = getSupabase();
+
+    const { data: chatbot } = await db
+      .from("chatbots")
+      .select(
+        "id, organization_id, voice_agent_id, collect_leads, header_title, name, leads_collected_count",
+      )
+      .eq("id", chatbotId)
+      .single();
+
+    if (!chatbot) {
+      return res.status(404).json({ error: { message: "Chatbot not found." } });
+    }
+
+    // Honour the toggle: if lead collection is disabled, reject.
+    if (chatbot.collect_leads === false) {
+      return res
+        .status(403)
+        .json({
+          error: { message: "Lead collection is disabled for this chatbot." },
+        });
+    }
+
+    // Look up the agent name for tagging
+    let agentName = chatbot.name || chatbot.header_title || "Chatbot";
+    if (chatbot.voice_agent_id) {
+      const { data: agent } = await db
+        .from("voice_agents")
+        .select("name")
+        .eq("id", chatbot.voice_agent_id)
+        .single();
+      if (agent && agent.name) agentName = agent.name;
+    }
+
+    const normalizedEmail = hasEmail ? String(email).trim().toLowerCase() : "";
+    const normalizedPhone = hasPhone ? String(phone).trim() : "";
+
+    // Deduplicate: if this org already has a lead with the same phone/email, skip insert
+    // (keeps the CRM clean if the same user re-opens the chat on another day)
+    let existingId = null;
+    if (normalizedEmail) {
+      const { data } = await db
+        .from("leads")
+        .select("id")
+        .eq("organization_id", chatbot.organization_id)
+        .eq("email", normalizedEmail)
+        .limit(1)
+        .maybeSingle();
+      if (data) existingId = data.id;
+    }
+    if (!existingId && normalizedPhone) {
+      const { data } = await db
+        .from("leads")
+        .select("id")
+        .eq("organization_id", chatbot.organization_id)
+        .eq("phone", normalizedPhone)
+        .limit(1)
+        .maybeSingle();
+      if (data) existingId = data.id;
+    }
+
+    if (existingId) {
+      return res.json({
+        success: true,
+        leadId: existingId,
+        deduplicated: true,
+      });
+    }
+
+    const tags = [agentName, "chatbot"].filter(Boolean);
+
+    const { data: lead, error: insertErr } = await db
+      .from("leads")
+      .insert({
+        organization_id: chatbot.organization_id,
+        name: String(name).trim(),
+        phone: normalizedPhone,
+        email: normalizedEmail,
+        reason: reason ? String(reason).trim().slice(0, 500) : "",
+        status: "new",
+        source: "chatbot",
+        tags,
+        voice_agent_id: chatbot.voice_agent_id || null,
+        assignment_context: `Captured by chatbot "${agentName}" via widget.`,
+      })
+      .select()
+      .single();
+
+    if (insertErr || !lead) {
+      console.error(
+        "[chatbot-public/capture-lead] insert failed:",
+        insertErr && insertErr.message,
+      );
+      return res
+        .status(500)
+        .json({
+          error: { message: "Failed to save your details. Please try again." },
+        });
+    }
+
+    // Best-effort bump of the counter
+    try {
+      await db
+        .from("chatbots")
+        .update({
+          leads_collected_count: (chatbot.leads_collected_count || 0) + 1,
+        })
+        .eq("id", chatbot.id);
+    } catch (_) {
+      /* ignore */
+    }
+
+    return res.json({ success: true, leadId: lead.id });
   }),
 );
 
