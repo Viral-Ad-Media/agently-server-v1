@@ -74,7 +74,8 @@ router.get("/:id", async (req, res) => {
     res.setHeader("X-Frame-Options", "ALLOWALL");
     res.setHeader(
       "Content-Security-Policy",
-      "frame-ancestors *; default-src 'self' 'unsafe-inline' 'unsafe-eval' https:;",
+      // data: allows base64 audio (TTS). blob: kept for legacy. media-src explicitly set.
+      "frame-ancestors *; default-src 'self' 'unsafe-inline' 'unsafe-eval' https: data: blob:; media-src 'self' https: data: blob:;",
     );
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     res.send(buildWidgetHtml(cfg));
@@ -317,7 +318,7 @@ body>*:not(#agently-root):not(script){display:none!important}
   // Conversations are NEVER stored server-side — they live in sessionStorage
   // and auto-expire after 10 minutes of inactivity.
   var STORAGE_KEY = 'agently:' + CID;
-  var IDLE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+  var IDLE_TTL_MS = 5 * 60 * 1000; // 5 minutes — chat history clears after 5 min of inactivity
   var LEAD_CAPTURED_KEY = 'agently:' + CID + ':leadCaptured';
   var FAQS = ${cfg.faqs};
   var PROMPTS = ${cfg.suggestedPrompts};
@@ -639,6 +640,20 @@ body>*:not(#agently-root):not(script){display:none!important}
     });
   }
 
+  /* ── Audio helper: blob → base64 data URL ───────────────────
+   * CSP on the sandboxed iframe blocks blob: URLs in both local
+   * dev and on Vercel. Base64 data URLs are CSP-safe because they
+   * are inline data, not external resource fetches.
+   * ─────────────────────────────────────────────────────────── */
+  function blobToDataUrl(blob) {
+    return new Promise(function(resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function() { resolve(reader.result); };
+      reader.onerror = function() { reject(new Error('FileReader failed')); };
+      reader.readAsDataURL(blob);
+    });
+  }
+
   /* Call /speak and play the returned mp3 */
   function speakReply(text) {
     if (!speakMode || !text) return;
@@ -651,39 +666,39 @@ body>*:not(#agently-root):not(script){display:none!important}
     .then(function(r) { return r.ok ? r.blob() : null; })
     .then(function(blob) {
       if (!blob) return;
-      var url = URL.createObjectURL(blob);
-      currentAudio = new Audio(url);
-      if (spk) spk.classList.add('playing');
-      currentAudio.onended = function() {
-        if (spk) spk.classList.remove('playing');
-        URL.revokeObjectURL(url);
-        currentAudio = null;
-        // Conversation loop: TTS just finished → auto-listen for the next message
-        if (conversationMode && speakMode && !recording) {
-          setTimeout(function() {
-            if (conversationMode && speakMode && !recording) startRecording();
-          }, 350);
-        }
-      };
-      currentAudio.onerror = function() {
-        if (spk) spk.classList.remove('playing');
-        currentAudio = null;
-        // Even if audio errored, try to continue the loop (fallback UX)
-        if (conversationMode && speakMode && !recording) {
-          setTimeout(function() {
-            if (conversationMode && speakMode && !recording) startRecording();
-          }, 350);
-        }
-      };
-      currentAudio.play().catch(function(err) {
-        // Autoplay policies may block — user needs to interact once first
-        console.warn('Audio play blocked:', err);
-        if (spk) spk.classList.remove('playing');
-        // Don't loop if playback was blocked — user needs to interact
-        conversationMode = false;
+      return blobToDataUrl(blob).then(function(dataUrl) {
+        currentAudio = new Audio();
+        currentAudio.src = dataUrl;
+        if (spk) spk.classList.add('playing');
+        currentAudio.onended = function() {
+          if (spk) spk.classList.remove('playing');
+          currentAudio = null;
+          // Conversation loop: TTS just finished → auto-listen for the next message
+          if (conversationMode && speakMode && !recording) {
+            setTimeout(function() {
+              if (conversationMode && speakMode && !recording) startRecording();
+            }, 350);
+          }
+        };
+        currentAudio.onerror = function(e) {
+          if (spk) spk.classList.remove('playing');
+          currentAudio = null;
+          console.warn('TTS audio error:', e && e.message ? e.message : e);
+          // Even if audio errored, try to continue the loop (fallback UX)
+          if (conversationMode && speakMode && !recording) {
+            setTimeout(function() {
+              if (conversationMode && speakMode && !recording) startRecording();
+            }, 350);
+          }
+        };
+        currentAudio.play().catch(function(err) {
+          console.warn('Audio play blocked:', err && err.message ? err.message : err);
+          if (spk) spk.classList.remove('playing');
+          conversationMode = false;
+        });
       });
     })
-    .catch(function(err) { console.warn('TTS failed:', err); });
+    .catch(function(err) { console.warn('TTS fetch failed:', err && err.message ? err.message : err); });
   }
   /* ══════════════════════════════════════════════════════════ */
 
@@ -808,8 +823,8 @@ body>*:not(#agently-root):not(script){display:none!important}
 
     if (vmCurrentAudio) { try { vmCurrentAudio.pause(); } catch (_) {} vmCurrentAudio = null; }
     Object.keys(vmTTSQueue).forEach(function(k) {
-      var entry = vmTTSQueue[k];
-      if (entry && entry.url) URL.revokeObjectURL(entry.url);
+      // Data URLs don't need to be revoked (unlike blob: URLs)
+      delete vmTTSQueue[k];
     });
     vmTTSQueue = {};
     vmTTSExpected = 0;
@@ -1142,11 +1157,15 @@ body>*:not(#agently-root):not(script){display:none!important}
     .then(function(blob) {
       if (!vmActive) return;
       if (!blob) { delete vmTTSQueue[seq]; return; }
-      vmTTSQueue[seq] = { url: URL.createObjectURL(blob), pending: false };
-      playTTSInOrder();
+      // Convert to data URL — blob: URLs are blocked by iframe CSP
+      return blobToDataUrl(blob).then(function(dataUrl) {
+        if (!vmActive) return;
+        vmTTSQueue[seq] = { url: dataUrl, pending: false };
+        playTTSInOrder();
+      });
     })
     .catch(function(err) {
-      console.warn('sentence TTS failed', err);
+      console.warn('sentence TTS failed', err && err.message ? err.message : err);
       delete vmTTSQueue[seq];
     });
   }
@@ -1162,18 +1181,19 @@ body>*:not(#agently-root):not(script){display:none!important}
 
     if (!entry.url) { playTTSInOrder(); return; }
 
-    vmCurrentAudio = new Audio(entry.url);
+    vmCurrentAudio = new Audio();
+    vmCurrentAudio.src = entry.url; // data URL — CSP-safe, no revoke needed
     vmCurrentAudio.onended = function() {
-      URL.revokeObjectURL(entry.url);
       vmCurrentAudio = null;
       playTTSInOrder();
     };
-    vmCurrentAudio.onerror = function() {
+    vmCurrentAudio.onerror = function(e) {
+      console.warn('vm audio error:', e && e.message ? e.message : e);
       vmCurrentAudio = null;
       playTTSInOrder();
     };
     vmCurrentAudio.play().catch(function(err) {
-      console.warn('vm audio play blocked', err);
+      console.warn('vm audio play blocked:', err && err.message ? err.message : err);
       vmCurrentAudio = null;
     });
   }
@@ -1199,11 +1219,7 @@ body>*:not(#agently-root):not(script){display:none!important}
     vmInterruptCheck = false;
     if (vmAbortController) { try { vmAbortController.abort(); } catch (_) {} }
     if (vmCurrentAudio) { try { vmCurrentAudio.pause(); } catch (_) {} vmCurrentAudio = null; }
-    Object.keys(vmTTSQueue).forEach(function(k) {
-      var e = vmTTSQueue[k];
-      if (e && e.url) URL.revokeObjectURL(e.url);
-    });
-    vmTTSQueue = {};
+    vmTTSQueue = {}; // data URLs — no revoke needed
     if (vmRafId) { cancelAnimationFrame(vmRafId); vmRafId = null; }
     if (vmActive) startListening();
   }

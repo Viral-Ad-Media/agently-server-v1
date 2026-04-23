@@ -36,7 +36,9 @@ const {
   purchasePhoneNumber,
   updateNumberWebhooks,
   releasePhoneNumber,
-  listOwnedNumbers,
+  // listOwnedNumbers intentionally REMOVED — returns ALL master-account numbers
+  // (data leak across all orgs). Number isolation is handled in the route directly.
+  // DO NOT re-add listOwnedNumbers to routes. See /numbers/owned route for details.
   buildConversationRelayTwiml,
   buildOutboundTwiml,
   fetchCallLogs,
@@ -343,13 +345,79 @@ router.get(
   }),
 );
 
-// List all numbers owned on master account
+// ─────────────────────────────────────────────────────────────
+// ██████████████████████████████████████████████████████████████
+//  DO NOT TOUCH — CRITICAL NUMBER ISOLATION
+//  This endpoint returns ONLY numbers belonging to THIS org.
+//  It queries the org's voice_agents rows (which store twilio_phone_sid
+//  after purchase) and fetches each number's details from Twilio by SID.
+//  NEVER call listOwnedNumbers() here — that returns ALL master account
+//  numbers across ALL orgs, which is a data leak. This is intentional.
+//  This is a SaaS — users must never see each other's numbers.
+// ██████████████████████████████████████████████████████████████
+// ─────────────────────────────────────────────────────────────
 router.get(
   "/numbers/owned",
   requireAuth,
-  asyncHandler(async (_req, res) => {
-    const numbers = await listOwnedNumbers();
-    res.json({ numbers });
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+
+    // ── STEP 1: Get only the phone SIDs that belong to THIS org ──
+    const { data: agents, error: agentsErr } = await db
+      .from("voice_agents")
+      .select("id, name, twilio_phone_number, twilio_phone_sid")
+      .eq("organization_id", req.orgId)
+      .neq("twilio_phone_sid", "")
+      .not("twilio_phone_sid", "is", null);
+
+    if (agentsErr) {
+      console.error("[twilio/numbers/owned] DB error:", agentsErr.message);
+      return res
+        .status(500)
+        .json({ error: { message: "Failed to load numbers." } });
+    }
+
+    if (!agents || agents.length === 0) {
+      return res.json({ numbers: [] });
+    }
+
+    // ── STEP 2: Fetch details for each org-owned SID from Twilio ──
+    const numbers = [];
+    for (const agent of agents) {
+      if (!agent.twilio_phone_sid) continue;
+      try {
+        const { twilioRequest } = require("../../lib/twilio");
+        const data = await twilioRequest(
+          "GET",
+          `/IncomingPhoneNumbers/${agent.twilio_phone_sid}.json`,
+        );
+        if (data && data.phone_number) {
+          numbers.push({
+            sid: data.sid,
+            phoneNumber: data.phone_number,
+            friendlyName: data.friendly_name || agent.name,
+            voiceUrl: data.voice_url || "",
+            dateCreated: data.date_created,
+            capabilities: {
+              voice: data.capabilities?.voice ?? true,
+              sms: data.capabilities?.SMS ?? false,
+            },
+            // Link back to the agent so the UI can show which agent uses this number
+            agentId: agent.id,
+            agentName: agent.name,
+          });
+        }
+      } catch (twilioErr) {
+        // If a SID no longer exists on Twilio (released externally), skip it
+        // rather than failing the whole list.
+        console.warn(
+          `[twilio/numbers/owned] SID ${agent.twilio_phone_sid} not found on Twilio:`,
+          twilioErr.message,
+        );
+      }
+    }
+
+    return res.json({ numbers });
   }),
 );
 
@@ -466,6 +534,166 @@ router.delete(
 
     await releasePhoneNumber(sid);
     res.json({ success: true });
+  }),
+);
+
+// ─────────────────────────────────────────────────────────────
+// ── PROTECTED: Verify an Existing (User-Owned) Phone Number ──
+// Users who already own a verified Twilio number or a number that
+// can be verified as a Twilio Caller ID can use this to add it to
+// their account without purchasing through us.
+//
+// FLOW:
+//   POST /api/twilio/numbers/verify-start
+//   → Initiates Twilio Caller ID Verification (makes a call or SMS
+//     to the number with a 6-digit code)
+//   → Returns { callSid, validationCode } so the user can confirm
+//
+//   POST /api/twilio/numbers/verify-complete
+//   → Receives { phoneNumber, validationCode, voiceAgentId }
+//   → Confirms that Twilio verification succeeded (checks
+//     OutgoingCallerIds on master account)
+//   → If valid: stores the number on the voice_agent and returns success
+// ─────────────────────────────────────────────────────────────
+
+// STEP 1: Start caller-ID verification via Twilio (sends a call with a code)
+router.post(
+  "/numbers/verify-start",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const { phoneNumber } = req.body || {};
+    if (!phoneNumber) {
+      return res
+        .status(400)
+        .json({ error: { message: "phoneNumber is required." } });
+    }
+
+    const { twilioRequest } = require("../../lib/twilio");
+
+    // Initiate Twilio Caller ID Verification.
+    // Twilio will place a call to the number and read a 6-digit code.
+    // Reference: https://www.twilio.com/docs/phone-numbers/api/outgoing-caller-ids
+    let data;
+    try {
+      data = await twilioRequest("POST", "/OutgoingCallerIds.json", {
+        PhoneNumber: phoneNumber,
+        FriendlyName: `Agently verification – ${req.organization.name}`,
+        StatusCallback: process.env.API_URL
+          ? `${process.env.API_URL.trim()}/api/twilio/numbers/verify-callback`
+          : undefined,
+      });
+    } catch (err) {
+      const msg = err && err.message ? err.message : String(err);
+      console.error("[verify-start] Twilio error:", msg);
+      return res.status(400).json({
+        error: {
+          message:
+            "Twilio could not initiate verification for that number. " +
+            "Make sure it is a real, reachable phone number. " +
+            `Twilio said: ${msg}`,
+        },
+      });
+    }
+
+    return res.json({
+      validationCode: data.validation_code,
+      callSid: data.call_sid,
+      phoneNumber,
+      // Twilio will call the number — user should answer and enter/note the code
+      instructions:
+        "Twilio will call " +
+        phoneNumber +
+        " now. When answered, note the 6-digit validation code. " +
+        "Then enter it in the next step to complete verification.",
+    });
+  }),
+);
+
+// STEP 2: Complete verification — confirm the code is valid on Twilio's side,
+//         then save the number to the org's voice agent.
+router.post(
+  "/numbers/verify-complete",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const { phoneNumber, voiceAgentId } = req.body || {};
+    if (!phoneNumber) {
+      return res
+        .status(400)
+        .json({ error: { message: "phoneNumber is required." } });
+    }
+
+    const { twilioRequest } = require("../../lib/twilio");
+    const db = getSupabase();
+
+    // Check if Twilio has confirmed this number as an OutgoingCallerId for the master account.
+    // Once the user enters the code correctly on the Twilio call, Twilio marks it verified.
+    let callerIdSid = null;
+    try {
+      const data = await twilioRequest("GET", "/OutgoingCallerIds.json", {
+        PhoneNumber: phoneNumber,
+        PageSize: "5",
+      });
+      const ids = data?.outgoing_caller_ids || [];
+      if (ids.length === 0) {
+        return res.status(400).json({
+          error: {
+            message:
+              "This number has not been verified yet. " +
+              "Please complete the Twilio verification call first.",
+          },
+        });
+      }
+      callerIdSid = ids[0].sid;
+    } catch (err) {
+      console.error("[verify-complete] lookup error:", err && err.message);
+      return res.status(400).json({
+        error: {
+          message: "Could not confirm verification status. Please try again.",
+        },
+      });
+    }
+
+    // Resolve the target agent
+    const targetAgentId =
+      voiceAgentId || req.organization.active_voice_agent_id;
+
+    if (targetAgentId) {
+      const { data: agent } = await db
+        .from("voice_agents")
+        .select("id")
+        .eq("id", targetAgentId)
+        .eq("organization_id", req.orgId)
+        .single();
+
+      if (!agent) {
+        return res
+          .status(404)
+          .json({ error: { message: "Voice agent not found." } });
+      }
+
+      // Store the verified number on the agent.
+      // We use callerIdSid as the phone_sid so it shows in /numbers/owned.
+      await db
+        .from("voice_agents")
+        .update({
+          twilio_phone_number: phoneNumber,
+          twilio_phone_sid: callerIdSid,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", targetAgentId)
+        .eq("organization_id", req.orgId);
+    }
+
+    return res.json({
+      success: true,
+      phoneNumber,
+      callerIdSid,
+      agentId: targetAgentId || null,
+      message:
+        "Number verified and added. You can now assign it to a voice agent.",
+    });
   }),
 );
 
