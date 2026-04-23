@@ -39,6 +39,8 @@ const {
   // listOwnedNumbers intentionally REMOVED — returns ALL master-account numbers
   // (data leak across all orgs). Number isolation is handled in the route directly.
   // DO NOT re-add listOwnedNumbers to routes. See /numbers/owned route for details.
+  verifyCallerIdStart,
+  verifyCallerIdCheck,
   buildConversationRelayTwiml,
   buildOutboundTwiml,
   fetchCallLogs,
@@ -539,24 +541,27 @@ router.delete(
 
 // ─────────────────────────────────────────────────────────────
 // ── PROTECTED: Verify an Existing (User-Owned) Phone Number ──
-// Users who already own a verified Twilio number or a number that
-// can be verified as a Twilio Caller ID can use this to add it to
-// their account without purchasing through us.
 //
-// FLOW:
+// Flow:
 //   POST /api/twilio/numbers/verify-start
-//   → Initiates Twilio Caller ID Verification (makes a call or SMS
-//     to the number with a 6-digit code)
-//   → Returns { callSid, validationCode } so the user can confirm
+//     → Calls verifyCallerIdStart() from lib/twilio.js
+//     → Twilio places a call to the number, reads a 6-digit code
+//     → Returns { validationCode, callSid, phoneNumber, instructions }
 //
 //   POST /api/twilio/numbers/verify-complete
-//   → Receives { phoneNumber, validationCode, voiceAgentId }
-//   → Confirms that Twilio verification succeeded (checks
-//     OutgoingCallerIds on master account)
-//   → If valid: stores the number on the voice_agent and returns success
+//     → Calls verifyCallerIdCheck() from lib/twilio.js
+//     → Confirms the number is now in Twilio's OutgoingCallerIds list
+//     → Saves it to the org's voice agent row in DB
+//     → Returns { success, phoneNumber, callerIdSid, agentId }
+//
+// Error taxonomy → user-friendly messages:
+//   "not verified yet"         → Number not answered / code not entered
+//   "not voice capable"        → VoIP/data-only number, cannot be used by agent
+//   "geographic restrictions"  → Twilio cannot call this number/country
+//   "invalid number"           → Malformed E.164 or non-existent number
 // ─────────────────────────────────────────────────────────────
 
-// STEP 1: Start caller-ID verification via Twilio (sends a call with a code)
+// STEP 1: Start caller-ID verification via Twilio
 router.post(
   "/numbers/verify-start",
   requireAuth,
@@ -566,52 +571,71 @@ router.post(
     if (!phoneNumber) {
       return res
         .status(400)
-        .json({ error: { message: "phoneNumber is required." } });
+        .json({ error: { message: "Please enter a phone number." } });
     }
 
-    const { twilioRequest } = require("../../lib/twilio");
-
-    // Initiate Twilio Caller ID Verification.
-    // Twilio will place a call to the number and read a 6-digit code.
-    // Reference: https://www.twilio.com/docs/phone-numbers/api/outgoing-caller-ids
-    let data;
-    try {
-      data = await twilioRequest("POST", "/OutgoingCallerIds.json", {
-        PhoneNumber: phoneNumber,
-        FriendlyName: `Agently verification – ${req.organization.name}`,
-        StatusCallback: process.env.API_URL
-          ? `${process.env.API_URL.trim()}/api/twilio/numbers/verify-callback`
-          : undefined,
-      });
-    } catch (err) {
-      const msg = err && err.message ? err.message : String(err);
-      console.error("[verify-start] Twilio error:", msg);
+    // Normalise: if user entered a local format (e.g. 09084467821 for Nigeria),
+    // they should have included the + prefix. We advise E.164 in the UI, but
+    // be lenient — if it starts with 0, we note this in the error.
+    const normalised = phoneNumber.trim();
+    if (!normalised.startsWith("+")) {
       return res.status(400).json({
         error: {
-          message:
-            "Twilio could not initiate verification for that number. " +
-            "Make sure it is a real, reachable phone number. " +
-            `Twilio said: ${msg}`,
+          message: `Phone number must include your country code and start with +. For example, a Nigerian number 09084467821 should be entered as +2349084467821.`,
         },
       });
     }
 
-    return res.json({
-      validationCode: data.validation_code,
-      callSid: data.call_sid,
-      phoneNumber,
-      // Twilio will call the number — user should answer and enter/note the code
-      instructions:
-        "Twilio will call " +
-        phoneNumber +
-        " now. When answered, note the 6-digit validation code. " +
-        "Then enter it in the next step to complete verification.",
-    });
+    try {
+      const result = await verifyCallerIdStart(
+        normalised,
+        `Agently – ${req.organization.name}`,
+      );
+
+      return res.json({
+        validationCode: result.validationCode,
+        callSid: result.callSid,
+        phoneNumber: result.phoneNumber,
+        instructions:
+          `Twilio is calling ${result.phoneNumber} right now. ` +
+          `Answer the call and listen — Twilio will read your 6-digit code out loud. ` +
+          `Once you have heard the code and the call ends, click "I've verified" below.`,
+      });
+    } catch (err) {
+      const raw = (err && err.message) || String(err);
+      console.error("[verify-start] Twilio error:", raw);
+
+      // Translate Twilio error codes into plain English
+      let userMessage =
+        "Verification could not be started. Please check the number and try again.";
+      if (
+        raw.includes("not a valid") ||
+        raw.includes("Invalid") ||
+        raw.includes("21211")
+      ) {
+        userMessage =
+          "That does not look like a valid phone number. Please double-check and use the international format (e.g. +2349084467821).";
+      } else if (raw.includes("21612") || raw.includes("geographic")) {
+        userMessage =
+          "Twilio is unable to reach that number — it may be in a region where verification calls are not supported.";
+      } else if (raw.includes("21614") || raw.includes("not reachable")) {
+        userMessage =
+          "That number could not be reached. Make sure it can receive calls and try again.";
+      } else if (
+        raw.includes("trial") ||
+        raw.includes("unverified") ||
+        raw.includes("21219")
+      ) {
+        userMessage =
+          "On a trial Twilio account, you can only verify numbers that you have pre-approved in the Twilio console.";
+      }
+
+      return res.status(400).json({ error: { message: userMessage } });
+    }
   }),
 );
 
-// STEP 2: Complete verification — confirm the code is valid on Twilio's side,
-//         then save the number to the org's voice agent.
+// STEP 2: Complete verification and save the number to the org
 router.post(
   "/numbers/verify-complete",
   requireAuth,
@@ -624,75 +648,97 @@ router.post(
         .json({ error: { message: "phoneNumber is required." } });
     }
 
-    const { twilioRequest } = require("../../lib/twilio");
+    const normalised = phoneNumber.trim();
     const db = getSupabase();
 
-    // Check if Twilio has confirmed this number as an OutgoingCallerId for the master account.
-    // Once the user enters the code correctly on the Twilio call, Twilio marks it verified.
-    let callerIdSid = null;
+    // ── Check Twilio: is the number now verified? ──
+    let checkResult;
     try {
-      const data = await twilioRequest("GET", "/OutgoingCallerIds.json", {
-        PhoneNumber: phoneNumber,
-        PageSize: "5",
-      });
-      const ids = data?.outgoing_caller_ids || [];
-      if (ids.length === 0) {
-        return res.status(400).json({
-          error: {
-            message:
-              "This number has not been verified yet. " +
-              "Please complete the Twilio verification call first.",
-          },
-        });
-      }
-      callerIdSid = ids[0].sid;
+      checkResult = await verifyCallerIdCheck(normalised);
     } catch (err) {
-      console.error("[verify-complete] lookup error:", err && err.message);
+      const raw = (err && err.message) || String(err);
+      console.error("[verify-complete] Twilio check error:", raw);
       return res.status(400).json({
         error: {
-          message: "Could not confirm verification status. Please try again.",
+          message:
+            "We could not confirm the verification. Please try again — make sure you answered the call and heard the code.",
         },
       });
     }
 
-    // Resolve the target agent
+    if (!checkResult.verified) {
+      return res.status(400).json({
+        error: {
+          message:
+            "This number has not been verified yet. " +
+            "Please answer the Twilio verification call first — Twilio reads a code to you on the call. " +
+            'If the call has not arrived, click "Start over" and try again.',
+          code: "NOT_VERIFIED_YET",
+        },
+      });
+    }
+
+    // ── Number is verified — check if it can actually be used as a caller ID ──
+    // Twilio OutgoingCallerIds are usable as caller ID on outbound calls.
+    // They cannot receive inbound calls unless they are IncomingPhoneNumbers.
+    // We store them so the agent can use this number as its outbound caller ID.
+
+    const callerIdSid = checkResult.callerIdSid;
+
+    // ── Resolve target agent ──
     const targetAgentId =
       voiceAgentId || req.organization.active_voice_agent_id;
 
     if (targetAgentId) {
       const { data: agent } = await db
         .from("voice_agents")
-        .select("id")
+        .select("id, name")
         .eq("id", targetAgentId)
         .eq("organization_id", req.orgId)
         .single();
 
       if (!agent) {
-        return res
-          .status(404)
-          .json({ error: { message: "Voice agent not found." } });
+        return res.status(404).json({
+          error: {
+            message:
+              "The selected voice agent was not found. Please select an agent and try again.",
+          },
+        });
       }
 
-      // Store the verified number on the agent.
-      // We use callerIdSid as the phone_sid so it shows in /numbers/owned.
-      await db
+      // Save to DB — use callerIdSid as the phone_sid.
+      // The /numbers/owned route reads by twilio_phone_sid, so this number
+      // will now appear in the org's owned list correctly.
+      const { error: updateErr } = await db
         .from("voice_agents")
         .update({
-          twilio_phone_number: phoneNumber,
+          twilio_phone_number: normalised,
           twilio_phone_sid: callerIdSid,
           updated_at: new Date().toISOString(),
         })
         .eq("id", targetAgentId)
         .eq("organization_id", req.orgId);
+
+      if (updateErr) {
+        console.error("[verify-complete] DB update error:", updateErr.message);
+        return res.status(500).json({
+          error: {
+            message:
+              "Number verified but could not be saved. Please try assigning it manually from the Owned tab.",
+          },
+        });
+      }
     }
 
     return res.json({
       success: true,
-      phoneNumber,
+      phoneNumber: normalised,
       callerIdSid,
       agentId: targetAgentId || null,
-      message:
-        "Number verified and added. You can now assign it to a voice agent.",
+      message: `${normalised} has been verified and added to your owned numbers. You can now use it on outbound calls.`,
+      // Note for the frontend: this is a CallerID, not an IncomingPhoneNumber.
+      // It can be used as the From number on outbound calls but cannot receive inbound calls.
+      canReceiveInbound: false,
     });
   }),
 );
