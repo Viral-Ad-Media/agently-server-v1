@@ -369,7 +369,7 @@ router.get(
     // ── STEP 1: Get only the phone SIDs that belong to THIS org ──
     const { data: agents, error: agentsErr } = await db
       .from("voice_agents")
-      .select("id, name, twilio_phone_number, twilio_phone_sid")
+      .select("id, name, twilio_phone_number, twilio_phone_sid, number_source")
       .eq("organization_id", req.orgId)
       .neq("twilio_phone_sid", "")
       .not("twilio_phone_sid", "is", null);
@@ -385,38 +385,131 @@ router.get(
       return res.json({ numbers: [] });
     }
 
-    // ── STEP 2: Fetch details for each org-owned SID from Twilio ──
+    // ── STEP 2: Fetch details for each org-owned number ────────────────
+    // IncomingPhoneNumbers (PN...) → fetch from /IncomingPhoneNumbers/{sid}
+    // OutgoingCallerIds (CA...)    → fetch from /OutgoingCallerIds/{sid}
+    // SMS_VERIFIED_*               → number is external; show directly from DB
     const numbers = [];
+
+    // Lazy-load the raw Twilio helper (same fetch pattern used in billing-tracker)
+    const sid = (process.env.TWILIO_ACCOUNT_SID || "").trim();
+    const token = (process.env.TWILIO_AUTH_TOKEN || "").trim();
+    const TWILIO_BASE = `https://api.twilio.com/2010-04-01/Accounts/${sid}`;
+    const basicAuth =
+      "Basic " + Buffer.from(`${sid}:${token}`).toString("base64");
+
+    async function twilioFetch(path) {
+      const res = await fetch(`${TWILIO_BASE}${path}`, {
+        headers: { Authorization: basicAuth },
+      });
+      if (res.status === 404) return null;
+      if (!res.ok) return null;
+      return res.json();
+    }
+
     for (const agent of agents) {
       if (!agent.twilio_phone_sid) continue;
+
+      const source =
+        agent.number_source ||
+        (agent.twilio_phone_sid.startsWith("PN")
+          ? "purchased"
+          : agent.twilio_phone_sid.startsWith("CA")
+            ? "imported"
+            : "sms_verified");
+
+      // SMS_VERIFIED numbers are not on Twilio — show from DB directly
+      if (agent.twilio_phone_sid.startsWith("SMS_VERIFIED_")) {
+        numbers.push({
+          sid: agent.twilio_phone_sid,
+          phoneNumber: agent.twilio_phone_number,
+          friendlyName: agent.name,
+          voiceUrl: "",
+          dateCreated: null,
+          capabilities: { voice: false, sms: true },
+          agentId: agent.id,
+          agentName: agent.name,
+          source, // 'sms_verified'
+          sourceLabel: "Imported (SMS verified)",
+        });
+        continue;
+      }
+
       try {
-        const { twilioRequest } = require("../../lib/twilio");
-        const data = await twilioRequest(
-          "GET",
-          `/IncomingPhoneNumbers/${agent.twilio_phone_sid}.json`,
-        );
-        if (data && data.phone_number) {
+        let data = null;
+
+        if (agent.twilio_phone_sid.startsWith("PN")) {
+          // Purchased Twilio number
+          data = await twilioFetch(
+            `/IncomingPhoneNumbers/${agent.twilio_phone_sid}.json`,
+          );
+        } else if (agent.twilio_phone_sid.startsWith("CA")) {
+          // Imported / CallerID verified number
+          data = await twilioFetch(
+            `/OutgoingCallerIds/${agent.twilio_phone_sid}.json`,
+          );
+          if (data) {
+            // OutgoingCallerIds response has different shape — normalise it
+            data = {
+              sid: data.sid,
+              phone_number: data.phone_number || agent.twilio_phone_number,
+              friendly_name: data.friendly_name || agent.name,
+              voice_url: "",
+              date_created: data.date_created,
+              capabilities: { voice: true, SMS: false },
+            };
+          }
+        }
+
+        if (data && (data.phone_number || agent.twilio_phone_number)) {
           numbers.push({
-            sid: data.sid,
-            phoneNumber: data.phone_number,
+            sid: data.sid || agent.twilio_phone_sid,
+            phoneNumber: data.phone_number || agent.twilio_phone_number,
             friendlyName: data.friendly_name || agent.name,
             voiceUrl: data.voice_url || "",
-            dateCreated: data.date_created,
+            dateCreated: data.date_created || null,
             capabilities: {
               voice: data.capabilities?.voice ?? true,
               sms: data.capabilities?.SMS ?? false,
             },
-            // Link back to the agent so the UI can show which agent uses this number
             agentId: agent.id,
             agentName: agent.name,
+            // ── NUMBER SOURCE LABEL ────────────────────────────────────
+            // 'purchased' = bought through Agently from master Twilio account
+            // 'imported'  = user's own number verified via voice CallerID
+            // DO NOT use this to show billing details — see twilio_billing_usd
+            source,
+            sourceLabel:
+              source === "purchased"
+                ? "Purchased via Agently"
+                : source === "imported"
+                  ? "Imported (voice verified)"
+                  : "Imported (SMS verified)",
+          });
+        } else if (!data) {
+          // SID not found on Twilio (released externally) — show from DB with warning
+          numbers.push({
+            sid: agent.twilio_phone_sid,
+            phoneNumber: agent.twilio_phone_number,
+            friendlyName: agent.name,
+            voiceUrl: "",
+            dateCreated: null,
+            capabilities: { voice: true, sms: false },
+            agentId: agent.id,
+            agentName: agent.name,
+            source,
+            sourceLabel:
+              source === "purchased"
+                ? "Purchased (not found on Twilio)"
+                : "Imported",
+            warning:
+              "This number could not be confirmed on Twilio. It may have been released.",
           });
         }
-      } catch (twilioErr) {
-        // If a SID no longer exists on Twilio (released externally), skip it
-        // rather than failing the whole list.
+      } catch (fetchErr) {
         console.warn(
-          `[twilio/numbers/owned] SID ${agent.twilio_phone_sid} not found on Twilio:`,
-          twilioErr.message,
+          `[twilio/numbers/owned] fetch failed for SID ${agent.twilio_phone_sid}:`,
+          fetchErr.message,
         );
       }
     }
@@ -462,12 +555,13 @@ router.post(
       friendlyName: `${req.organization.name} – ${agent.name}`,
     });
 
-    // Save to DB
+    // Save to DB — mark as 'purchased' (came through Agently master account)
     await db
       .from("voice_agents")
       .update({
         twilio_phone_number: phoneNumber,
         twilio_phone_sid: purchased.sid,
+        number_source: "purchased",
         updated_at: new Date().toISOString(),
       })
       .eq("id", targetAgentId);
@@ -739,6 +833,7 @@ router.post(
               .update({
                 twilio_phone_number: verification.phone_number,
                 twilio_phone_sid: checkResult.callerIdSid,
+                number_source: "imported", // user's own number verified via CallerID call
                 updated_at: new Date().toISOString(),
               })
               .eq("id", verification.voice_agent_id)
@@ -906,12 +1001,14 @@ router.post(
 
     const verifySid = (process.env.TWILIO_VERIFY_SERVICE_SID || "").trim();
     if (!verifySid) {
-      return res.status(503).json({
-        error: {
-          message: "SMS verification is not configured.",
-          code: "SMS_VERIFY_NOT_CONFIGURED",
-        },
-      });
+      return res
+        .status(503)
+        .json({
+          error: {
+            message: "SMS verification is not configured.",
+            code: "SMS_VERIFY_NOT_CONFIGURED",
+          },
+        });
     }
 
     const normalised = phoneNumber.trim();
@@ -948,12 +1045,14 @@ router.post(
       }
     } catch (err) {
       console.error("[verify-sms-confirm] error:", err && err.message);
-      return res.status(500).json({
-        error: {
-          message: "Could not confirm OTP. Please try again.",
-          code: "OTP_CHECK_FAILED",
-        },
-      });
+      return res
+        .status(500)
+        .json({
+          error: {
+            message: "Could not confirm OTP. Please try again.",
+            code: "OTP_CHECK_FAILED",
+          },
+        });
     }
 
     // OTP approved — save to DB
@@ -983,6 +1082,7 @@ router.post(
         .update({
           twilio_phone_number: normalised,
           twilio_phone_sid: `SMS_VERIFIED_${normalised.replace(/\+/g, "")}`,
+          number_source: "sms_verified",
           updated_at: new Date().toISOString(),
         })
         .eq("id", targetAgentId)

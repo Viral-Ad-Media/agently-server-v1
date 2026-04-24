@@ -640,11 +640,88 @@ body>*:not(#agently-root):not(script){display:none!important}
     });
   }
 
-  /* ── Audio helper: blob → base64 data URL ───────────────────
-   * CSP on the sandboxed iframe blocks blob: URLs in both local
-   * dev and on Vercel. Base64 data URLs are CSP-safe because they
-   * are inline data, not external resource fetches.
-   * ─────────────────────────────────────────────────────────── */
+  /* ── Unlock AudioContext on first user gesture ──────────────────────
+   * Browsers block audio.play() unless the user has interacted.
+   * We create an AudioContext on the first click anywhere and keep it alive.
+   * Web Audio API's AudioContext bypasses most autoplay restrictions once
+   * unlocked, and we use it for voice-mode TTS playback.
+   * The speaker-toggle (speakReply) still uses HTMLAudio for simplicity
+   * since it's triggered from a button click directly.
+   * ─────────────────────────────────────────────────────────────────── */
+  var audioCtxUnlocked = false;
+  var sharedAudioCtx = null;
+
+  function getAudioCtx() {
+    if (!sharedAudioCtx) {
+      try {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        if (AC) sharedAudioCtx = new AC();
+      } catch (_) {}
+    }
+    if (sharedAudioCtx && sharedAudioCtx.state === 'suspended') {
+      sharedAudioCtx.resume().catch(function() {});
+    }
+    return sharedAudioCtx;
+  }
+
+  // Unlock on first interaction anywhere in the widget
+  document.addEventListener('click', function unlockAudio() {
+    if (audioCtxUnlocked) return;
+    audioCtxUnlocked = true;
+    getAudioCtx();
+    document.removeEventListener('click', unlockAudio);
+  }, { once: true });
+
+  /* Play a base64 data URL via Web Audio API (works even after user gesture expires).
+   * Falls back to HTMLAudio if AudioContext is unavailable. */
+  function playDataUrlVoice(dataUrl, onEnded, onError) {
+    var ctx = getAudioCtx();
+
+    if (!ctx) {
+      // Fallback: HTMLAudio (may be blocked by autoplay policy)
+      var fallback = new Audio();
+      fallback.src = dataUrl;
+      fallback.onended = onEnded || function(){};
+      fallback.onerror = onError || function(){};
+      fallback.play().catch(function(err) {
+        console.warn('[TTS] HTMLAudio fallback blocked:', err && err.message ? err.message : err);
+        if (onError) onError(err);
+      });
+      return { stop: function() { try { fallback.pause(); } catch(_){} } };
+    }
+
+    // Strip the data URL prefix to get raw base64
+    var base64 = dataUrl.split(',')[1];
+    if (!base64) { if (onError) onError(new Error('empty data URL')); return { stop: function(){} }; }
+
+    var binary = atob(base64);
+    var buffer = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) buffer[i] = binary.charCodeAt(i);
+
+    var stopped = false;
+    var source = null;
+
+    ctx.decodeAudioData(buffer.buffer, function(decoded) {
+      if (stopped) return;
+      source = ctx.createBufferSource();
+      source.buffer = decoded;
+      source.connect(ctx.destination);
+      source.onended = function() { if (!stopped) { stopped = true; if (onEnded) onEnded(); } };
+      try { source.start(0); } catch(e) { if (onError) onError(e); }
+    }, function(err) {
+      if (onError) onError(err || new Error('decode failed'));
+    });
+
+    return {
+      stop: function() {
+        stopped = true;
+        if (source) { try { source.stop(); } catch(_) {} source = null; }
+      }
+    };
+  }
+
+  // Track the current voice-mode audio handle (returned by playDataUrlVoice)
+  var vmCurrentHandle = null;
   function blobToDataUrl(blob) {
     return new Promise(function(resolve, reject) {
       var reader = new FileReader();
@@ -723,7 +800,7 @@ body>*:not(#agently-root):not(script){display:none!important}
   var vmTTSQueue = {};           // seq -> { url, text, aborted }
   var vmTTSExpected = 0;
   var vmTTSSeqCounter = 0;
-  var vmCurrentAudio = null;
+  // vmCurrentAudio replaced by vmCurrentHandle (AudioContext-based)
   var vmAbortController = null;  // aborts in-flight SSE on interrupt / end
 
   // VAD tuning — empirically good for phone/laptop mics with echo cancellation on
@@ -821,7 +898,7 @@ body>*:not(#agently-root):not(script){display:none!important}
     vmRecorder = null;
     vmChunks = [];
 
-    if (vmCurrentAudio) { try { vmCurrentAudio.pause(); } catch (_) {} vmCurrentAudio = null; }
+    if (vmCurrentHandle) { try { vmCurrentHandle.stop(); } catch(_) {} vmCurrentHandle = null; }
     Object.keys(vmTTSQueue).forEach(function(k) {
       // Data URLs don't need to be revoked (unlike blob: URLs)
       delete vmTTSQueue[k];
@@ -1172,30 +1249,38 @@ body>*:not(#agently-root):not(script){display:none!important}
 
   function playTTSInOrder() {
     if (!vmActive) return;
-    if (vmCurrentAudio) return; // already playing — let onended drive the next one
-    while (vmTTSQueue[vmTTSExpected] && vmTTSQueue[vmTTSExpected].pending) return;
-    var entry = vmTTSQueue[vmTTSExpected];
-    if (!entry) return;
-    delete vmTTSQueue[vmTTSExpected];
-    vmTTSExpected++;
+    if (vmCurrentHandle) return; // already playing — let onended drive the next one
 
-    if (!entry.url) { playTTSInOrder(); return; }
+    // FIXED: old code had "while (pending) return" which never looped past pending entries.
+    // Now correctly skips over pending entries to find the next ready one.
+    var entry = null;
+    var seq = vmTTSExpected;
+    while (seq in vmTTSQueue) {
+      if (!vmTTSQueue[seq].pending) {
+        entry = vmTTSQueue[seq];
+        delete vmTTSQueue[seq];
+        vmTTSExpected = seq + 1;
+        break;
+      }
+      // This entry is still pending (blobToDataUrl not done yet) — wait
+      return;
+    }
 
-    vmCurrentAudio = new Audio();
-    vmCurrentAudio.src = entry.url; // data URL — CSP-safe, no revoke needed
-    vmCurrentAudio.onended = function() {
-      vmCurrentAudio = null;
-      playTTSInOrder();
-    };
-    vmCurrentAudio.onerror = function(e) {
-      console.warn('vm audio error:', e && e.message ? e.message : e);
-      vmCurrentAudio = null;
-      playTTSInOrder();
-    };
-    vmCurrentAudio.play().catch(function(err) {
-      console.warn('vm audio play blocked:', err && err.message ? err.message : err);
-      vmCurrentAudio = null;
-    });
+    if (!entry) return; // queue empty — done
+    if (!entry.url) { playTTSInOrder(); return; } // empty entry — skip
+
+    vmCurrentHandle = playDataUrlVoice(
+      entry.url,
+      function onEnded() {
+        vmCurrentHandle = null;
+        playTTSInOrder(); // play next sentence
+      },
+      function onError(e) {
+        console.warn('[vm TTS] audio error:', e && e.message ? e.message : e);
+        vmCurrentHandle = null;
+        playTTSInOrder(); // keep going even on error
+      }
+    );
   }
 
   function waitForTTSQueueToDrain() {
@@ -1204,7 +1289,7 @@ body>*:not(#agently-root):not(script){display:none!important}
       function check() {
         if (!vmActive) return resolve();
         var hasPending = Object.keys(vmTTSQueue).length > 0;
-        var isPlaying = !!vmCurrentAudio;
+        var isPlaying = !!vmCurrentHandle;
         if (!hasPending && !isPlaying) return resolve();
         // Safety cap: don't wait more than 30s for audio to finish
         if (Date.now() - start > 30000) return resolve();
@@ -1218,7 +1303,7 @@ body>*:not(#agently-root):not(script){display:none!important}
     // Stop streaming, stop TTS playback, go back to listening
     vmInterruptCheck = false;
     if (vmAbortController) { try { vmAbortController.abort(); } catch (_) {} }
-    if (vmCurrentAudio) { try { vmCurrentAudio.pause(); } catch (_) {} vmCurrentAudio = null; }
+    if (vmCurrentHandle) { try { vmCurrentHandle.stop(); } catch(_) {} vmCurrentHandle = null; }
     vmTTSQueue = {}; // data URLs — no revoke needed
     if (vmRafId) { cancelAnimationFrame(vmRafId); vmRafId = null; }
     if (vmActive) startListening();
