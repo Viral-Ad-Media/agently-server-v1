@@ -154,6 +154,16 @@ safeMount("/api/twilio", () => require("./routes/twilio"), "twilio");
 safeMount("/api", () => require("./routes/misc"), "misc");
 safeMount("/chatbot-widget", () => require("./routes/widget"), "widget");
 
+// ── Start background billing tracker ────────────────────────────────
+// Tracks per-number Twilio costs in the background every 30 seconds.
+// Writes to voice_agents.twilio_billing_usd — NEVER exposed to users.
+// Only starts if Twilio credentials are set (safe to skip in dev).
+try {
+  require("../lib/billing-tracker").start();
+} catch (e) {
+  console.warn("[app] billing-tracker failed to start:", e && e.message);
+}
+
 // 404 for anything else
 app.use((req, res) => {
   setCorsHeaders(req, res);

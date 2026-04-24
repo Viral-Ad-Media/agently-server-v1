@@ -20,12 +20,18 @@
       "dest": "/api/index.js",
       "headers": {
         "X-Frame-Options": "ALLOWALL",
-        "Content-Security-Policy": "frame-ancestors *; default-src 'self' 'unsafe-inline' 'unsafe-eval' https: data: blob:;"
+        "Content-Security-Policy": "frame-ancestors *; default-src 'self' 'unsafe-inline' 'unsafe-eval' https: data: blob:; media-src 'self' https: data: blob:;"
       }
     },
     {
       "src": "/api/(.*)",
       "dest": "/api/index.js"
+    }
+  ],
+  "crons": [
+    {
+      "path": "/api/twilio/_internal/billing-sync",
+      "schedule": "*/2 * * * *"
     }
   ]
 }
