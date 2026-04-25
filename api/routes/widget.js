@@ -326,8 +326,7 @@ body>*:not(#agently-root):not(script){display:none!important}
   var PLACEHOLDER = '${cfg.placeholder}';
   var COLLECT_LEADS = ${cfg.collectLeads};
   var AGENT_NAME = '${cfg.agentName}';
-  // Railway WebSocket server URL for Realtime voice mode
-  // e.g. wss://agently-ws-server-production.up.railway.app
+  var CHAT_VOICE = '${cfg.chatVoice}';
   var REALTIME_WS_BASE = '${cfg.realtimeWsUrl}';
   // Browser-side conversation persistence with idle TTL.
   // Conversations are NEVER stored server-side — they live in sessionStorage
@@ -1173,427 +1172,270 @@ body>*:not(#agently-root):not(script){display:none!important}
   }
   /* ══════════════════════════════════════════════════════════ */
 
-
-  function ft() {
-    return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  }
-
-  /* FIX: renderMd properly handles \\n escape sequences and formats output as HTML */
-  function renderMd(text) {
-    var s = String(text || '');
-    // Decode escaped newlines first
-    s = s.replace(/\\\\n/g, '\\n').replace(/\\n/g, '\\n');
-    // Escape HTML
-    s = s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-    // Bold and italic
-    s = s.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>');
-    s = s.replace(/\\*([^\\*\\n]+?)\\*/g, '<em>$1</em>');
-    s = s.replace(/_([^_\\n]+?)_/g, '<em>$1</em>');
-    // Links
-    s = s.replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-    s = s.replace(/(^|\\s)(https?:\\/\\/[^\\s<]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
-    // Lists
-    var lines = s.split('\\n');
-    var out = [];
-    var inUl = false, inOl = false;
-    for (var i = 0; i < lines.length; i++) {
-      var line = lines[i];
-      var ulMatch = line.match(/^[*\\-•] (.+)/);
-      var olMatch = line.match(/^\\d+\\. (.+)/);
-      if (ulMatch) {
-        if (!inUl) { out.push('<ul>'); inUl = true; }
-        if (inOl) { out.push('</ol>'); inOl = false; }
-        out.push('<li>' + ulMatch[1] + '</li>');
-      } else if (olMatch) {
-        if (!inOl) { out.push('<ol>'); inOl = true; }
-        if (inUl) { out.push('</ul>'); inUl = false; }
-        out.push('<li>' + olMatch[1] + '</li>');
-      } else {
-        if (inUl) { out.push('</ul>'); inUl = false; }
-        if (inOl) { out.push('</ol>'); inOl = false; }
-        if (line.trim() === '') {
-          out.push('<br>');
-        } else {
-          out.push('<p>' + line + '</p>');
-        }
-      }
+  // ── Build system prompt from injected config (browser-side, no server call) ──
+  function buildVoiceSystemPrompt() {
+    var lines = [
+      'You are ' + AGENT_NAME + ', a helpful voice assistant.',
+      'CRITICAL: Keep every response to 1-3 short sentences. This is voice — be concise.',
+      'Never use bullet points, markdown, or lists. Speak in plain natural sentences only.',
+    ];
+    if (LANGUAGES && LANGUAGES.length > 0) {
+      var ln = LANGUAGES.map(function(l){ return LANG_NAMES[l] || l.toUpperCase(); });
+      lines.push('Respond ONLY in: ' + ln.join(' or ') + '. Never switch languages.');
     }
-    if (inUl) out.push('</ul>');
-    if (inOl) out.push('</ol>');
-    return out.join('');
-  }
-
-  var SESS_KEY = 'agently_chat_' + CID;
-
-  function loadSession() {
-    try {
-      var raw = sessionStorage.getItem(SESS_KEY);
-      if (!raw) return;
-      var saved = JSON.parse(raw);
-
-      // Support both old format (bare array) and new format ({ts, history})
-      var savedAt = 0;
-      var list = null;
-      if (Array.isArray(saved)) {
-        list = saved;
-        savedAt = 0; // legacy — don't expire
-      } else if (saved && typeof saved === 'object') {
-        savedAt = saved.ts || 0;
-        list = Array.isArray(saved.history) ? saved.history : null;
-      }
-      if (!Array.isArray(list)) return;
-
-      // Idle TTL: if last activity was more than 10 minutes ago, wipe.
-      if (savedAt && (Date.now() - savedAt) > IDLE_TTL_MS) {
-        sessionStorage.removeItem(SESS_KEY);
-        return;
-      }
-
-      list.forEach(function(m) {
-        if (m.role && m.text) {
-          if (m.role === 'model') { history.push({ role: 'model', text: m.text }); addMsg('bot', m.text, true); }
-          else { history.push({ role: 'user', text: m.text }); addMsg('usr', m.text, true); }
-        }
+    if (FAQS && FAQS.length > 0) {
+      lines.push('\nFREQUENTLY ASKED QUESTIONS:');
+      FAQS.forEach(function(faq) {
+        if (faq.question && faq.answer) lines.push('Q: ' + faq.question + '\nA: ' + faq.answer);
       });
-      greeted = true;
-    } catch(e) {}
-  }
-
-  function saveSession() {
-    try {
-      sessionStorage.setItem(SESS_KEY, JSON.stringify({
-        ts: Date.now(),
-        history: history.slice(-40),
-      }));
-    } catch(e) {}
-  }
-
-  function addMsg(role, text, skipSave) {
-    var wrap = document.createElement('div');
-    wrap.className = 'bubble ' + (role === 'bot' ? 'bot' : 'usr');
-    var inner = document.createElement('div');
-    inner.className = 'btext';
-    inner.innerHTML = role === 'bot' ? renderMd(text) : text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    var time = document.createElement('div');
-    time.className = 'btime';
-    time.textContent = ft();
-    wrap.appendChild(inner);
-    wrap.appendChild(time);
-    msgs.appendChild(wrap);
-    msgs.scrollTop = msgs.scrollHeight;
-    if (!skipSave) saveSession();
-    return wrap;
-  }
-
-  function addBotMsg(text) { history.push({ role: 'model', text: text }); return addMsg('bot', text); }
-  function addUserMsg(text) { history.push({ role: 'user', text: text }); return addMsg('usr', text); }
-
-  function showTyping() {
-    var wrap = document.createElement('div');
-    wrap.id = 'typ'; wrap.className = 'bubble bot typing';
-    var inner = document.createElement('div');
-    inner.className = 'btext';
-    inner.innerHTML = '<div class="tdots"><div class="td"></div><div class="td"></div><div class="td"></div></div>';
-    wrap.appendChild(inner);
-    msgs.appendChild(wrap);
-    msgs.scrollTop = msgs.scrollHeight;
-  }
-  function hideTyping() { var t = document.getElementById('typ'); if (t) t.remove(); }
-
-  function localAnswer(q) {
-    var lq = q.toLowerCase();
-    for (var i = 0; i < FAQS.length; i++) {
-      var faq = FAQS[i];
-      if (!faq.question) continue;
-      var kw = faq.question.toLowerCase().split(/\\s+/).filter(function(w){ return w.length > 4; });
-      var hits = kw.filter(function(k){ return lq.includes(k); });
-      if (kw.length > 0 && hits.length >= Math.min(2, kw.length)) return faq.answer;
     }
-    return null;
-  }
-
-  function sendMessage(preset) {
-    if (sending) return;
-    var text = (preset || ci.value).trim();
-    if (!text) return;
-    ci.value = '';
-    ci.style.height = '';
-    sb.disabled = true;
-    sending = true;
-    addUserMsg(text);
-    showTyping();
-
-    var local = localAnswer(text);
-    if (local) {
-      setTimeout(function() { hideTyping(); addBotMsg(local); speakReply(local); sending = false; ci.focus(); }, 500);
-      return;
+    if (COLLECT_LEADS) {
+      lines.push(
+        '\nLEAD CAPTURE (mandatory):',
+        'After 1-2 exchanges, ask for the visitor name and phone or email.',
+        'Repeat it back to confirm accuracy before accepting. If they decline, re-ask after 2-3 exchanges.'
+      );
     }
-
-    fetch(API + '/api/chatbot-public/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, chatbotId: CID, history: history.slice(-12), language: currentLang })
-    })
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      hideTyping();
-      var reply = (d.response || (d.error && d.error.message) || "I'm here to help! Could you rephrase that?");
-      addBotMsg(reply);
-      speakReply(reply);
-    })
-    .catch(function() {
-      hideTyping();
-      var msg = "Sorry, I'm having trouble connecting right now. Please try again in a moment.";
-      addBotMsg(msg);
-    })
-    .finally(function() { sending = false; ci.focus(); maybeTriggerLeadCapture(); });
+    return lines.join('\n');
   }
 
   /* ══════════════════════════════════════════════════════════
-   * LEAD CAPTURE
-   * In-chat form for text mode + spoken capture for voice mode.
-   * Only runs when COLLECT_LEADS = true and lead not yet captured.
-   * Lead state lives in sessionStorage (browser-side, no server storage).
+   * VOICE CONVERSATION MODE — OpenAI Realtime API (sub-second)
+   * No Supabase on Railway — system prompt built browser-side.
    * ══════════════════════════════════════════════════════════ */
-  var leadFormVisible = false;
-  var leadAttempts = 0;
-  var MAX_LEAD_ATTEMPTS = 2; // don't pester users — try twice, then give up
+  var vmActive       = false;
+  var vmWs           = null;
+  var vmMicStream    = null;
+  var vmAudioCtx     = null;
+  var vmScriptProc   = null;
+  var vmPlaybackNode = null;
+  var vmPlayQueue    = [];
+  var vmPlaying      = false;
 
-  function leadAlreadyCaptured() {
-    try { return sessionStorage.getItem(LEAD_CAPTURED_KEY) === 'true'; }
-    catch (_) { return false; }
-  }
-
-  function markLeadCaptured() {
-    try { sessionStorage.setItem(LEAD_CAPTURED_KEY, 'true'); } catch (_) {}
-  }
-
-  function leadL10n(key) {
-    var dict = {
-      en: {
-        ask: "To serve you better, may I have your details? Just your name and either an email or phone number would be perfect.",
-        title: "Quick details",
-        hint: "Name and one of email or phone is required.",
-        name: "Name *",
-        phone: "Phone",
-        email: "Email",
-        submit: "Save details",
-        skip: "Maybe later",
-        thanks: "Thanks! How else can I help?",
-        needName: "Please enter your name.",
-        needContact: "Please enter a phone number or email.",
-        invalidEmail: "That email doesn't look right.",
-        savedFail: "Couldn't save those details — please try again.",
-        textDisabled: "Please complete the form above to continue.",
-      },
-      es: {
-        ask: "Para atenderte mejor, ¿puedo pedirte tus datos? Solo tu nombre y un correo o teléfono.",
-        title: "Datos rápidos",
-        hint: "Nombre y uno de correo o teléfono son obligatorios.",
-        name: "Nombre *",
-        phone: "Teléfono",
-        email: "Correo",
-        submit: "Guardar datos",
-        skip: "Quizá más tarde",
-        thanks: "¡Gracias! ¿En qué más puedo ayudarte?",
-        needName: "Por favor ingresa tu nombre.",
-        needContact: "Por favor ingresa un teléfono o correo.",
-        invalidEmail: "Ese correo no se ve correcto.",
-        savedFail: "No pude guardar los datos — inténtalo de nuevo.",
-        textDisabled: "Por favor completa el formulario para continuar.",
-      },
-    };
-    return (dict[currentLang] || dict.en)[key];
-  }
-
-  function setInputDisabledByLead(disabled) {
-    if (!ci) return;
-    ci.disabled = disabled;
-    sb.disabled = disabled || !ci.value.trim();
-    if (mic) mic.disabled = disabled;
-    ci.placeholder = disabled ? leadL10n('textDisabled') : PLACEHOLDER;
-  }
-
-  function maybeTriggerLeadCapture() {
-    if (!COLLECT_LEADS) return;
-    if (leadAlreadyCaptured()) return;
-    if (leadFormVisible) return;
-    if (vmActive) return; // voice-mode handles its own capture
-    if (leadAttempts >= MAX_LEAD_ATTEMPTS) return;
-
-    // Wait until we've had a real exchange (greeting + at least one user msg + one bot reply)
-    var userMsgs = history.filter(function(m){ return m.role === 'user'; }).length;
-    var botMsgs = history.filter(function(m){ return m.role === 'model'; }).length;
-    if (userMsgs < 1 || botMsgs < 2) return;
-
-    leadAttempts++;
-    setTimeout(function() {
-      addBotMsg(leadL10n('ask'));
-      renderLeadForm();
-    }, 600);
-  }
-
-  function renderLeadForm() {
-    if (leadFormVisible || leadAlreadyCaptured()) return;
-    leadFormVisible = true;
-    setInputDisabledByLead(true);
-
-    var form = document.createElement('div');
-    form.className = 'leadForm';
-    form.id = 'leadForm';
-    form.innerHTML =
-      '<div class="lfTitle">' +
-        '<svg class="lfIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' +
-        '<span>' + leadL10n('title') + '</span>' +
-      '</div>' +
-      '<div class="lfHint">' + leadL10n('hint') + '</div>' +
-      '<div class="lfField">' +
-        '<label class="lfLabel">' + leadL10n('name') + '</label>' +
-        '<input class="lfInput" id="lfName" type="text" autocomplete="name" />' +
-      '</div>' +
-      '<div class="lfRow">' +
-        '<div class="lfField">' +
-          '<label class="lfLabel">' + leadL10n('phone') + '</label>' +
-          '<input class="lfInput" id="lfPhone" type="tel" autocomplete="tel" />' +
-        '</div>' +
-        '<div class="lfField">' +
-          '<label class="lfLabel">' + leadL10n('email') + '</label>' +
-          '<input class="lfInput" id="lfEmail" type="email" autocomplete="email" />' +
-        '</div>' +
-      '</div>' +
-      '<div class="lfError" id="lfError"></div>' +
-      '<div class="lfActions">' +
-        '<button class="lfSkip" type="button" id="lfSkip">' + leadL10n('skip') + '</button>' +
-        '<button class="lfSubmit" type="button" id="lfSubmit">' + leadL10n('submit') + '</button>' +
-      '</div>';
-
-    msgs.appendChild(form);
-    msgs.scrollTop = msgs.scrollHeight;
-
-    var nameEl = form.querySelector('#lfName');
-    var phoneEl = form.querySelector('#lfPhone');
-    var emailEl = form.querySelector('#lfEmail');
-    var errEl = form.querySelector('#lfError');
-    var submitBtn = form.querySelector('#lfSubmit');
-    var skipBtn = form.querySelector('#lfSkip');
-
-    setTimeout(function() { try { nameEl.focus(); } catch(_) {} }, 100);
-
-    function showErr(msg) {
-      errEl.textContent = msg;
-      errEl.classList.add('show');
+  function vmSetPhase(phase, statusText, hintText) {
+    if (vmOrb) {
+      vmOrb.classList.remove('listening', 'speaking', 'thinking');
+      if (phase === 'listening') vmOrb.classList.add('listening');
+      else if (phase === 'speaking') vmOrb.classList.add('speaking');
+      else if (phase === 'thinking') vmOrb.classList.add('thinking');
     }
-    function clearErr() { errEl.classList.remove('show'); }
+    if (vmStatus && statusText != null) vmStatus.textContent = statusText;
+    if (vmHint   && hintText   != null) vmHint.textContent   = hintText;
+  }
 
-    function validateAndSubmit() {
-      clearErr();
-      var name = (nameEl.value || '').trim();
-      var phone = (phoneEl.value || '').trim();
-      var email = (emailEl.value || '').trim();
+  function vmLocalize(en, es) { return currentLang === 'es' ? es : en; }
 
-      if (!name) {
-        nameEl.classList.add('invalid');
-        showErr(leadL10n('needName'));
-        return;
-      }
-      nameEl.classList.remove('invalid');
+  if (vmBtn) vmBtn.onclick = function() { if (vmActive) endVoiceMode(); else void startVoiceMode(); };
+  if (vmEnd) vmEnd.onclick = function() { endVoiceMode(); };
 
-      if (!phone && !email) {
-        phoneEl.classList.add('invalid');
-        emailEl.classList.add('invalid');
-        showErr(leadL10n('needContact'));
-        return;
-      }
-      phoneEl.classList.remove('invalid');
-      emailEl.classList.remove('invalid');
+  async function startVoiceMode() {
+    if (vmActive) return;
+    if (!REALTIME_WS_BASE) {
+      addBotMsg(vmLocalize('Real-time voice is not configured on this widget.', 'La voz en tiempo real no está configurada.'));
+      return;
+    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      addBotMsg(vmLocalize('Your browser does not support microphone access.', 'Tu navegador no admite acceso al micrófono.'));
+      return;
+    }
+    vmActive = true;
+    if (vMode) vMode.classList.add('on');
+    if (vmLangEl) vmLangEl.textContent = (currentLang || 'en').toUpperCase();
+    vmSetPhase('idle', vmLocalize('Connecting…', 'Conectando…'), '');
 
-      if (email && !/.+@.+\\..+/.test(email)) {
-        emailEl.classList.add('invalid');
-        showErr(leadL10n('invalidEmail'));
-        return;
-      }
-
-      submitBtn.disabled = true;
-      submitBtn.textContent = '…';
-
-      fetch(API + '/api/chatbot-public/capture-lead', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chatbotId: CID,
-          name: name,
-          phone: phone,
-          email: email,
-        }),
-      })
-      .then(function(r) {
-        if (!r.ok) return r.json().then(function(j) { throw new Error((j && j.error && j.error.message) || 'failed'); });
-        return r.json();
-      })
-      .then(function() {
-        markLeadCaptured();
-        form.classList.add('submitted');
-        leadFormVisible = false;
-        setInputDisabledByLead(false);
-        addBotMsg(leadL10n('thanks'));
-      })
-      .catch(function(err) {
-        submitBtn.disabled = false;
-        submitBtn.textContent = leadL10n('submit');
-        showErr(err.message || leadL10n('savedFail'));
+    // Request mic — MUST be in this user gesture
+    var micStream;
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
       });
+    } catch (err) {
+      console.warn('[vm] mic denied:', err.message);
+      vmActive = false;
+      if (vMode) vMode.classList.remove('on');
+      addBotMsg(vmLocalize(
+        'Microphone access denied. Please allow microphone access and try again.',
+        'Acceso al micrófono denegado. Permite el acceso e inténtalo de nuevo.'
+      ));
+      return;
+    }
+    vmMicStream = micStream;
+
+    // Create AudioContext in this user gesture so autoplay is allowed
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      vmAudioCtx = new AC();
+      if (vmAudioCtx.state === 'suspended') vmAudioCtx.resume();
+    } catch (e) {
+      console.warn('[vm] AudioContext failed:', e.message);
+      vmActive = false;
+      cleanupMic();
+      if (vMode) vMode.classList.remove('on');
+      addBotMsg(vmLocalize('Voice mode is not supported by your browser.', 'El modo de voz no es compatible con tu navegador.'));
+      return;
     }
 
-    submitBtn.onclick = validateAndSubmit;
-    skipBtn.onclick = function() {
-      form.remove();
-      leadFormVisible = false;
-      setInputDisabledByLead(false);
+    var wsUrl = REALTIME_WS_BASE + '/realtime?chatbotId=' + encodeURIComponent(CID);
+    try {
+      vmWs = new WebSocket(wsUrl);
+      vmWs.binaryType = 'arraybuffer';
+    } catch (e) {
+      vmActive = false;
+      cleanupMic();
+      if (vMode) vMode.classList.remove('on');
+      addBotMsg(vmLocalize('Could not connect to voice service.', 'No se pudo conectar al servicio de voz.'));
+      return;
+    }
+
+    vmWs.onopen = function() {
+      // Send config immediately — proxy waits for this before opening OpenAI
+      try {
+        vmWs.send(JSON.stringify({
+          type:         'session.init',
+          chatbotId:    CID,
+          systemPrompt: buildVoiceSystemPrompt(),
+          voice:        CHAT_VOICE || 'alloy',
+        }));
+      } catch (e) { console.error('[vm] session.init send failed:', e.message); }
+      vmSetPhase('thinking', vmLocalize('Connecting to AI…', 'Conectando con IA…'), '');
     };
 
-    // Enter on any field submits
-    [nameEl, phoneEl, emailEl].forEach(function(el) {
-      el.addEventListener('keydown', function(e) {
-        if (e.key === 'Enter') { e.preventDefault(); validateAndSubmit(); }
-      });
-    });
+    vmWs.onmessage = function(event) {
+      if (!vmActive) return;
+
+      if (event.data instanceof ArrayBuffer) {
+        playPCMChunk(event.data);
+        return;
+      }
+
+      var msg;
+      try { msg = JSON.parse(event.data); } catch { return; }
+
+      if (msg.type === 'session.connecting') {
+        vmSetPhase('thinking', vmLocalize('Connecting to AI…', 'Conectando con IA…'), '');
+      } else if (msg.type === 'session.ready') {
+        startMicStreaming(micStream, vmAudioCtx);
+        vmSetPhase('listening',
+          vmLocalize('Listening… speak now', 'Escuchando… habla ahora'),
+          vmLocalize('I will reply instantly when you pause.', 'Responderé cuando hagas una pausa.')
+        );
+      } else if (msg.type === 'input_audio_buffer.speech_started') {
+        stopPCMPlayback();
+        vmSetPhase('listening', vmLocalize('Listening…', 'Escuchando…'), '');
+      } else if (msg.type === 'input_audio_buffer.speech_stopped' || msg.type === 'input_audio_buffer.committed') {
+        vmSetPhase('thinking', vmLocalize('Thinking…', 'Pensando…'), '');
+      } else if (msg.type === 'response.created') {
+        vmSetPhase('speaking', vmLocalize('Speaking…', 'Hablando…'), vmLocalize('Tap end to stop.', 'Toca finalizar para detener.'));
+      } else if (msg.type === 'response.done' || msg.type === 'response.audio.done') {
+        waitForAudioDone(function() {
+          if (vmActive) vmSetPhase('listening',
+            vmLocalize('Listening…', 'Escuchando…'),
+            vmLocalize('I will reply instantly when you pause.', 'Responderé cuando hagas una pausa.')
+          );
+        });
+      } else if (msg.type === 'conversation.item.input_audio_transcription.completed') {
+        var t = (msg.transcript || '').trim(); if (t) addUserMsg(t);
+      } else if (msg.type === 'response.audio_transcript.done') {
+        var at = (msg.transcript || '').trim(); if (at) addBotMsg(at);
+      } else if (msg.type === 'error') {
+        console.error('[vm] OpenAI error:', (msg.error && msg.error.message) || msg.message);
+      }
+    };
+
+    vmWs.onerror = function(e) { console.error('[vm] WS error:', e); };
+
+    vmWs.onclose = function(event) {
+      console.log('[vm] WS closed code=' + event.code + ' reason=' + event.reason);
+      if (!vmActive) return;
+      vmActive = false;
+      stopPCMPlayback();
+      cleanupMic();
+      if (vMode) vMode.classList.remove('on');
+      vmSetPhase('idle', '', '');
+      if (event.code !== 1000) {
+        addBotMsg(vmLocalize('Voice connection lost. Please try again.', 'Conexión de voz perdida. Inténtalo de nuevo.'));
+      }
+    };
   }
 
-  /* Voice-mode lead capture — invoked from streamAndSpeak when token detected.
-   * The system prompt (built server-side) is augmented to instruct the model:
-   * after greeting + first answer, ask for the visitor's name + email/phone,
-   * read it back for confirmation, and on confirmation emit a token like:
-   *   [CAPTURE_LEAD: name=Jane Doe; phone=+1234567890; email=jane@x.com]
-   * The widget regex-matches this token in the streamed text, strips it
-   * before TTS, and POSTs the parsed values to /capture-lead. */
-  function parseAndCaptureLeadFromText(text) {
-    if (!COLLECT_LEADS || leadAlreadyCaptured() || !text) return text;
-    var re = /\\[CAPTURE_LEAD:\\s*([^\\]]+)\\]/i;
-    var m = text.match(re);
-    if (!m) return text;
-    var payload = m[1] || '';
-    var name = '', phone = '', email = '';
-    payload.split(/[;,]/).forEach(function(part) {
-      var kv = part.split('=');
-      if (kv.length < 2) return;
-      var k = kv[0].trim().toLowerCase();
-      var v = kv.slice(1).join('=').trim();
-      if (k === 'name') name = v;
-      else if (k === 'phone') phone = v;
-      else if (k === 'email') email = v;
-    });
-    if (name && (phone || email)) {
-      fetch(API + '/api/chatbot-public/capture-lead', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chatbotId: CID, name: name, phone: phone, email: email }),
-      })
-      .then(function(r) { if (r.ok) markLeadCaptured(); })
-      .catch(function() {});
+  function endVoiceMode() {
+    if (!vmActive && !(vMode && vMode.classList.contains('on'))) return;
+    vmActive = false;
+    stopPCMPlayback();
+    cleanupMic();
+    if (vmWs) {
+      try { vmWs.send(JSON.stringify({ type: 'session.end' })); } catch (_) {}
+      try { vmWs.close(1000); } catch (_) {}
+      vmWs = null;
     }
-    // Strip the token from the text we display / speak
-    return text.replace(re, '').trim();
+    vmSetPhase('idle', '', '');
+    if (vMode) vMode.classList.remove('on');
   }
+
+  function startMicStreaming(stream, actx) {
+    if (!actx || actx.state === 'closed') return;
+    try {
+      var source  = actx.createMediaStreamSource(stream);
+      var proc    = actx.createScriptProcessor(4096, 1, 1);
+      var srcRate = actx.sampleRate;
+      proc.onaudioprocess = function(e) {
+        if (!vmActive || !vmWs || vmWs.readyState !== 1) return;
+        var f32    = e.inputBuffer.getChannelData(0);
+        var outLen = srcRate === 24000 ? f32.length : Math.round(f32.length * 24000 / srcRate);
+        var out    = new Float32Array(outLen);
+        for (var i = 0; i < outLen; i++) out[i] = f32[Math.min(Math.round(i * srcRate / 24000), f32.length - 1)];
+        var int16  = new Int16Array(outLen);
+        for (var j = 0; j < outLen; j++) { var s = Math.max(-1, Math.min(1, out[j])); int16[j] = s < 0 ? s * 0x8000 : s * 0x7FFF; }
+        var bytes  = new Uint8Array(int16.buffer);
+        var bin    = '';
+        for (var k = 0; k < bytes.length; k++) bin += String.fromCharCode(bytes[k]);
+        try { vmWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: btoa(bin) })); } catch (_) {}
+      };
+      source.connect(proc);
+      proc.connect(actx.destination);
+      vmScriptProc = proc;
+    } catch (err) { console.warn('[vm] mic stream setup failed:', err.message); }
+  }
+
+  function playPCMChunk(arrayBuffer) {
+    if (!vmAudioCtx || vmAudioCtx.state === 'closed' || !arrayBuffer || !arrayBuffer.byteLength) return;
+    var int16   = new Int16Array(arrayBuffer);
+    var float32 = new Float32Array(int16.length);
+    for (var i = 0; i < int16.length; i++) float32[i] = int16[i] / (int16[i] < 0 ? 0x8000 : 0x7FFF);
+    var buf = vmAudioCtx.createBuffer(1, float32.length, 24000);
+    buf.copyToChannel(float32, 0);
+    vmPlayQueue.push(buf);
+    if (!vmPlaying) drainPlayQueue();
+  }
+
+  function drainPlayQueue() {
+    if (!vmActive || !vmAudioCtx || vmAudioCtx.state === 'closed' || vmPlayQueue.length === 0) { vmPlaying = false; return; }
+    vmPlaying = true;
+    var buf = vmPlayQueue.shift();
+    var src = vmAudioCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(vmAudioCtx.destination);
+    src.onended = function() { drainPlayQueue(); };
+    src.start();
+    vmPlaybackNode = src;
+  }
+
+  function stopPCMPlayback() {
+    vmPlayQueue = []; vmPlaying = false;
+    if (vmPlaybackNode) { try { vmPlaybackNode.stop(); } catch (_) {} vmPlaybackNode = null; }
+  }
+
+  function waitForAudioDone(cb) {
+    if (!vmPlaying && vmPlayQueue.length === 0) { cb(); return; }
+    var t = setInterval(function() { if (!vmPlaying && vmPlayQueue.length === 0) { clearInterval(t); cb(); } }, 80);
+  }
+
+  function cleanupMic() {
+    if (vmScriptProc) { try { vmScriptProc.disconnect(); } catch (_) {} vmScriptProc = null; }
+    if (vmMicStream)  { try { vmMicStream.getTracks().forEach(function(t){t.stop();}); } catch (_) {} vmMicStream = null; }
+    if (vmAudioCtx)   { try { vmAudioCtx.close(); } catch (_) {} vmAudioCtx = null; }
+  }
+
   /* ══════════════════════════════════════════════════════════ */
 
 })();
