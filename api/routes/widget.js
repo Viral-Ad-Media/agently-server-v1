@@ -1035,23 +1035,24 @@ body>*:not(#agently-root):not(script){display:none!important}
   // The processor resamples from the mic's native rate to 24kHz,
   // converts float32 → int16, and sends base64-encoded chunks over WebSocket.
 
-  var WORKLET_CODE = `;
-  class PCMProcessor extends AudioWorkletProcessor {
-    constructor() {
-      super();
-      this._buf = [];
-    }
-    process(inputs) {
-      var ch = inputs[0][0];
-      if (ch) for (var i = 0; i < ch.length; i++) this._buf.push(ch[i]);
-      if (this._buf.length >= 4096) {
-        this.port.postMessage(new Float32Array(this._buf.splice(0, 4096)));
-      }
-      return true;
-    }
-  }
-  registerProcessor("agently-pcm", PCMProcessor);
-  `;
+  // Worklet code as a plain string — NO backticks allowed here because
+  // this JS is embedded inside a Node.js template literal (buildWidgetHtml).
+  // A backtick would prematurely terminate the outer template literal,
+  // cutting off everything after it and breaking the launcher button.
+  var WORKLET_CODE = [
+    'class PCMProcessor extends AudioWorkletProcessor {',
+    '  constructor() { super(); this._buf = []; }',
+    '  process(inputs) {',
+    '    var ch = inputs[0][0];',
+    '    if (ch) for (var i = 0; i < ch.length; i++) this._buf.push(ch[i]);',
+    '    if (this._buf.length >= 4096) {',
+    '      this.port.postMessage(new Float32Array(this._buf.splice(0, 4096)));',
+    '    }',
+    '    return true;',
+    '  }',
+    '}',
+    "registerProcessor('agently-pcm', PCMProcessor);",
+  ].join('\\n');
 
   function startMicCapture(stream, actx) {
     if (!actx) return;
