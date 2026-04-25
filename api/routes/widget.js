@@ -1030,60 +1030,87 @@ body>*:not(#agently-root):not(script){display:none!important}
   }
 
   // ── Mic capture → PCM16 → WebSocket ──────────────────────────
-  // OpenAI Realtime API requires: PCM16 audio, 24kHz, mono.
-  // We use ScriptProcessorNode to capture float32 from mic,
-  // convert to int16, and send raw binary over WebSocket.
+  // OpenAI Realtime API requires PCM16 audio at 24kHz mono.
+  // We use AudioWorklet (modern) with ScriptProcessor fallback (legacy).
+  // The processor resamples from the mic's native rate to 24kHz,
+  // converts float32 → int16, and sends base64-encoded chunks over WebSocket.
+
+  var WORKLET_CODE = `;
+  class PCMProcessor extends AudioWorkletProcessor {
+    constructor() {
+      super();
+      this._buf = [];
+    }
+    process(inputs) {
+      var ch = inputs[0][0];
+      if (ch) for (var i = 0; i < ch.length; i++) this._buf.push(ch[i]);
+      if (this._buf.length >= 4096) {
+        this.port.postMessage(new Float32Array(this._buf.splice(0, 4096)));
+      }
+      return true;
+    }
+  }
+  registerProcessor("agently-pcm", PCMProcessor);
+  `;
+
   function startMicCapture(stream, actx) {
     if (!actx) return;
-    try {
-      var source = actx.createMediaStreamSource(stream);
-      var bufSize = 4096;
-      var proc = actx.createScriptProcessor(bufSize, 1, 1);
 
-      proc.onaudioprocess = function(e) {
-        if (!vmActive || !vmWs || vmWs.readyState !== 1) return;
-        var f32 = e.inputBuffer.getChannelData(0);
-
-        // Resample from mic sample rate to 24kHz if needed
-        var targetRate = 24000;
-        var srcRate = actx.sampleRate;
-        var resampled = f32;
-        if (srcRate !== targetRate) {
-          var ratio = srcRate / targetRate;
-          var outLen = Math.round(f32.length / ratio);
-          var out = new Float32Array(outLen);
-          for (var i = 0; i < outLen; i++) {
-            out[i] = f32[Math.min(Math.round(i * ratio), f32.length - 1)];
-          }
-          resampled = out;
+    function sendFloat32(f32, srcRate) {
+      if (!vmActive || !vmWs || vmWs.readyState !== 1) return;
+      var targetRate = 24000;
+      var resampled = f32;
+      if (srcRate !== targetRate) {
+        var ratio = srcRate / targetRate;
+        var outLen = Math.round(f32.length / ratio);
+        var out = new Float32Array(outLen);
+        for (var i = 0; i < outLen; i++) {
+          out[i] = f32[Math.min(Math.round(i * ratio), f32.length - 1)];
         }
-
-        // Convert float32 → int16
-        var int16 = new Int16Array(resampled.length);
-        for (var j = 0; j < resampled.length; j++) {
-          var s = Math.max(-1, Math.min(1, resampled[j]));
-          int16[j] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-        }
-
-        // Wrap in OpenAI input_audio_buffer.append event
-        // The Realtime API accepts either raw binary (audio bytes only)
-        // or JSON events. We send JSON to keep the message type clear.
-        var b64 = arrayBufferToBase64(int16.buffer);
-        try {
-          vmWs.send(JSON.stringify({
-            type: 'input_audio_buffer.append',
-            audio: b64,
-          }));
-        } catch (_) {}
-      };
-
-      source.connect(proc);
-      proc.connect(actx.destination);
-      vmScriptProc = proc;
-
-    } catch (err) {
-      console.warn('[vm] mic capture setup failed:', err.message);
+        resampled = out;
+      }
+      var int16 = new Int16Array(resampled.length);
+      for (var j = 0; j < resampled.length; j++) {
+        var s = Math.max(-1, Math.min(1, resampled[j]));
+        int16[j] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      var b64 = arrayBufferToBase64(int16.buffer);
+      try {
+        vmWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: b64 }));
+      } catch (_) {}
     }
+
+    var source = actx.createMediaStreamSource(stream);
+
+    // Try AudioWorklet first (modern, not deprecated)
+    if (actx.audioWorklet && actx.audioWorklet.addModule) {
+      var blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
+      var url  = URL.createObjectURL(blob);
+      actx.audioWorklet.addModule(url).then(function() {
+        URL.revokeObjectURL(url);
+        var node = new AudioWorkletNode(actx, 'agently-pcm');
+        node.port.onmessage = function(e) { sendFloat32(e.data, actx.sampleRate); };
+        source.connect(node);
+        node.connect(actx.destination);
+        vmScriptProc = node; // reuse slot for cleanup
+      }).catch(function(e) {
+        console.warn('[vm] AudioWorklet failed, falling back:', e.message);
+        useLegacyProcessor(source, actx, sendFloat32);
+      });
+    } else {
+      useLegacyProcessor(source, actx, sendFloat32);
+    }
+  }
+
+  function useLegacyProcessor(source, actx, sendFloat32) {
+    // ScriptProcessorNode fallback (deprecated but still works everywhere)
+    var proc = actx.createScriptProcessor(4096, 1, 1);
+    proc.onaudioprocess = function(e) {
+      sendFloat32(e.inputBuffer.getChannelData(0), actx.sampleRate);
+    };
+    source.connect(proc);
+    proc.connect(actx.destination);
+    vmScriptProc = proc;
   }
 
   function arrayBufferToBase64(buffer) {
