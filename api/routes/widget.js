@@ -818,6 +818,22 @@ body>*:not(#agently-root):not(script){display:none!important}
   var vmPlayQueue = [];         // [{buffer: AudioBuffer}] queue for ordered playback
   var vmPlaying = false;        // whether we are currently playing audio
 
+  // ── UI helpers — must be defined before startVoiceMode ───────
+  function vmSetPhase(phase, statusText, hintText) {
+    if (vmOrb) {
+      vmOrb.classList.remove('listening', 'speaking', 'thinking');
+      if (phase === 'listening') vmOrb.classList.add('listening');
+      else if (phase === 'speaking') vmOrb.classList.add('speaking');
+      else if (phase === 'thinking') vmOrb.classList.add('thinking');
+    }
+    if (vmStatus && statusText != null) vmStatus.textContent = statusText;
+    if (vmHint   && hintText   != null) vmHint.textContent   = hintText;
+  }
+
+  function vmLocalize(en, es) {
+    return currentLang === 'es' ? es : en;
+  }
+
   if (vmBtn) {
     vmBtn.onclick = function() {
       if (vmActive) { void endVoiceMode(); }
