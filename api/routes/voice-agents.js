@@ -9,39 +9,6 @@ const { updateNumberWebhooks } = require("../../lib/twilio");
 
 const router = express.Router();
 
-// ── GET /api/voice-agents ────────────────────────────────────
-// Returns all voice agents for the org, including their FAQs.
-// Used by the Leads page dropdown and any other page that needs the agent list.
-router.get(
-  "/",
-  requireAuth,
-  asyncHandler(async (req, res) => {
-    const db = getSupabase();
-    const { data: agents, error } = await db
-      .from("voice_agents")
-      .select("*")
-      .eq("organization_id", req.orgId)
-      .order("created_at", { ascending: true });
-
-    if (error) {
-      return res.status(500).json({ error: { message: "Failed to fetch voice agents." } });
-    }
-
-    const agentsWithFaqs = await Promise.all(
-      (agents || []).map(async (agent) => {
-        const { data: faqs } = await db
-          .from("faqs")
-          .select("*")
-          .eq("voice_agent_id", agent.id)
-          .order("created_at", { ascending: true });
-        return serializeAgent(agent, faqs || []);
-      })
-    );
-
-    res.json(agentsWithFaqs);
-  })
-);
-
 // ── POST /api/voice-agents ───────────────────────────────────
 router.post(
   "/",
@@ -122,6 +89,25 @@ router.patch(
       updates.twilio_phone_number = body.twilioPhoneNumber;
     if (body.twilioPhoneSid !== undefined)
       updates.twilio_phone_sid = body.twilioPhoneSid;
+
+    // Call purposes — outbound only, an array of plain-text call reasons
+    if (body.callPurposes !== undefined)
+      updates.call_purposes = Array.isArray(body.callPurposes)
+        ? body.callPurposes
+        : [];
+
+    // ── Number unassignment ────────────────────────────────────
+    // Clears twilio_phone_number and twilio_phone_sid from this agent
+    // so the number can be assigned to a different agent.
+    // The number itself remains in "All Owned" — it is NOT released from Twilio.
+    // NOTE: Two agents must NEVER share the same phone number.
+    if (body.unassignNumber === true) {
+      // Conflict check — no other agent should be getting this number
+      updates.twilio_phone_number = "";
+      updates.twilio_phone_sid = "";
+      updates.number_source = null;
+    }
+
     updates.updated_at = new Date().toISOString();
 
     const { data: agent, error } = await db

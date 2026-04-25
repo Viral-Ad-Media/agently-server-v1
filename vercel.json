@@ -31,7 +31,7 @@
   "crons": [
     {
       "path": "/api/twilio/_internal/billing-sync",
-      "schedule": "*/2 * * * *"
+      "schedule": "0 2 * * *"
     }
   ]
 }
