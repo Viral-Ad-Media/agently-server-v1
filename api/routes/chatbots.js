@@ -17,7 +17,15 @@ function buildEmbedScript(row) {
   const opp = pos === "left" ? "right" : "left";
   return {
     widgetUrl,
-    embedScript: `<!-- Agently Chat Widget -->\n<iframe\n  id="agently-widget-${row.id}"\n  src="${widgetUrl}"\n  style="position:fixed;bottom:20px;${pos}:20px;${opp}:auto;width:420px;height:700px;max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);border:none;background:transparent;z-index:2147483646;overflow:hidden;"\n  scrolling="no" frameborder="0" allow="microphone"\n  sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"\n  title="Chat widget"\n></iframe>`,
+    embedScript: `<!-- Agently Chat Widget -->
+<iframe
+  id="agently-widget-${row.id}"
+  src="${widgetUrl}"
+  style="position:fixed;bottom:20px;${pos}:20px;${opp}:auto;width:420px;height:700px;max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);border:none;background:transparent;z-index:2147483646;overflow:hidden;"
+  scrolling="no" frameborder="0"
+  allow="microphone *; camera *; autoplay *; clipboard-write *"
+  title="Chat widget"
+></iframe>`,
   };
 }
 

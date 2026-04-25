@@ -83,8 +83,12 @@ router.get("/:id", async (req, res) => {
     res.setHeader(
       "Content-Security-Policy",
       // data: allows base64 audio (TTS). blob: kept for legacy. media-src explicitly set.
-      "frame-ancestors *; default-src 'self' 'unsafe-inline' 'unsafe-eval' https: data: blob:; media-src 'self' https: data: blob:;",
+      "frame-ancestors *; default-src 'self' 'unsafe-inline' 'unsafe-eval' https: data: blob:; media-src 'self' https: data: blob:; connect-src 'self' https: wss:;",
     );
+    // Permissions-Policy: explicitly grant microphone to this iframe
+    // Without this, even allow="microphone" on the parent iframe is blocked
+    // by some browsers when the parent is a different origin.
+    res.setHeader("Permissions-Policy", "microphone=*, camera=*, autoplay=*");
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     res.send(buildWidgetHtml(cfg));
   } catch (e) {
