@@ -863,23 +863,37 @@ body>*:not(#agently-root):not(script){display:none!important}
     vmWs.onmessage = function(event) {
       if (!vmActive) return;
       if (event.data instanceof ArrayBuffer) { playPCM(event.data); return; }
-      var msg; try { msg = JSON.parse(event.data); } catch { return; }
+      var msg; try { msg = JSON.parse(event.data); } catch (_) { return; }
+
+      // OpenAI Realtime sends audio as Base64 JSON deltas over WebSocket.
+      // Keep binary support above for compatibility, but this is the normal path.
+      if ((msg.type === 'response.audio.delta' || msg.type === 'response.output_audio.delta') && msg.delta) {
+        playPCM(base64ToArrayBuffer(msg.delta));
+        vmPhase('speaking', 'Speaking...', 'Tap end to stop.');
+        return;
+      }
+
       if (msg.type === 'session.connecting') { vmPhase('thinking', 'Connecting to AI...', ''); }
       else if (msg.type === 'session.ready') {
         micStream(mic, vmAudioCtx);
         vmPhase('listening', 'Listening... speak now', 'I will reply instantly when you pause.');
       }
-      else if (msg.type === 'input_audio_buffer.speech_started') { stopPCM(); vmPhase('listening', 'Listening...', ''); }
+      else if (msg.type === 'input_audio_buffer.speech_started') {
+        stopPCM();
+        try { if (vmWs && vmWs.readyState === 1) vmWs.send(JSON.stringify({ type: 'response.cancel' })); } catch (_) {}
+        vmPhase('listening', 'Listening...', '');
+      }
       else if (msg.type === 'input_audio_buffer.speech_stopped' || msg.type === 'input_audio_buffer.committed') { vmPhase('thinking', 'Thinking...', ''); }
       else if (msg.type === 'response.created') { vmPhase('speaking', 'Speaking...', 'Tap end to stop.'); }
-      else if (msg.type === 'response.done' || msg.type === 'response.audio.done') {
+      else if (msg.type === 'response.done' || msg.type === 'response.audio.done' || msg.type === 'response.output_audio.done') {
         var waitT = setInterval(function() { if (!vmPlaying && !vmPlayQueue.length) { clearInterval(waitT); if (vmActive) vmPhase('listening', 'Listening...', 'I will reply instantly when you pause.'); } }, 80);
       }
       else if (msg.type === 'conversation.item.input_audio_transcription.completed') { var t=(msg.transcript||'').trim(); if(t) addUserMsg(t); }
-      else if (msg.type === 'response.audio_transcript.done') { var at=(msg.transcript||'').trim(); if(at) addBotMsg(at); }
-      else if (msg.type === 'error') { 
-        console.error('[vm] error:', msg.error || msg.message); 
-        var errMsg = msg.message || (msg.error && msg.error.message) || 'Voice mode encountered an error';
+      else if (msg.type === 'response.audio_transcript.done' || msg.type === 'response.output_audio_transcript.done') { var at=(msg.transcript||'').trim(); if(at) addBotMsg(at); }
+      else if (msg.type === 'response.output_text.done') { var ot=(msg.text||'').trim(); if(ot) addBotMsg(ot); }
+      else if (msg.type === 'error') {
+        console.error('[vm] error:', msg.error || msg.message || msg);
+        var errMsg = msg.message || (msg.error && (msg.error.message || msg.error.code)) || 'Voice mode encountered an error';
         stopVM();
         addBotMsg('Sorry, ' + errMsg + '. Please try text chat instead.');
       }
@@ -933,8 +947,11 @@ body>*:not(#agently-root):not(script){display:none!important}
         URL.revokeObjectURL(url);
         var node = new AudioWorkletNode(actx, 'agently-p');
         node.port.onmessage = function(e) { sendF32(e.data); };
+        var silentGain = actx.createGain();
+        silentGain.gain.value = 0;
         src.connect(node);
-        node.connect(actx.destination);
+        node.connect(silentGain);
+        silentGain.connect(actx.destination);
         vmScriptProc = node;
       }).catch(function() {
         // AudioWorklet failed (sandbox CSP blocks blob: URLs) — fall back
@@ -948,9 +965,20 @@ body>*:not(#agently-root):not(script){display:none!important}
   function legacyProc(src, actx, sendF32) {
     var proc = actx.createScriptProcessor(4096, 1, 1);
     proc.onaudioprocess = function(e) { sendF32(e.inputBuffer.getChannelData(0)); };
+    var silentGain = actx.createGain();
+    silentGain.gain.value = 0;
     src.connect(proc);
-    proc.connect(actx.destination);
+    proc.connect(silentGain);
+    silentGain.connect(actx.destination);
     vmScriptProc = proc;
+  }
+
+  function base64ToArrayBuffer(b64) {
+    var bin = atob(b64);
+    var len = bin.length;
+    var bytes = new Uint8Array(len);
+    for (var i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes.buffer;
   }
 
   function playPCM(ab) {
