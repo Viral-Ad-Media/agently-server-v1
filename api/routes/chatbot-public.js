@@ -314,7 +314,10 @@ router.post(
               instructions,
               audio: {
                 input: {
-                  format: "pcm16",
+                  format: {
+                    type: "audio/pcm",
+                    rate: 24000,
+                  },
                   transcription: {
                     model: "whisper-1",
                   },
@@ -322,11 +325,14 @@ router.post(
                     type: "server_vad",
                     threshold: 0.5,
                     prefix_padding_ms: 300,
-                    silence_duration_ms: 600,
+                    silence_duration_ms: 500,
                   },
                 },
                 output: {
-                  format: "pcm16",
+                  format: {
+                    type: "audio/pcm",
+                    rate: 24000,
+                  },
                   voice,
                 },
               },
