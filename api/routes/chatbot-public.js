@@ -200,7 +200,7 @@ async function buildChatContext(db, chatbotId, requestedLanguage) {
           "BEHAVIOUR:",
           `• Answer CONFIDENTLY using facts from the KNOWLEDGE BASE — including the owner's name, services, experience, contact details, social links, and anything else present there.`,
           `• Do NOT say "I cannot provide that information" if the information is in the KNOWLEDGE BASE — USE it.`,
-          `• Be concise: 2–3 sentences for normal replies (voice mode playback gets long very quickly).`,
+          `• Be concise: 2–3 sentences for normal replies (voice mode playback gets very long quickly).`,
           `• If a question genuinely isn't covered by the KNOWLEDGE BASE, briefly say so and offer to connect them with a human.`,
           `• Never invent facts that aren't in the KNOWLEDGE BASE.`,
           `• Format with plain paragraphs. Use "- " for bullet lists. Never use literal "\\n" escape sequences — use real line breaks only.`,

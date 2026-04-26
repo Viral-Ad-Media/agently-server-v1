@@ -877,7 +877,12 @@ body>*:not(#agently-root):not(script){display:none!important}
       }
       else if (msg.type === 'conversation.item.input_audio_transcription.completed') { var t=(msg.transcript||'').trim(); if(t) addUserMsg(t); }
       else if (msg.type === 'response.audio_transcript.done') { var at=(msg.transcript||'').trim(); if(at) addBotMsg(at); }
-      else if (msg.type === 'error') { console.error('[vm] error:', msg.error || msg.message); }
+      else if (msg.type === 'error') { 
+        console.error('[vm] error:', msg.error || msg.message); 
+        var errMsg = msg.message || (msg.error && msg.error.message) || 'Voice mode encountered an error';
+        stopVM();
+        addBotMsg('Sorry, ' + errMsg + '. Please try text chat instead.');
+      }
     };
 
     vmWs.onerror = function(e) { console.error('[vm] ws error:', e); };
