@@ -35,6 +35,19 @@ router.get("/:id", async (req, res) => {
       (Array.isArray(chatbot.chat_languages) ? chatbot.chat_languages : ["en"]);
     const chatVoice = queryVoice || chatbot.chat_voice || "alloy";
 
+    // Resolve agent name for the lead tag and system prompt
+    let agentName = chatbot.name || chatbot.header_title || "Assistant";
+    if (chatbot.voice_agent_id) {
+      try {
+        const { data: agent } = await db
+          .from("voice_agents")
+          .select("name")
+          .eq("id", chatbot.voice_agent_id)
+          .single();
+        if (agent && agent.name) agentName = agent.name;
+      } catch (_) {}
+    }
+
     const cfg = {
       chatbotId: safeStr(id),
       apiUrl: safeStr(apiUrl),
