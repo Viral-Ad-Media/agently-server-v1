@@ -257,7 +257,7 @@ body>*:not(#agently-root):not(script){display:none!important}
       <div class="hn">${cfg.headerTitle.replace(/\\'/g, "'").replace(/\\n/g, "")}</div>
       <div class="hs"><span class="dot"></span>Online · Instant replies</div>
     </div>
-    <button class="xb" id="vmBtn" aria-label="Start voice conversation" title="Start voice conversation"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 3.19 6.11 19.79 19.79 0 0 1 .07 2a2 2 0 0 1 2-2.18h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg></button>
+    <button class="xb" id="vmBtn" aria-label="Start voice conversation" title="Start voice conversation"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg></button>
     <button class="xb" id="spk" aria-label="Toggle voice replies" title="Voice replies off"><svg id="ico-spk-off" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="22" y1="9" x2="16" y2="15"/><line x1="16" y1="9" x2="22" y2="15"/></svg><svg id="ico-spk-on" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button>
     <button class="xb" id="xb" aria-label="Close chat"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>
   </div>
@@ -902,24 +902,50 @@ body>*:not(#agently-root):not(script){display:none!important}
 
   function micStream(stream, actx) {
     if (!actx || actx.state === 'closed') return;
-    try {
-      var src = actx.createMediaStreamSource(stream);
-      var proc = actx.createScriptProcessor(4096, 1, 1);
-      var rate = actx.sampleRate;
-      proc.onaudioprocess = function(e) {
-        if (!vmActive || !vmWs || vmWs.readyState !== 1) return;
-        var f = e.inputBuffer.getChannelData(0);
-        var n = rate === 24000 ? f.length : Math.round(f.length * 24000 / rate);
-        var o = new Float32Array(n);
-        for (var i = 0; i < n; i++) o[i] = f[Math.min(Math.round(i * rate / 24000), f.length-1)];
-        var s = new Int16Array(n);
-        for (var j = 0; j < n; j++) { var v = Math.max(-1, Math.min(1, o[j])); s[j] = v < 0 ? v*0x8000 : v*0x7FFF; }
-        var b = new Uint8Array(s.buffer), bin = '';
-        for (var k = 0; k < b.length; k++) bin += String.fromCharCode(b[k]);
-        try { vmWs.send(JSON.stringify({type:'input_audio_buffer.append', audio:btoa(bin)})); } catch(_){}
-      };
-      src.connect(proc); proc.connect(actx.destination); vmScriptProc = proc;
-    } catch(err) { console.warn('[vm] mic setup failed:', err.message); }
+    var srcRate = actx.sampleRate;
+
+    function sendF32(f32) {
+      if (!vmActive || !vmWs || vmWs.readyState !== 1) return;
+      var n = srcRate === 24000 ? f32.length : Math.round(f32.length * 24000 / srcRate);
+      var o = new Float32Array(n);
+      for (var i = 0; i < n; i++) o[i] = f32[Math.min(Math.round(i * srcRate / 24000), f32.length - 1)];
+      var s = new Int16Array(n);
+      for (var j = 0; j < n; j++) { var v = Math.max(-1, Math.min(1, o[j])); s[j] = v < 0 ? v * 0x8000 : v * 0x7FFF; }
+      var b = new Uint8Array(s.buffer), bin = '';
+      for (var k = 0; k < b.length; k++) bin += String.fromCharCode(b[k]);
+      try { vmWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: btoa(bin) })); } catch (_) {}
+    }
+
+    var src = actx.createMediaStreamSource(stream);
+
+    // Try AudioWorklet (no deprecation warning)
+    if (actx.audioWorklet && actx.audioWorklet.addModule) {
+      // Worklet code as data URL — avoids backtick issues and no external file needed
+      var code = 'class P extends AudioWorkletProcessor{constructor(){super();this._b=[];}process(i){var c=i[0][0];if(c)for(var j=0;j<c.length;j++)this._b.push(c[j]);if(this._b.length>=4096)this.port.postMessage(new Float32Array(this._b.splice(0,4096)));return true;}}registerProcessor("agently-p",P);';
+      var blob = new Blob([code], { type: 'application/javascript' });
+      var url  = URL.createObjectURL(blob);
+      actx.audioWorklet.addModule(url).then(function() {
+        URL.revokeObjectURL(url);
+        var node = new AudioWorkletNode(actx, 'agently-p');
+        node.port.onmessage = function(e) { sendF32(e.data); };
+        src.connect(node);
+        node.connect(actx.destination);
+        vmScriptProc = node;
+      }).catch(function() {
+        // AudioWorklet failed (sandbox CSP blocks blob: URLs) — fall back
+        legacyProc(src, actx, sendF32);
+      });
+    } else {
+      legacyProc(src, actx, sendF32);
+    }
+  }
+
+  function legacyProc(src, actx, sendF32) {
+    var proc = actx.createScriptProcessor(4096, 1, 1);
+    proc.onaudioprocess = function(e) { sendF32(e.inputBuffer.getChannelData(0)); };
+    src.connect(proc);
+    proc.connect(actx.destination);
+    vmScriptProc = proc;
   }
 
   function playPCM(ab) {
