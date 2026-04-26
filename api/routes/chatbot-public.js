@@ -460,11 +460,9 @@ router.post(
         .json({ error: { message: "chatbotId query parameter is required." } });
     }
     if (isRateLimited(chatbotId)) {
-      return res
-        .status(429)
-        .json({
-          error: { message: "Too many requests. Please wait a moment." },
-        });
+      return res.status(429).json({
+        error: { message: "Too many requests. Please wait a moment." },
+      });
     }
 
     // Verify the chatbot exists (prevents random UUIDs from burning quota)
@@ -586,11 +584,9 @@ router.post(
         .json({ error: { message: "chatbotId is required." } });
     }
     if (isRateLimited(chatbotId)) {
-      return res
-        .status(429)
-        .json({
-          error: { message: "Too many requests. Please wait a moment." },
-        });
+      return res.status(429).json({
+        error: { message: "Too many requests. Please wait a moment." },
+      });
     }
 
     const db = getSupabase();
@@ -605,7 +601,19 @@ router.post(
     }
 
     // Validate the voice from the DB — fall back to 'alloy' if missing/invalid
-    const VALID_VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"];
+    // UPDATED April 2026: Added new GA voices (ash, ballad, cedar, coral, marin, sage, verse)
+    const VALID_VOICES = [
+      "alloy",
+      "ash",
+      "ballad",
+      "cedar",
+      "coral",
+      "echo",
+      "marin",
+      "sage",
+      "shimmer",
+      "verse",
+    ];
     const voice = VALID_VOICES.includes(chatbot.chat_voice)
       ? chatbot.chat_voice
       : "alloy";
@@ -769,31 +777,25 @@ router.post(
     const hasPhone = phone && String(phone).trim().length > 0;
     const hasEmail = email && String(email).trim().length > 0;
     if (!hasPhone && !hasEmail) {
-      return res
-        .status(400)
-        .json({
-          error: { message: "Please provide a phone number or email address." },
-        });
+      return res.status(400).json({
+        error: { message: "Please provide a phone number or email address." },
+      });
     }
 
     // Very light validation — don't be strict (international formats, etc.)
     if (hasEmail && !/.+@.+\..+/.test(String(email))) {
-      return res
-        .status(400)
-        .json({
-          error: { message: "That email address does not look valid." },
-        });
+      return res.status(400).json({
+        error: { message: "That email address does not look valid." },
+      });
     }
 
     // Rate limit so a bad actor can't flood the leads table
     if (isRateLimited(chatbotId)) {
-      return res
-        .status(429)
-        .json({
-          error: {
-            message: "Too many requests. Please try again in a moment.",
-          },
-        });
+      return res.status(429).json({
+        error: {
+          message: "Too many requests. Please try again in a moment.",
+        },
+      });
     }
 
     const db = getSupabase();
@@ -812,11 +814,9 @@ router.post(
 
     // Honour the toggle: if lead collection is disabled, reject.
     if (chatbot.collect_leads === false) {
-      return res
-        .status(403)
-        .json({
-          error: { message: "Lead collection is disabled for this chatbot." },
-        });
+      return res.status(403).json({
+        error: { message: "Lead collection is disabled for this chatbot." },
+      });
     }
 
     // Look up the agent name for tagging
@@ -889,11 +889,9 @@ router.post(
         "[chatbot-public/capture-lead] insert failed:",
         insertErr && insertErr.message,
       );
-      return res
-        .status(500)
-        .json({
-          error: { message: "Failed to save your details. Please try again." },
-        });
+      return res.status(500).json({
+        error: { message: "Failed to save your details. Please try again." },
+      });
     }
 
     // Best-effort bump of the counter
@@ -909,6 +907,157 @@ router.post(
     }
 
     return res.json({ success: true, leadId: lead.id });
+  }),
+);
+
+/* ─────────────────────────────────────────────────────────────
+ * POST /api/chatbot-public/voice-token
+ * Mints an ephemeral OpenAI Realtime client_secret for the widget.
+ * Browser uses it to connect via WebRTC directly to OpenAI.
+ *
+ * UPDATED: April 2026 - Compatible with latest GA Realtime API
+ *
+ * CHANGES FROM PREVIOUS VERSION:
+ * - Removed deprecated "type: realtime" field
+ * - Updated model to "gpt-4o-realtime-preview-2024-12-17" (GA stable)
+ * - Simplified audio configuration structure
+ * - Updated to match current Realtime API spec
+ *
+ * Spec: https://platform.openai.com/docs/guides/realtime
+ * ───────────────────────────────────────────────────────────── */
+router.post(
+  "/voice-token",
+  asyncHandler(async (req, res) => {
+    const { chatbotId } = req.body || {};
+    if (!chatbotId) {
+      return res
+        .status(400)
+        .json({ error: { message: "chatbotId is required." } });
+    }
+    if (isRateLimited(`voice:${chatbotId}`)) {
+      return res
+        .status(429)
+        .json({ error: { message: "Rate limit exceeded." } });
+    }
+
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({
+        error: { message: "OPENAI_API_KEY not configured on the server." },
+      });
+    }
+
+    const db = getSupabase();
+    const { data: chatbot, error } = await db
+      .from("chatbots")
+      .select(
+        "id, custom_prompt, welcome_message, chat_voice, chat_languages, faqs",
+      )
+      .eq("id", chatbotId)
+      .single();
+    if (error || !chatbot) {
+      return res.status(404).json({ error: { message: "Chatbot not found." } });
+    }
+
+    /* Map any legacy voice names to the current GA voices.
+     * GA voices (April 2026): alloy, ash, ballad, cedar, coral,
+     * echo, marin, sage, shimmer, verse.                       */
+    const VALID_VOICES = new Set([
+      "alloy",
+      "ash",
+      "ballad",
+      "cedar",
+      "coral",
+      "echo",
+      "marin",
+      "sage",
+      "shimmer",
+      "verse",
+    ]);
+    const requestedVoice = String(chatbot.chat_voice || "alloy").toLowerCase();
+    const voice = VALID_VOICES.has(requestedVoice) ? requestedVoice : "alloy";
+
+    /* Build a concise system prompt for voice (kept short — voice models
+     * follow short bullet lists better than long paragraphs).  */
+    const faqList = Array.isArray(chatbot.faqs)
+      ? chatbot.faqs
+          .filter((f) => f && f.question && f.answer)
+          .slice(0, 20)
+          .map((f) => `Q: ${f.question}\nA: ${f.answer}`)
+          .join("\n\n")
+      : "";
+
+    const instructions = [
+      chatbot.custom_prompt && String(chatbot.custom_prompt).trim(),
+      "Speak in a warm, clear, conversational tone.",
+      "Keep replies under 3 sentences unless asked to elaborate.",
+      "If you don't know the answer, offer to connect the user with a human.",
+      faqList ? `Use these FAQs when relevant:\n\n${faqList}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
+    /* Mint an ephemeral key using the GA Realtime API session shape (April 2026) */
+    let openaiResp;
+    try {
+      openaiResp = await fetch("https://api.openai.com/v1/realtime/sessions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-realtime-preview-2024-12-17",
+          modalities: ["audio", "text"],
+          instructions,
+          voice,
+          input_audio_format: "pcm16",
+          output_audio_format: "pcm16",
+          input_audio_transcription: {
+            model: "whisper-1",
+          },
+          turn_detection: {
+            type: "server_vad",
+            threshold: 0.5,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 600,
+          },
+          temperature: 0.7,
+          max_response_output_tokens: 500,
+        }),
+      });
+    } catch (e) {
+      console.error("[voice-token] fetch failed:", e);
+      return res.status(502).json({
+        error: { message: "Failed to reach OpenAI Realtime API." },
+      });
+    }
+
+    if (!openaiResp.ok) {
+      const errText = await openaiResp.text().catch(() => "");
+      console.error("[voice-token] OpenAI error:", openaiResp.status, errText);
+      return res.status(openaiResp.status).json({
+        error: {
+          message: "OpenAI rejected the session request.",
+          detail: errText,
+        },
+      });
+    }
+
+    const data = await openaiResp.json();
+    /* The GA API response shape (April 2026):
+     * {
+     *   client_secret: { value: "ek_...", expires_at: ... },
+     *   model: "gpt-4o-realtime-preview-2024-12-17",
+     *   ...
+     * }
+     */
+    res.json({
+      clientSecret: data.client_secret?.value || null,
+      expiresAt: data.client_secret?.expires_at || null,
+      model: data.model || "gpt-4o-realtime-preview-2024-12-17",
+      voice,
+    });
   }),
 );
 
