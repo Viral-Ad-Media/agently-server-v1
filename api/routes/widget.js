@@ -766,7 +766,7 @@ body>*:not(#agently-root):not(script){display:none!important}
    * ========================================================= */
   var vmActive = false, vmWs = null, vmMicStream = null;
   var vmAudioCtx = null, vmScriptProc = null;
-  var vmPlaybackNode = null, vmPlayQueue = [], vmPlaying = false;
+  var vmPlaybackNode = null, vmPlayQueue = [], vmPlaying = false, vmHasActiveResponse = false;
   var vmOrb = document.getElementById('vmOrb');
   var vmStatus = document.getElementById('vmStatus');
   var vmHint = document.getElementById('vmHint');
@@ -880,12 +880,18 @@ body>*:not(#agently-root):not(script){display:none!important}
       }
       else if (msg.type === 'input_audio_buffer.speech_started') {
         stopPCM();
-        try { if (vmWs && vmWs.readyState === 1) vmWs.send(JSON.stringify({ type: 'response.cancel' })); } catch (_) {}
+        // Only cancel when OpenAI has actually created a response. Sending
+        // response.cancel with no active response returns a Realtime API error
+        // like: "Cancellation failed: no active response found".
+        if (vmHasActiveResponse) {
+          try { if (vmWs && vmWs.readyState === 1) vmWs.send(JSON.stringify({ type: 'response.cancel' })); } catch (_) {}
+        }
         vmPhase('listening', 'Listening...', '');
       }
       else if (msg.type === 'input_audio_buffer.speech_stopped' || msg.type === 'input_audio_buffer.committed') { vmPhase('thinking', 'Thinking...', ''); }
-      else if (msg.type === 'response.created') { vmPhase('speaking', 'Speaking...', 'Tap end to stop.'); }
+      else if (msg.type === 'response.created') { vmHasActiveResponse = true; vmPhase('speaking', 'Speaking...', 'Tap end to stop.'); }
       else if (msg.type === 'response.done' || msg.type === 'response.audio.done' || msg.type === 'response.output_audio.done') {
+        vmHasActiveResponse = false;
         var waitT = setInterval(function() { if (!vmPlaying && !vmPlayQueue.length) { clearInterval(waitT); if (vmActive) vmPhase('listening', 'Listening...', 'I will reply instantly when you pause.'); } }, 80);
       }
       else if (msg.type === 'conversation.item.input_audio_transcription.completed') { var t=(msg.transcript||'').trim(); if(t) addUserMsg(t); }
@@ -894,6 +900,11 @@ body>*:not(#agently-root):not(script){display:none!important}
       else if (msg.type === 'error') {
         console.error('[vm] error:', msg.error || msg.message || msg);
         var errMsg = msg.message || (msg.error && (msg.error.message || msg.error.code)) || 'Voice mode encountered an error';
+        if (/no active response found|cancellation failed/i.test(errMsg)) {
+          vmHasActiveResponse = false;
+          vmPhase('listening', 'Listening...', 'I will reply instantly when you pause.');
+          return;
+        }
         stopVM();
         addBotMsg('Sorry, ' + errMsg + '. Please try text chat instead.');
       }
@@ -913,6 +924,7 @@ body>*:not(#agently-root):not(script){display:none!important}
   function stopVM() {
     if (!vmActive && !(vMode && vMode.classList.contains('on'))) return;
     vmActive = false;
+    vmHasActiveResponse = false;
     stopPCM(); cleanVM();
     if (vmWs) { try { vmWs.send(JSON.stringify({type:'session.end'})); } catch(_){} try { vmWs.close(1000); } catch(_){} vmWs = null; }
     vmPhase('idle', '', '');
