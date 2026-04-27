@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 4000;
 
 const server = http.createServer(app);
 
-// Attach WebSocket for ConversationRelay (local dev only)
+// Attach WebSocket for Twilio Media Streams -> OpenAI Realtime
 if (typeof app.attachWebSocket === "function") {
   app.attachWebSocket(server);
 }
@@ -22,5 +22,7 @@ server.listen(PORT, () => {
   console.log(
     `📞 Voice webhook: http://localhost:${PORT}/api/twilio/voice-inbound`,
   );
-  console.log(`🔌 WS relay:    ws://localhost:${PORT}/api/twilio/ws\n`);
+  console.log(
+    `🔌 Media WS:    ws://localhost:${PORT}/api/twilio/media-stream\n`,
+  );
 });

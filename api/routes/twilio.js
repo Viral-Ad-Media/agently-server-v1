@@ -8,7 +8,7 @@
  * PUBLIC (no JWT, Twilio signs these):
  *   POST /api/twilio/voice-inbound        – Twilio calls this on inbound call, returns TwiML
  *   GET  /api/twilio/voice-inbound        – same (Twilio uses GET or POST)
- *   GET  /api/twilio/ws                   – WebSocket upgrade for ConversationRelay
+ *   GET  /api/twilio/media-stream         – WebSocket upgrade for Twilio Media Streams
  *   POST /api/twilio/call-status          – Twilio call status callbacks
  *   POST /api/twilio/recording-status     – Twilio recording status callbacks
  *   POST /api/twilio/sms-inbound          – Inbound SMS / WhatsApp
@@ -23,7 +23,9 @@
  *   GET  /api/twilio/calls               – Fetch Twilio call log for this org
  *   GET  /api/twilio/billing             – Fetch Twilio billing data for this org
  *   POST /api/twilio/outbound            – Initiate an outbound call
- *   GET  /api/twilio/voice-test          – Generate test TwiML for browser preview
+ *   GET  /api/twilio/voice-token         – Generate Twilio Voice SDK access token
+ *   POST /api/twilio/voice-app           – TwiML App entry for browser calls
+ *   GET  /api/twilio/voice-test          – Generate test Media Streams TwiML preview
  */
 
 const express = require("express");
@@ -41,8 +43,8 @@ const {
   // DO NOT re-add listOwnedNumbers to routes. See /numbers/owned route for details.
   verifyCallerIdStart,
   verifyCallerIdCheck,
-  buildConversationRelayTwiml,
-  buildOutboundTwiml,
+  buildMediaStreamTwiml,
+  createVoiceAccessToken,
   fetchCallLogs,
   // fetchMonthlyBilling intentionally removed — it returns master account totals
   // and must never be exposed to users. Per-number costs are tracked internally
@@ -50,6 +52,12 @@ const {
   makeOutboundCall,
   sendWhatsAppMessage,
 } = require("../../lib/twilio");
+const {
+  createCallRecord,
+  updateCallRecordBySid,
+  updateCallRecordById,
+  finalizeUsage,
+} = require("../../lib/call-records");
 
 const router = express.Router();
 
@@ -62,6 +70,63 @@ const WS_URL = () => {
   // Derive from API_URL: https://x.vercel.app → wss://x.vercel.app
   return API_URL().replace(/^https?:\/\//, "wss://");
 };
+
+function normalizePhone(phone) {
+  return String(phone || "").trim();
+}
+
+function safeXmlText(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function hangupTwiml(
+  message = "Sorry, this number is not currently configured. Goodbye.",
+) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>${safeXmlText(message)}</Say>
+  <Hangup/>
+</Response>`;
+}
+
+function mediaStreamUrl(params) {
+  const wsBase = WS_URL();
+  const query = new URLSearchParams(params);
+  return `${wsBase}/api/twilio/media-stream?${query.toString()}`;
+}
+
+function buildRealtimeTwiml({
+  agent,
+  callRecordId,
+  callSid,
+  direction,
+  callerPhone,
+}) {
+  const wsUrl = mediaStreamUrl({
+    orgId: agent.organization_id,
+    agentId: agent.id,
+    callRecordId,
+    callSid: callSid || "",
+    direction: direction || "inbound",
+    callerPhone: callerPhone || "",
+  });
+  return buildMediaStreamTwiml({
+    wsUrl,
+    parameters: {
+      organizationId: agent.organization_id,
+      agentId: agent.id,
+      callRecordId,
+      callSid: callSid || "",
+      direction: direction || "inbound",
+      callerPhone: callerPhone || "",
+    },
+  });
+}
 
 // ─────────────────────────────────────────────────────────────
 // Helper: lookup org + agent from a Twilio phone number
@@ -82,37 +147,37 @@ async function lookupAgentByPhone(toPhone) {
 // ─────────────────────────────────────────────────────────────
 // ── PUBLIC: Inbound Voice Webhook ────────────────────────────
 // Twilio hits this when someone calls a number we manage.
-// We respond with TwiML that connects to ConversationRelay.
+// We respond with TwiML that connects Twilio Media Streams to OpenAI Realtime.
 // ─────────────────────────────────────────────────────────────
 async function handleInboundVoice(req, res) {
-  const toPhone = req.body?.To || req.query?.To || "";
-  const fromPhone = req.body?.From || req.query?.From || "";
-  const callSid = req.body?.CallSid || req.query?.CallSid || "";
+  const toPhone = normalizePhone(req.body?.To || req.query?.To || "");
+  const fromPhone = normalizePhone(req.body?.From || req.query?.From || "");
+  const callSid = normalizePhone(req.body?.CallSid || req.query?.CallSid || "");
 
   try {
     const agent = await lookupAgentByPhone(toPhone);
 
     if (!agent) {
-      // No agent configured — just say a message and hang up
       res.setHeader("Content-Type", "text/xml");
-      return res.send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="Polly.Joanna">Sorry, this number is not currently configured. Goodbye.</Say>
-</Response>`);
+      return res.send(hangupTwiml());
     }
 
-    const orgId = agent.organization_id;
-    const agentId = agent.id;
+    const record = await createCallRecord({
+      organizationId: agent.organization_id,
+      voiceAgentId: agent.id,
+      callerPhone: fromPhone,
+      direction: "inbound",
+      status: "queued",
+      twilioCallSid: callSid,
+      metadata: { twilioTo: toPhone, twilioFrom: fromPhone },
+    });
 
-    // WebSocket URL for ConversationRelay
-    // NOTE: Twilio requires a WSS URL in production
-    const wsBase = WS_URL();
-    const wsUrl = `${wsBase}/api/twilio/ws?orgId=${orgId}&agentId=${agentId}&callSid=${callSid}&callerPhone=${encodeURIComponent(fromPhone)}`;
-
-    const twiml = buildConversationRelayTwiml({
-      agentRow: agent,
-      wsUrl,
-      greeting: agent.greeting,
+    const twiml = buildRealtimeTwiml({
+      agent,
+      callRecordId: record.id,
+      callSid,
+      direction: "inbound",
+      callerPhone: fromPhone,
     });
 
     res.setHeader("Content-Type", "text/xml");
@@ -120,15 +185,18 @@ async function handleInboundVoice(req, res) {
   } catch (err) {
     console.error("[Twilio inbound] Error:", err.message);
     res.setHeader("Content-Type", "text/xml");
-    return res.send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say>We are experiencing technical difficulties. Please try again later.</Say>
-</Response>`);
+    return res.send(
+      hangupTwiml(
+        "We are experiencing technical difficulties. Please try again later.",
+      ),
+    );
   }
 }
 
 router.post("/voice-inbound", handleInboundVoice);
 router.get("/voice-inbound", handleInboundVoice);
+router.post("/incoming-call", handleInboundVoice);
+router.get("/incoming-call", handleInboundVoice);
 
 // ─────────────────────────────────────────────────────────────
 // ── PUBLIC: Outbound TwiML ───────────────────────────────────
@@ -138,12 +206,25 @@ router.get("/voice-inbound", handleInboundVoice);
 router.post(
   "/outbound-twiml",
   asyncHandler(async (req, res) => {
-    const callSid = req.body?.CallSid || "";
-    const toPhone = req.body?.To || "";
-    const fromPhone = req.body?.From || "";
+    const callSid = req.body?.CallSid || req.query?.CallSid || "";
+    const toPhone = req.body?.To || req.query?.To || "";
+    const fromPhone = req.body?.From || req.query?.From || "";
+    const agentId = req.query?.agentId || req.body?.agentId || "";
+    const callRecordIdFromQuery =
+      req.query?.callRecordId || req.body?.callRecordId || "";
 
-    // Look up agent by the from number
-    const agent = await lookupAgentByPhone(fromPhone);
+    const db = getSupabase();
+    let agent = null;
+    if (agentId) {
+      const { data } = await db
+        .from("voice_agents")
+        .select("*")
+        .eq("id", agentId)
+        .maybeSingle();
+      agent = data || null;
+    }
+    if (!agent) agent = await lookupAgentByPhone(fromPhone);
+
     if (!agent) {
       res.setHeader("Content-Type", "text/xml");
       return res.send(
@@ -151,10 +232,32 @@ router.post(
       );
     }
 
-    const wsBase = WS_URL();
-    const wsUrl = `${wsBase}/api/twilio/ws?orgId=${agent.organization_id}&agentId=${agent.id}&callSid=${callSid}&callerPhone=${encodeURIComponent(toPhone)}`;
+    let callRecordId = callRecordIdFromQuery;
+    if (!callRecordId) {
+      const record = await createCallRecord({
+        organizationId: agent.organization_id,
+        voiceAgentId: agent.id,
+        callerPhone: toPhone,
+        direction: "outbound",
+        status: "queued",
+        twilioCallSid: callSid,
+        metadata: { twilioTo: toPhone, twilioFrom: fromPhone },
+      });
+      callRecordId = record.id;
+    } else if (callSid) {
+      await updateCallRecordById(callRecordId, {
+        twilio_call_sid: callSid,
+        status: "in-progress",
+      });
+    }
 
-    const twiml = buildOutboundTwiml({ agentRow: agent, wsUrl });
+    const twiml = buildRealtimeTwiml({
+      agent,
+      callRecordId,
+      callSid,
+      direction: "outbound",
+      callerPhone: toPhone,
+    });
     res.setHeader("Content-Type", "text/xml");
     res.send(twiml);
   }),
@@ -188,7 +291,7 @@ router.post(
           const { data: existing } = await db
             .from("call_records")
             .select("id")
-            .eq("vapi_call_id", CallSid)
+            .eq("twilio_call_sid", CallSid)
             .maybeSingle();
 
           if (!existing) {
@@ -203,7 +306,10 @@ router.post(
               outcome: "FAQ Answered",
               summary: "Call completed (status callback).",
               transcript: [],
-              vapi_call_id: CallSid,
+              twilio_call_sid: CallSid,
+              provider: "twilio",
+              direction: req.body.Direction || "inbound",
+              status: CallStatus || "completed",
               timestamp: new Date().toISOString(),
             });
             await db
@@ -238,7 +344,7 @@ router.post(
         await db
           .from("call_records")
           .update({ recording_url: RecordingUrl + ".mp3" })
-          .eq("vapi_call_id", CallSid);
+          .eq("twilio_call_sid", CallSid);
       } catch (e) {
         console.error("[Twilio recording-status] error:", e.message);
       }
@@ -1001,14 +1107,12 @@ router.post(
 
     const verifySid = (process.env.TWILIO_VERIFY_SERVICE_SID || "").trim();
     if (!verifySid) {
-      return res
-        .status(503)
-        .json({
-          error: {
-            message: "SMS verification is not configured.",
-            code: "SMS_VERIFY_NOT_CONFIGURED",
-          },
-        });
+      return res.status(503).json({
+        error: {
+          message: "SMS verification is not configured.",
+          code: "SMS_VERIFY_NOT_CONFIGURED",
+        },
+      });
     }
 
     const normalised = phoneNumber.trim();
@@ -1045,14 +1149,12 @@ router.post(
       }
     } catch (err) {
       console.error("[verify-sms-confirm] error:", err && err.message);
-      return res
-        .status(500)
-        .json({
-          error: {
-            message: "Could not confirm OTP. Please try again.",
-            code: "OTP_CHECK_FAILED",
-          },
-        });
+      return res.status(500).json({
+        error: {
+          message: "Could not confirm OTP. Please try again.",
+          code: "OTP_CHECK_FAILED",
+        },
+      });
     }
 
     // OTP approved — save to DB
@@ -1178,7 +1280,7 @@ router.post(
   requireAuth,
   requireAdmin,
   asyncHandler(async (req, res) => {
-    const { toPhone, customerName, voiceAgentId } = req.body;
+    const { toPhone, customerName, voiceAgentId, leadId } = req.body;
     if (!toPhone)
       return res
         .status(400)
@@ -1203,16 +1305,100 @@ router.post(
       });
     }
 
+    const record = await createCallRecord({
+      organizationId: req.orgId,
+      voiceAgentId: agent.id,
+      callerName: customerName || "Outbound Lead",
+      callerPhone: toPhone,
+      leadId: leadId || null,
+      direction: "outbound",
+      status: "queued",
+      metadata: { initiatedBy: req.user?.id || null },
+    });
+
+    const apiBase = API_URL();
+    const twimlUrl = `${apiBase}/api/twilio/outbound-twiml?agentId=${encodeURIComponent(agent.id)}&callRecordId=${encodeURIComponent(record.id)}`;
     const result = await makeOutboundCall({
       from: agent.twilio_phone_number,
       to: toPhone,
+      twimlUrl,
+      statusCallbackUrl: `${apiBase}/api/twilio/call-status`,
     });
 
-    res.json({ success: true, callSid: result.callSid, status: result.status });
+    await updateCallRecordById(record.id, {
+      twilio_call_sid: result.callSid,
+      status: result.status || "initiated",
+    });
+
+    res.json({
+      success: true,
+      callSid: result.callSid,
+      callRecordId: record.id,
+      status: result.status,
+    });
   }),
 );
 
 // ─────────────────────────────────────────────────────────────
+// ── PROTECTED: Twilio Voice SDK token / Browser call TwiML ───
+// ─────────────────────────────────────────────────────────────
+router.get(
+  "/voice-token",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const identity = `org-${req.orgId}-user-${req.user?.id || "unknown"}`;
+    const token = createVoiceAccessToken({ identity });
+    res.json({ success: true, token, identity });
+  }),
+);
+
+router.post(
+  "/voice-app",
+  asyncHandler(async (req, res) => {
+    const agentId = req.body?.agentId || req.query?.agentId || "";
+    const callerName =
+      req.body?.callerName || req.query?.callerName || "Browser Caller";
+    const callerPhone =
+      req.body?.callerPhone || req.query?.callerPhone || "browser-test";
+    const callSid =
+      req.body?.CallSid || req.query?.CallSid || `web-${Date.now()}`;
+
+    const db = getSupabase();
+    const { data: agent } = await db
+      .from("voice_agents")
+      .select("*")
+      .eq("id", agentId)
+      .maybeSingle();
+    if (!agent) {
+      res.setHeader("Content-Type", "text/xml");
+      return res.send(hangupTwiml("Voice agent not found."));
+    }
+
+    const record = await createCallRecord({
+      organizationId: agent.organization_id,
+      voiceAgentId: agent.id,
+      callerName,
+      callerPhone,
+      direction: "web",
+      status: "queued",
+      twilioCallSid: callSid,
+      metadata: { source: "twilio-voice-sdk" },
+    });
+
+    const twiml = buildRealtimeTwiml({
+      agent,
+      callRecordId: record.id,
+      callSid,
+      direction: "web",
+      callerPhone,
+    });
+    res.setHeader("Content-Type", "text/xml");
+    return res.send(twiml);
+  }),
+);
+
+// ─────────────────────────────────────────────────────────────
+// ── PROTECTED: In-Browser Test TwiML// ─────────────────────────────────────────────────────────────
 // ── PROTECTED: In-Browser Test TwiML ─────────────────────────
 // Returns TwiML you can use with Twilio Client SDK for browser-based test
 // ─────────────────────────────────────────────────────────────
@@ -1235,10 +1421,13 @@ router.get(
         .json({ error: { message: "Voice agent not found." } });
     }
 
-    const wsBase = WS_URL();
-    const wsUrl = `${wsBase}/api/twilio/ws?orgId=${req.orgId}&agentId=${agentId}&callSid=test-${Date.now()}&callerPhone=browser-test`;
-
-    const twiml = buildConversationRelayTwiml({ agentRow: agent, wsUrl });
+    const twiml = buildRealtimeTwiml({
+      agent,
+      callRecordId: `preview-${Date.now()}`,
+      callSid: `test-${Date.now()}`,
+      direction: "web",
+      callerPhone: "browser-test",
+    });
     res.setHeader("Content-Type", "text/xml");
     res.send(twiml);
   }),
