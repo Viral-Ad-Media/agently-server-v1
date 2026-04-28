@@ -70,21 +70,6 @@ async function trackUnanswered({
     console.warn("[chatbot-public] unanswered insert failed:", e.message);
   }
 }
-async function saveChatMessage({ organizationId, chatbotId, role, text }) {
-  if (!organizationId || !chatbotId || !text) return;
-  try {
-    await getSupabase()
-      .from("chat_messages")
-      .insert({
-        organization_id: organizationId,
-        chatbot_id: chatbotId,
-        role,
-        text: String(text).slice(0, 8000),
-      });
-  } catch (e) {
-    console.warn("[chatbot-public] chat_messages insert failed:", e.message);
-  }
-}
 async function captureLead({ chatbotId, organizationId, lead, reason = "" }) {
   const db = getSupabase();
   let orgId = organizationId,
@@ -157,11 +142,11 @@ async function captureLead({ chatbotId, organizationId, lead, reason = "" }) {
       .select()
       .maybeSingle();
     if (error) throw error;
-    return data;
+    return { ...data, _deduped: true };
   }
   const { data, error } = await db.from("leads").insert(row).select().single();
   if (error) throw error;
-  return data;
+  return { ...data, _deduped: false };
 }
 
 router.post(
@@ -177,10 +162,12 @@ router.post(
         .status(400)
         .json({ error: { message: "chatbotId is required." } });
     if (isRateLimited(`chat:${chatbotId}`))
-      return res.status(429).json({
-        response:
-          "I'm receiving many messages right now. Please try again in a moment.",
-      });
+      return res
+        .status(429)
+        .json({
+          response:
+            "I'm receiving many messages right now. Please try again in a moment.",
+        });
     let result;
     try {
       result = await generateGroundedChatResponse({
@@ -191,25 +178,16 @@ router.post(
       });
     } catch (e) {
       console.error("[chatbot-public/chat] generation failed:", e.message);
-      return res.status(500).json({
-        response:
-          "I'm sorry, I'm having trouble reaching the assistant right now. Please try again shortly.",
-      });
+      return res
+        .status(500)
+        .json({
+          response:
+            "I'm sorry, I'm having trouble reaching the assistant right now. Please try again shortly.",
+        });
     }
     const response = cleanAssistantResponse(result.response);
     const orgId = result.context?.organization_id;
-    await saveChatMessage({
-      organizationId: orgId,
-      chatbotId,
-      role: "user",
-      text: message.trim(),
-    });
-    await saveChatMessage({
-      organizationId: orgId,
-      chatbotId,
-      role: "model",
-      text: response,
-    });
+    // Privacy rule: do not persist normal chat transcripts. Only leads and unanswered questions are stored.
     if (lead && (lead.name || lead.phone || lead.email)) {
       try {
         await captureLead({
@@ -244,7 +222,7 @@ router.post(
         chatbotId,
         lead: { name, phone, email, reason, tags },
       });
-      res.json({ success: true, leadId: lead.id });
+      res.json({ success: true, leadId: lead.id, deduped: !!lead._deduped });
     } catch (e) {
       res
         .status(400)
@@ -417,9 +395,11 @@ router.post(
     );
     if (!openaiResp.ok) {
       const detail = await openaiResp.text().catch(() => "");
-      return res.status(openaiResp.status).json({
-        error: { message: "OpenAI rejected the session request.", detail },
-      });
+      return res
+        .status(openaiResp.status)
+        .json({
+          error: { message: "OpenAI rejected the session request.", detail },
+        });
     }
     const data = await openaiResp.json();
     res.json({

@@ -305,7 +305,7 @@ body>*:not(#agently-root):not(script){display:none!important}
   var REALTIME_WS_BASE = '${cfg.realtimeWsUrl}';
   var COLLECT_LEADS = ${cfg.collectLeads};
   var STORAGE_KEY = 'agently:' + CID;
-  var IDLE_TTL_MS = 5 * 60 * 1000;
+  var IDLE_TTL_MS = 3 * 60 * 1000; // Clear local widget chat cache no later than 3 minutes after close
   var LEAD_CAPTURED_KEY = 'agently:' + CID + ':leadCaptured';
   var AGENT_NAME = '${cfg.agentName}';
   var LANG_NAMES = ${JSON.stringify(LANG_NAMES)};
@@ -315,6 +315,7 @@ body>*:not(#agently-root):not(script){display:none!important}
   var greeted = false;
   var sending = false;
   var history = [];
+  var closeClearTimer = null;
 
   var cw = document.getElementById('cw');
   var launcher = document.getElementById('launcher');
@@ -368,9 +369,14 @@ body>*:not(#agently-root):not(script){display:none!important}
     launcher.setAttribute('aria-expanded', String(isOpen));
     icoChat.style.display = isOpen ? 'none' : '';
     icoClose.style.display = isOpen ? '' : 'none';
-    if (isOpen && !sessionLoaded) { sessionLoaded = true; loadSession(); }
-    if (isOpen && !greeted) { greeted = true; setTimeout(function() { addBotMsg(WELCOME); }, 200); }
-    if (isOpen) { setTimeout(function() { ci.focus(); }, 250); }
+    if (isOpen) {
+      if (closeClearTimer) { clearTimeout(closeClearTimer); closeClearTimer = null; }
+      if (!sessionLoaded) { sessionLoaded = true; loadSession(); }
+      if (!greeted) { greeted = true; setTimeout(function() { addBotMsg(WELCOME); }, 200); }
+      setTimeout(function() { ci.focus(); }, 250);
+    } else {
+      scheduleSessionClear();
+    }
   }
 
   launcher.onclick = toggle;
@@ -437,12 +443,32 @@ body>*:not(#agently-root):not(script){display:none!important}
 
   var SESS_KEY = 'agently_chat_' + CID;
 
+  function clearSessionCache() {
+    try { sessionStorage.removeItem(SESS_KEY); } catch(e) {}
+  }
+
+  function scheduleSessionClear() {
+    if (closeClearTimer) clearTimeout(closeClearTimer);
+    closeClearTimer = setTimeout(function() {
+      clearSessionCache();
+      history = [];
+      msgs.innerHTML = '';
+      greeted = false;
+      sessionLoaded = false;
+    }, IDLE_TTL_MS);
+  }
+
   function loadSession() {
     try {
       var raw = sessionStorage.getItem(SESS_KEY);
       if (!raw) return;
-      var saved = JSON.parse(raw);
-      if (!Array.isArray(saved)) return;
+      var parsed = JSON.parse(raw);
+      var saved = Array.isArray(parsed) ? parsed : parsed.messages;
+      var ts = Array.isArray(parsed) ? Date.now() : Number(parsed.ts || 0);
+      if (!Array.isArray(saved) || !ts || (Date.now() - ts > IDLE_TTL_MS)) {
+        clearSessionCache();
+        return;
+      }
       saved.forEach(function(m) {
         if (m.role && m.text) {
           if (m.role === 'model') { history.push({ role: 'model', text: m.text }); addMsg('bot', m.text, true); }
@@ -450,11 +476,11 @@ body>*:not(#agently-root):not(script){display:none!important}
         }
       });
       greeted = true;
-    } catch(e) {}
+    } catch(e) { clearSessionCache(); }
   }
 
   function saveSession() {
-    try { sessionStorage.setItem(SESS_KEY, JSON.stringify(history.slice(-40))); } catch(e) {}
+    try { sessionStorage.setItem(SESS_KEY, JSON.stringify({ ts: Date.now(), messages: history.slice(-24) })); } catch(e) {}
   }
 
   function addMsg(role, text, skipSave) {
@@ -701,10 +727,10 @@ body>*:not(#agently-root):not(script){display:none!important}
   var MAX_LEAD_ATTEMPTS = 3;
 
   function leadAlreadyCaptured() {
-    try { return sessionStorage.getItem(LEAD_CAPTURED_KEY) === 'true'; } catch(_) { return false; }
+    try { return sessionStorage.getItem(LEAD_CAPTURED_KEY) === 'true' || localStorage.getItem(LEAD_CAPTURED_KEY) === 'true'; } catch(_) { return false; }
   }
   function markLeadCaptured() {
-    try { sessionStorage.setItem(LEAD_CAPTURED_KEY, 'true'); } catch(_) {}
+    try { sessionStorage.setItem(LEAD_CAPTURED_KEY, 'true'); localStorage.setItem(LEAD_CAPTURED_KEY, 'true'); } catch(_) {}
   }
 
   function maybeTriggerLeadCapture() {
@@ -747,11 +773,11 @@ body>*:not(#agently-root):not(script){display:none!important}
         body: JSON.stringify({ chatbotId: CID, name: name, phone: phone, email: email })
       })
       .then(function(r) { if (!r.ok) throw new Error('failed'); return r.json(); })
-      .then(function() {
+      .then(function(d) {
         markLeadCaptured();
         form.style.opacity = '0.5'; leadFormVisible = false;
         ci.disabled = false; sb.disabled = !ci.value.trim();
-        addBotMsg('Thank you! How else can I help you?');
+        addBotMsg(d && d.deduped ? 'Thank you — I found your existing details. How else can I help you?' : 'Thank you! How else can I help you?');
       })
       .catch(function() { subBtn.disabled = false; subBtn.textContent = 'Save details'; showErr('Could not save details. Please try again.'); });
     }
@@ -1147,10 +1173,10 @@ body>*:not(#agently-root):not(script){display:none!important}
   var MAX_LEAD_ATTEMPTS = 3;
 
   function leadAlreadyCaptured() {
-    try { return sessionStorage.getItem(LEAD_CAPTURED_KEY) === 'true'; } catch(_) { return false; }
+    try { return sessionStorage.getItem(LEAD_CAPTURED_KEY) === 'true' || localStorage.getItem(LEAD_CAPTURED_KEY) === 'true'; } catch(_) { return false; }
   }
   function markLeadCaptured() {
-    try { sessionStorage.setItem(LEAD_CAPTURED_KEY, 'true'); } catch(_) {}
+    try { sessionStorage.setItem(LEAD_CAPTURED_KEY, 'true'); localStorage.setItem(LEAD_CAPTURED_KEY, 'true'); } catch(_) {}
   }
 
   function maybeTriggerLeadCapture() {
@@ -1193,11 +1219,11 @@ body>*:not(#agently-root):not(script){display:none!important}
         body: JSON.stringify({ chatbotId: CID, name: name, phone: phone, email: email })
       })
       .then(function(r) { if (!r.ok) throw new Error('failed'); return r.json(); })
-      .then(function() {
+      .then(function(d) {
         markLeadCaptured();
         form.style.opacity = '0.5'; leadFormVisible = false;
         ci.disabled = false; sb.disabled = !ci.value.trim();
-        addBotMsg('Thank you! How else can I help you?');
+        addBotMsg(d && d.deduped ? 'Thank you — I found your existing details. How else can I help you?' : 'Thank you! How else can I help you?');
       })
       .catch(function() { subBtn.disabled = false; subBtn.textContent = 'Save details'; showErr('Could not save details. Please try again.'); });
     }
