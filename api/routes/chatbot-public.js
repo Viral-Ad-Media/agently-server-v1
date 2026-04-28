@@ -3,16 +3,24 @@
 const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
 const { asyncHandler } = require("../../middleware/error");
-const { getOpenAI } = require("../../lib/openai-client");
+let getOpenAI;
+try {
+  ({ getOpenAI } = require("../../lib/openai-client"));
+} catch (_) {
+  ({ getOpenAI } = require("../../lib/openai"));
+}
 const {
   loadChatbotContext,
   buildAssistantPrompt,
   generateGroundedChatResponse,
   cleanAssistantResponse,
   looksUnanswered,
+  getContextStats,
 } = require("../../lib/assistant-intelligence");
 
 const router = express.Router();
+const rateLimitMap = new Map();
+
 const LANG_NAMES = {
   en: "English",
   es: "Spanish",
@@ -27,11 +35,9 @@ const LANG_NAMES = {
   hi: "Hindi",
   nl: "Dutch",
 };
-const rateLimitMap = new Map();
-function isRateLimited(key) {
-  const now = Date.now(),
-    windowMs = 60000,
-    max = 80;
+
+function isRateLimited(key, max = 80, windowMs = 60 * 1000) {
+  const now = Date.now();
   const entry = rateLimitMap.get(key) || { count: 0, start: now };
   if (now - entry.start > windowMs) {
     rateLimitMap.set(key, { count: 1, start: now });
@@ -42,6 +48,7 @@ function isRateLimited(key) {
   rateLimitMap.set(key, entry);
   return false;
 }
+
 function normalizePhone(phone) {
   return String(phone || "")
     .replace(/[^+0-9]/g, "")
@@ -50,26 +57,7 @@ function normalizePhone(phone) {
 function validEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || "").trim());
 }
-async function trackUnanswered({
-  organizationId,
-  chatbotId,
-  question,
-  botResponse,
-}) {
-  if (!organizationId || !question) return;
-  try {
-    await getSupabase()
-      .from("unanswered_questions")
-      .insert({
-        organization_id: organizationId,
-        chatbot_id: chatbotId,
-        question,
-        bot_response: botResponse || "",
-      });
-  } catch (e) {
-    console.warn("[chatbot-public] unanswered insert failed:", e.message);
-  }
-}
+
 async function saveChatMessage({ organizationId, chatbotId, role, text }) {
   if (!organizationId || !chatbotId || !text) return;
   try {
@@ -85,10 +73,32 @@ async function saveChatMessage({ organizationId, chatbotId, role, text }) {
     console.warn("[chatbot-public] chat_messages insert failed:", e.message);
   }
 }
+
+async function trackUnanswered({
+  organizationId,
+  chatbotId,
+  question,
+  botResponse,
+}) {
+  if (!organizationId || !chatbotId || !question) return;
+  try {
+    await getSupabase()
+      .from("unanswered_questions")
+      .insert({
+        organization_id: organizationId,
+        chatbot_id: chatbotId,
+        question,
+        bot_response: botResponse || "",
+      });
+  } catch (e) {
+    console.warn("[chatbot-public] unanswered insert failed:", e.message);
+  }
+}
+
 async function captureLead({ chatbotId, organizationId, lead, reason = "" }) {
   const db = getSupabase();
-  let orgId = organizationId,
-    voiceAgentId = lead.voiceAgentId || null;
+  let orgId = organizationId;
+  let voiceAgentId = lead.voiceAgentId || null;
   if (!orgId || !voiceAgentId) {
     const { data: chatbot } = await db
       .from("chatbots")
@@ -116,7 +126,8 @@ async function captureLead({ chatbotId, organizationId, lead, reason = "" }) {
     reason: String(lead.reason || reason || "Website chat lead").slice(0, 1000),
     source: "chatbot",
     status: "new",
-    tags: lead.tags || ["chatbot"],
+    tags:
+      Array.isArray(lead.tags) && lead.tags.length ? lead.tags : ["chatbot"],
     assignment_context: String(
       lead.assignmentContext || "Captured from embedded chat widget",
     ).slice(0, 1000),
@@ -181,6 +192,7 @@ router.post(
         response:
           "I'm receiving many messages right now. Please try again in a moment.",
       });
+
     let result;
     try {
       result = await generateGroundedChatResponse({
@@ -190,12 +202,16 @@ router.post(
         languageName: LANG_NAMES[language] || "English",
       });
     } catch (e) {
-      console.error("[chatbot-public/chat] generation failed:", e.message);
+      console.error(
+        "[chatbot-public/chat] generation failed:",
+        e.stack || e.message,
+      );
       return res.status(500).json({
         response:
-          "I'm sorry, I'm having trouble reaching the assistant right now. Please try again shortly.",
+          "I'm sorry, I'm having trouble reaching the business assistant right now. Please try again shortly.",
       });
     }
+
     const response = cleanAssistantResponse(result.response);
     const orgId = result.context?.organization_id;
     await saveChatMessage({
@@ -218,7 +234,9 @@ router.post(
           lead,
           reason: message.trim(),
         });
-      } catch (e) {}
+      } catch (e) {
+        console.warn("[chatbot-public] lead capture ignored:", e.message);
+      }
     }
     if (looksUnanswered(response))
       await trackUnanswered({
@@ -250,6 +268,15 @@ router.post(
         .status(400)
         .json({ error: { message: e.message || "Could not capture lead." } });
     }
+  }),
+);
+
+router.get(
+  "/debug-context/:chatbotId",
+  asyncHandler(async (req, res) => {
+    // This endpoint returns counts/previews only. It does not call OpenAI.
+    const context = await loadChatbotContext(req.params.chatbotId);
+    res.json({ ok: true, stats: getContextStats(context) });
   }),
 );
 
@@ -314,6 +341,7 @@ router.post(
       return res
         .status(500)
         .json({ error: { message: "OPENAI_API_KEY not configured." } });
+
     const context = await loadChatbotContext(chatbotId);
     const requested = String(
       context.entity.chat_voice || "alloy",
@@ -333,11 +361,12 @@ router.post(
     const voice = validVoices.has(requested) ? requested : "alloy";
     const instructions = buildAssistantPrompt({
       context,
-      message: "voice website assistant session",
+      message: "browser voice chat session",
       mode: "voice",
       direction: "chat",
       languageName: LANG_NAMES[language] || "English",
     });
+
     const openaiResp = await fetch(
       "https://api.openai.com/v1/realtime/client_secrets",
       {
