@@ -2,12 +2,6 @@
 
 const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
-let assistantIntel = null;
-try {
-  assistantIntel = require("../../lib/assistant-intelligence");
-} catch (_) {
-  assistantIntel = null;
-}
 
 const router = express.Router();
 
@@ -41,7 +35,7 @@ router.get("/:id", async (req, res) => {
       (Array.isArray(chatbot.chat_languages) ? chatbot.chat_languages : ["en"]);
     const chatVoice = queryVoice || chatbot.chat_voice || "alloy";
 
-    // Resolve agent name for the lead tag and server-built voice prompt.
+    // Resolve agent name for the lead tag and system prompt
     let agentName = chatbot.name || chatbot.header_title || "Assistant";
     if (chatbot.voice_agent_id) {
       try {
@@ -52,29 +46,6 @@ router.get("/:id", async (req, res) => {
           .single();
         if (agent && agent.name) agentName = agent.name;
       } catch (_) {}
-    }
-
-    let voiceSystemPrompt = "";
-    if (
-      assistantIntel &&
-      assistantIntel.loadChatbotContext &&
-      assistantIntel.buildAssistantPrompt
-    ) {
-      try {
-        const context = await assistantIntel.loadChatbotContext(id);
-        voiceSystemPrompt = assistantIntel.buildAssistantPrompt({
-          context,
-          message: "voice conversation",
-          mode: "voice",
-          direction: "chat",
-          languageName: "English",
-        });
-      } catch (e) {
-        console.warn(
-          "[widget] voice prompt build failed:",
-          e && e.message ? e.message : e,
-        );
-      }
     }
 
     const cfg = {
@@ -104,7 +75,6 @@ router.get("/:id", async (req, res) => {
       ),
       collectLeads: chatbot.collect_leads !== false,
       agentName: safeStr(agentName),
-      voiceSystemPrompt: safeStr(voiceSystemPrompt),
     };
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -338,7 +308,6 @@ body>*:not(#agently-root):not(script){display:none!important}
   var IDLE_TTL_MS = 5 * 60 * 1000; // Clear local widget chat cache only after the widget has been closed for 5 minutes
   var LEAD_CAPTURED_KEY = 'agently:' + CID + ':leadCaptured';
   var AGENT_NAME = '${cfg.agentName}';
-  var VOICE_SYSTEM_PROMPT = '${cfg.voiceSystemPrompt}';
   var LANG_NAMES = ${JSON.stringify(LANG_NAMES)};
 
   var currentLang = LANGUAGES[0] || 'en';
@@ -474,68 +443,44 @@ body>*:not(#agently-root):not(script){display:none!important}
 
   var SESS_KEY = 'agently_chat_' + CID;
 
-  function storageGet(k) {
-    try { return localStorage.getItem(k) || sessionStorage.getItem(k); } catch(e) { return null; }
-  }
-  function storageSet(k, v) {
-    try { localStorage.setItem(k, v); } catch(e) {}
-    try { sessionStorage.setItem(k, v); } catch(e) {}
-  }
-  function storageRemove(k) {
-    try { localStorage.removeItem(k); } catch(e) {}
-    try { sessionStorage.removeItem(k); } catch(e) {}
-  }
-
   function clearSessionCache() {
-    storageRemove(SESS_KEY);
+    try { sessionStorage.removeItem(SESS_KEY); } catch(e) {}
   }
 
   function scheduleSessionClear() {
-    var closedAt = Date.now();
-    try {
-      storageSet(SESS_KEY, JSON.stringify({ ts: Date.now(), closedAt: closedAt, messages: history.slice(-24) }));
-    } catch(e) {}
     if (closeClearTimer) clearTimeout(closeClearTimer);
     closeClearTimer = setTimeout(function() {
-      try {
-        var raw = storageGet(SESS_KEY);
-        var parsed = raw ? JSON.parse(raw) : null;
-        if (parsed && parsed.closedAt && Date.now() - Number(parsed.closedAt) >= IDLE_TTL_MS) {
-          clearSessionCache();
-          history = [];
-          msgs.innerHTML = '';
-          greeted = false;
-          sessionLoaded = false;
-        }
-      } catch(e) { clearSessionCache(); }
-    }, IDLE_TTL_MS + 200);
+      clearSessionCache();
+      history = [];
+      msgs.innerHTML = '';
+      greeted = false;
+      sessionLoaded = false;
+    }, IDLE_TTL_MS);
   }
 
   function loadSession() {
     try {
-      var raw = storageGet(SESS_KEY);
+      var raw = sessionStorage.getItem(SESS_KEY);
       if (!raw) return;
       var parsed = JSON.parse(raw);
       var saved = Array.isArray(parsed) ? parsed : parsed.messages;
-      var closedAt = Array.isArray(parsed) ? 0 : Number(parsed.closedAt || 0);
-      if (closedAt && Date.now() - closedAt > IDLE_TTL_MS) {
+      var ts = Array.isArray(parsed) ? Date.now() : Number(parsed.ts || 0);
+      if (!Array.isArray(saved) || !ts || (Date.now() - ts > IDLE_TTL_MS)) {
         clearSessionCache();
         return;
       }
-      if (!Array.isArray(saved)) { clearSessionCache(); return; }
-      if (closedAt) { parsed.closedAt = 0; storageSet(SESS_KEY, JSON.stringify(parsed)); }
       saved.forEach(function(m) {
         if (m.role && m.text) {
           if (m.role === 'model') { history.push({ role: 'model', text: m.text }); addMsg('bot', m.text, true); }
           else { history.push({ role: 'user', text: m.text }); addMsg('usr', m.text, true); }
         }
       });
-      greeted = history.length > 0;
+      greeted = true;
     } catch(e) { clearSessionCache(); }
   }
 
   function saveSession() {
-    try { storageSet(SESS_KEY, JSON.stringify({ ts: Date.now(), closedAt: 0, messages: history.slice(-24) })); } catch(e) {}
+    try { sessionStorage.setItem(SESS_KEY, JSON.stringify({ ts: Date.now(), messages: history.slice(-24) })); } catch(e) {}
   }
 
   function addMsg(role, text, skipSave) {
@@ -863,21 +808,26 @@ body>*:not(#agently-root):not(script){display:none!important}
   }
 
   function vmPrompt() {
-    var parts = [];
-    if (VOICE_SYSTEM_PROMPT && VOICE_SYSTEM_PROMPT.trim()) {
-      parts.push(VOICE_SYSTEM_PROMPT);
-    } else {
-      parts.push('You are ' + AGENT_NAME + ', the website receptionist for this business. Stay focused on the business, its website, services, products, pages, links, FAQs, and support. Never introduce yourself as OpenAI or as a generic AI module. If you do not know an answer from the provided business context, say so and offer to take a message.');
-    }
-    parts.push('Voice mode: keep every reply to 1-3 short natural sentences. Do not use markdown or bullet points while speaking.');
+    var parts = [
+      'You are ' + AGENT_NAME + ', a helpful voice assistant.',
+      'Keep every reply to 1-3 short sentences. This is a voice conversation - be concise.',
+      'Never use bullet points or markdown. Speak in plain natural sentences.'
+    ];
     if (LANGUAGES && LANGUAGES.length > 0) {
       var ln = LANGUAGES.map(function(l){ return LANG_NAMES[l] || l.toUpperCase(); });
       parts.push('Respond ONLY in: ' + ln.join(' or ') + '. Never switch languages.');
     }
-    if (COLLECT_LEADS) {
-      parts.push('Ask for name and either phone or email only when follow-up is needed. Do not ask repeatedly once the visitor has already provided it.');
+    if (FAQS && FAQS.length > 0) {
+      var q = [];
+      for (var fi = 0; fi < FAQS.length && fi < 8; fi++) {
+        if (FAQS[fi].question && FAQS[fi].answer) q.push('Q: ' + FAQS[fi].question + ' A: ' + FAQS[fi].answer);
+      }
+      if (q.length) parts.push('FAQs: ' + q.join(' || '));
     }
-    return parts.join('\n\n').slice(0, 12000);
+    if (COLLECT_LEADS) {
+      parts.push('After 1-2 exchanges ask for name and phone or email. Repeat back to confirm before accepting. Re-ask politely if they decline.');
+    }
+    return parts.join('. ');
   }
 
   if (vmBtn2) vmBtn2.onclick = function() { if (vmActive) stopVM(); else { if (COLLECT_LEADS && !leadAlreadyCaptured()) { renderLeadForm(); return; } void startVM(); } };
