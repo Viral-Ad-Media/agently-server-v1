@@ -2,6 +2,13 @@
 
 const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
+let loadChatbotContext = null;
+let buildAssistantPrompt = null;
+try {
+  const intelligence = require("../../lib/assistant-intelligence");
+  loadChatbotContext = intelligence.loadChatbotContext;
+  buildAssistantPrompt = intelligence.buildAssistantPrompt;
+} catch (_) {}
 
 const router = express.Router();
 
@@ -48,6 +55,26 @@ router.get("/:id", async (req, res) => {
       } catch (_) {}
     }
 
+    let voiceSystemPrompt = "";
+    try {
+      if (loadChatbotContext && buildAssistantPrompt) {
+        const context = await loadChatbotContext(id);
+        voiceSystemPrompt = buildAssistantPrompt({
+          context,
+          message:
+            "General website voice conversation. The visitor may ask about the business, pages, sections, products, services, links, contact details, or support.",
+          mode: "voice",
+          direction: "chat",
+          languageName: "English",
+        }).slice(0, 9000);
+      }
+    } catch (e) {
+      console.warn(
+        "[widget] voice intelligence prompt unavailable:",
+        e.message,
+      );
+    }
+
     const cfg = {
       chatbotId: safeStr(id),
       apiUrl: safeStr(apiUrl),
@@ -75,6 +102,7 @@ router.get("/:id", async (req, res) => {
       ),
       collectLeads: chatbot.collect_leads !== false,
       agentName: safeStr(agentName),
+      voiceSystemPrompt: safeStr(voiceSystemPrompt),
     };
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -308,6 +336,7 @@ body>*:not(#agently-root):not(script){display:none!important}
   var IDLE_TTL_MS = 5 * 60 * 1000; // Clear local widget chat cache only after the widget has been closed for 5 minutes
   var LEAD_CAPTURED_KEY = 'agently:' + CID + ':leadCaptured';
   var AGENT_NAME = '${cfg.agentName}';
+  var VOICE_SYSTEM_PROMPT = '${cfg.voiceSystemPrompt}';
   var LANG_NAMES = ${JSON.stringify(LANG_NAMES)};
 
   var currentLang = LANGUAGES[0] || 'en';
@@ -443,44 +472,74 @@ body>*:not(#agently-root):not(script){display:none!important}
 
   var SESS_KEY = 'agently_chat_' + CID;
 
+  function storageGet(k) {
+    try { return sessionStorage.getItem(k) || localStorage.getItem(k); } catch(e) { return null; }
+  }
+  function storageSet(k, v) {
+    try { sessionStorage.setItem(k, v); } catch(e) {}
+    try { localStorage.setItem(k, v); } catch(e) {}
+  }
+  function storageRemove(k) {
+    try { sessionStorage.removeItem(k); } catch(e) {}
+    try { localStorage.removeItem(k); } catch(e) {}
+  }
+
   function clearSessionCache() {
-    try { sessionStorage.removeItem(SESS_KEY); } catch(e) {}
+    storageRemove(SESS_KEY);
   }
 
   function scheduleSessionClear() {
+    var closedAt = Date.now();
+    try {
+      var raw = storageGet(SESS_KEY);
+      var parsed = raw ? JSON.parse(raw) : { messages: [] };
+      parsed.closedAt = closedAt;
+      parsed.expiresAt = closedAt + IDLE_TTL_MS;
+      parsed.messages = history.slice(-24);
+      storageSet(SESS_KEY, JSON.stringify(parsed));
+    } catch(e) {}
     if (closeClearTimer) clearTimeout(closeClearTimer);
     closeClearTimer = setTimeout(function() {
-      clearSessionCache();
-      history = [];
-      msgs.innerHTML = '';
-      greeted = false;
-      sessionLoaded = false;
-    }, IDLE_TTL_MS);
+      try {
+        var raw = storageGet(SESS_KEY);
+        var parsed = raw ? JSON.parse(raw) : null;
+        if (parsed && parsed.closedAt && Date.now() >= Number(parsed.closedAt) + IDLE_TTL_MS) {
+          clearSessionCache();
+          history = [];
+          msgs.innerHTML = '';
+          greeted = false;
+          sessionLoaded = false;
+        }
+      } catch(e) { clearSessionCache(); }
+    }, IDLE_TTL_MS + 200);
   }
 
   function loadSession() {
     try {
-      var raw = sessionStorage.getItem(SESS_KEY);
+      var raw = storageGet(SESS_KEY);
       if (!raw) return;
       var parsed = JSON.parse(raw);
       var saved = Array.isArray(parsed) ? parsed : parsed.messages;
-      var ts = Array.isArray(parsed) ? Date.now() : Number(parsed.ts || 0);
-      if (!Array.isArray(saved) || !ts || (Date.now() - ts > IDLE_TTL_MS)) {
+      var closedAt = Array.isArray(parsed) ? 0 : Number(parsed.closedAt || 0);
+      if (closedAt && (Date.now() - closedAt > IDLE_TTL_MS)) {
         clearSessionCache();
         return;
       }
+      if (!Array.isArray(saved)) { clearSessionCache(); return; }
+      // Reopening or reloading within five minutes keeps the conversation alive.
+      if (closedAt) { parsed.closedAt = 0; parsed.expiresAt = 0; storageSet(SESS_KEY, JSON.stringify(parsed)); }
       saved.forEach(function(m) {
         if (m.role && m.text) {
           if (m.role === 'model') { history.push({ role: 'model', text: m.text }); addMsg('bot', m.text, true); }
           else { history.push({ role: 'user', text: m.text }); addMsg('usr', m.text, true); }
         }
       });
-      greeted = true;
+      greeted = history.length > 0;
     } catch(e) { clearSessionCache(); }
   }
 
   function saveSession() {
-    try { sessionStorage.setItem(SESS_KEY, JSON.stringify({ ts: Date.now(), messages: history.slice(-24) })); } catch(e) {}
+    try { storageSet(SESS_KEY, JSON.stringify({ ts: Date.now(), closedAt: 0, expiresAt: 0, messages: history.slice(-24) })); } catch(e) {}
   }
 
   function addMsg(role, text, skipSave) {
@@ -808,9 +867,14 @@ body>*:not(#agently-root):not(script){display:none!important}
   }
 
   function vmPrompt() {
+    if (VOICE_SYSTEM_PROMPT && VOICE_SYSTEM_PROMPT.trim()) {
+      return VOICE_SYSTEM_PROMPT + '\n\nVOICE SESSION RULES:\n- Keep replies short and natural for speech.\n- Do not say raw URLs aloud unless the user specifically asks; mention the page or section name instead.\n- Never identify as OpenAI, ChatGPT, a platform module, or the website developer.\n- If website content uses first person, answer in third person.\n- If the answer is not in the provided website/business knowledge, say so and offer to take a message.';
+    }
     var parts = [
-      'You are ' + AGENT_NAME + ', a helpful voice assistant.',
+      'You are ' + AGENT_NAME + ', the website receptionist for this business.',
       'Keep every reply to 1-3 short sentences. This is a voice conversation - be concise.',
+      'Never introduce yourself as OpenAI, ChatGPT, a generic AI module, the developer, or a platform integration.',
+      'Use only the provided business FAQs and website context. If you do not know, say you cannot find that in the business knowledge base and offer to take a message.',
       'Never use bullet points or markdown. Speak in plain natural sentences.'
     ];
     if (LANGUAGES && LANGUAGES.length > 0) {
@@ -825,7 +889,7 @@ body>*:not(#agently-root):not(script){display:none!important}
       if (q.length) parts.push('FAQs: ' + q.join(' || '));
     }
     if (COLLECT_LEADS) {
-      parts.push('After 1-2 exchanges ask for name and phone or email. Repeat back to confirm before accepting. Re-ask politely if they decline.');
+      parts.push('Collect name and phone or email only when useful for follow-up. Do not ask repeatedly once provided.');
     }
     return parts.join('. ');
   }

@@ -162,10 +162,12 @@ router.post(
         .status(400)
         .json({ error: { message: "chatbotId is required." } });
     if (isRateLimited(`chat:${chatbotId}`))
-      return res.status(429).json({
-        response:
-          "I'm receiving many messages right now. Please try again in a moment.",
-      });
+      return res
+        .status(429)
+        .json({
+          response:
+            "I'm receiving many messages right now. Please try again in a moment.",
+        });
     let result;
     try {
       result = await generateGroundedChatResponse({
@@ -176,10 +178,12 @@ router.post(
       });
     } catch (e) {
       console.error("[chatbot-public/chat] generation failed:", e.message);
-      return res.status(500).json({
-        response:
-          "I'm sorry, I'm having trouble reaching the assistant right now. Please try again shortly.",
-      });
+      return res
+        .status(500)
+        .json({
+          response:
+            "I'm sorry, I'm having trouble reaching the assistant right now. Please try again shortly.",
+        });
     }
     const response = cleanAssistantResponse(result.response);
     const orgId = result.context?.organization_id;
@@ -313,6 +317,7 @@ function safeVoiceInstructionsFromContext(context, languageName = "English") {
     `Start naturally using this business identity when appropriate: ${greeting}`,
     `Never introduce yourself as OpenAI, ChatGPT, a generic AI module, or a platform integration.`,
     `Stay focused on ${businessName}'s website, products, services, contact paths, and support.`,
+    `You are not any person described in the website content. If content says "I am" or "my work", rewrite it in third person, such as "The developer is...".`,
     `Use only the business context below. Do not invent social links, products, prices, URLs, locations, or services.`,
     `If the exact answer is not in the context, say you cannot find it in the business knowledge base and offer to take a message.`,
     `If a request has multiple possible matches, ask a short clarifying question and offer the best options.`,
@@ -391,9 +396,11 @@ router.post(
     );
     if (!openaiResp.ok) {
       const detail = await openaiResp.text().catch(() => "");
-      return res.status(openaiResp.status).json({
-        error: { message: "OpenAI rejected the session request.", detail },
-      });
+      return res
+        .status(openaiResp.status)
+        .json({
+          error: { message: "OpenAI rejected the session request.", detail },
+        });
     }
     const data = await openaiResp.json();
     res.json({
