@@ -988,7 +988,7 @@ body>*:not(#agently-root):not(script){display:none!important}
 
   function b64ToArrayBuffer(b64) {
     try {
-      var bin = atob(String(b64 || '));
+      var bin = atob(String(b64 || ''));
       var len = bin.length;
       var bytes = new Uint8Array(len);
       for (var i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
