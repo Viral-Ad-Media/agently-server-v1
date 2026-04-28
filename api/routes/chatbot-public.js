@@ -3,24 +3,16 @@
 const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
 const { asyncHandler } = require("../../middleware/error");
-let getOpenAI;
-try {
-  ({ getOpenAI } = require("../../lib/openai-client"));
-} catch (_) {
-  ({ getOpenAI } = require("../../lib/openai"));
-}
+const { getOpenAI } = require("../../lib/openai-client");
 const {
   loadChatbotContext,
   buildAssistantPrompt,
   generateGroundedChatResponse,
   cleanAssistantResponse,
   looksUnanswered,
-  getContextStats,
 } = require("../../lib/assistant-intelligence");
 
 const router = express.Router();
-const rateLimitMap = new Map();
-
 const LANG_NAMES = {
   en: "English",
   es: "Spanish",
@@ -35,9 +27,11 @@ const LANG_NAMES = {
   hi: "Hindi",
   nl: "Dutch",
 };
-
-function isRateLimited(key, max = 80, windowMs = 60 * 1000) {
-  const now = Date.now();
+const rateLimitMap = new Map();
+function isRateLimited(key) {
+  const now = Date.now(),
+    windowMs = 60000,
+    max = 80;
   const entry = rateLimitMap.get(key) || { count: 0, start: now };
   if (now - entry.start > windowMs) {
     rateLimitMap.set(key, { count: 1, start: now });
@@ -48,7 +42,6 @@ function isRateLimited(key, max = 80, windowMs = 60 * 1000) {
   rateLimitMap.set(key, entry);
   return false;
 }
-
 function normalizePhone(phone) {
   return String(phone || "")
     .replace(/[^+0-9]/g, "")
@@ -57,7 +50,26 @@ function normalizePhone(phone) {
 function validEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || "").trim());
 }
-
+async function trackUnanswered({
+  organizationId,
+  chatbotId,
+  question,
+  botResponse,
+}) {
+  if (!organizationId || !question) return;
+  try {
+    await getSupabase()
+      .from("unanswered_questions")
+      .insert({
+        organization_id: organizationId,
+        chatbot_id: chatbotId,
+        question,
+        bot_response: botResponse || "",
+      });
+  } catch (e) {
+    console.warn("[chatbot-public] unanswered insert failed:", e.message);
+  }
+}
 async function saveChatMessage({ organizationId, chatbotId, role, text }) {
   if (!organizationId || !chatbotId || !text) return;
   try {
@@ -73,32 +85,10 @@ async function saveChatMessage({ organizationId, chatbotId, role, text }) {
     console.warn("[chatbot-public] chat_messages insert failed:", e.message);
   }
 }
-
-async function trackUnanswered({
-  organizationId,
-  chatbotId,
-  question,
-  botResponse,
-}) {
-  if (!organizationId || !chatbotId || !question) return;
-  try {
-    await getSupabase()
-      .from("unanswered_questions")
-      .insert({
-        organization_id: organizationId,
-        chatbot_id: chatbotId,
-        question,
-        bot_response: botResponse || "",
-      });
-  } catch (e) {
-    console.warn("[chatbot-public] unanswered insert failed:", e.message);
-  }
-}
-
 async function captureLead({ chatbotId, organizationId, lead, reason = "" }) {
   const db = getSupabase();
-  let orgId = organizationId;
-  let voiceAgentId = lead.voiceAgentId || null;
+  let orgId = organizationId,
+    voiceAgentId = lead.voiceAgentId || null;
   if (!orgId || !voiceAgentId) {
     const { data: chatbot } = await db
       .from("chatbots")
@@ -126,8 +116,7 @@ async function captureLead({ chatbotId, organizationId, lead, reason = "" }) {
     reason: String(lead.reason || reason || "Website chat lead").slice(0, 1000),
     source: "chatbot",
     status: "new",
-    tags:
-      Array.isArray(lead.tags) && lead.tags.length ? lead.tags : ["chatbot"],
+    tags: lead.tags || ["chatbot"],
     assignment_context: String(
       lead.assignmentContext || "Captured from embedded chat widget",
     ).slice(0, 1000),
@@ -192,7 +181,6 @@ router.post(
         response:
           "I'm receiving many messages right now. Please try again in a moment.",
       });
-
     let result;
     try {
       result = await generateGroundedChatResponse({
@@ -202,16 +190,12 @@ router.post(
         languageName: LANG_NAMES[language] || "English",
       });
     } catch (e) {
-      console.error(
-        "[chatbot-public/chat] generation failed:",
-        e.stack || e.message,
-      );
+      console.error("[chatbot-public/chat] generation failed:", e.message);
       return res.status(500).json({
         response:
-          "I'm sorry, I'm having trouble reaching the business assistant right now. Please try again shortly.",
+          "I'm sorry, I'm having trouble reaching the assistant right now. Please try again shortly.",
       });
     }
-
     const response = cleanAssistantResponse(result.response);
     const orgId = result.context?.organization_id;
     await saveChatMessage({
@@ -234,9 +218,7 @@ router.post(
           lead,
           reason: message.trim(),
         });
-      } catch (e) {
-        console.warn("[chatbot-public] lead capture ignored:", e.message);
-      }
+      } catch (e) {}
     }
     if (looksUnanswered(response))
       await trackUnanswered({
@@ -268,15 +250,6 @@ router.post(
         .status(400)
         .json({ error: { message: e.message || "Could not capture lead." } });
     }
-  }),
-);
-
-router.get(
-  "/debug-context/:chatbotId",
-  asyncHandler(async (req, res) => {
-    // This endpoint returns counts/previews only. It does not call OpenAI.
-    const context = await loadChatbotContext(req.params.chatbotId);
-    res.json({ ok: true, stats: getContextStats(context) });
   }),
 );
 
@@ -325,6 +298,61 @@ router.patch(
   }),
 );
 
+function safeVoiceInstructionsFromContext(context, languageName = "English") {
+  const org = context.organization || {};
+  const bot = context.entity || {};
+  const linked = context.linkedAgent || {};
+  const businessName =
+    org.name || bot.header_title || bot.name || "this business";
+  const website = org.website || "";
+  const greeting =
+    linked.greeting ||
+    bot.welcome_message ||
+    `Hello, I am ${bot.avatar_label || bot.name || "your assistant"}. How can I help you today?`;
+  const faqs = Array.isArray(context.faqs) ? context.faqs.slice(0, 8) : [];
+  const chunks = Array.isArray(context.chunks)
+    ? context.chunks.slice(0, 6)
+    : [];
+  const faqText = faqs
+    .map((f, i) => `${i + 1}. Q: ${f.question} A: ${f.answer}`)
+    .join("\n");
+  const chunkText = chunks
+    .map((c, i) => {
+      const title = c.source_title || c.source_url || `Knowledge ${i + 1}`;
+      const content = String(c.content || "")
+        .replace(/\s+/g, " ")
+        .slice(0, 650);
+      const links =
+        Array.isArray(c.links) && c.links.length
+          ? ` Links: ${c.links
+              .slice(0, 5)
+              .map((l) => `${l.label || "Page"}: ${l.url}`)
+              .join(" | ")}`
+          : c.source_url
+            ? ` Link: ${c.source_url}`
+            : "";
+      return `${i + 1}. ${title}: ${content}${links}`;
+    })
+    .join("\n");
+  return [
+    `You are ${linked.name || bot.name || "the assistant"}, the website receptionist for ${businessName}${website ? ` (${website})` : ""}.`,
+    `Start naturally using this business identity when appropriate: ${greeting}`,
+    `Never introduce yourself as OpenAI, ChatGPT, a generic AI module, or a platform integration.`,
+    `Stay focused on ${businessName}'s website, products, services, contact paths, and support.`,
+    `Use only the business context below. Do not invent social links, products, prices, URLs, locations, or services.`,
+    `If the exact answer is not in the context, say you cannot find it in the business knowledge base and offer to take a message.`,
+    `If a request has multiple possible matches, ask a short clarifying question and offer the best options.`,
+    `Voice mode: speak naturally and briefly. Mention page names instead of reading long raw URLs aloud.`,
+    `Collect lead details when useful: name and either phone or email. Do not ask repeatedly once provided.`,
+    `Language: ${languageName}.`,
+    faqText ? `FAQs:\n${faqText}` : "",
+    chunkText ? `Website knowledge:\n${chunkText}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n")
+    .slice(0, 6500);
+}
+
 router.post(
   "/voice-token",
   asyncHandler(async (req, res) => {
@@ -341,7 +369,6 @@ router.post(
       return res
         .status(500)
         .json({ error: { message: "OPENAI_API_KEY not configured." } });
-
     const context = await loadChatbotContext(chatbotId);
     const requested = String(
       context.entity.chat_voice || "alloy",
@@ -359,14 +386,13 @@ router.post(
       "verse",
     ]);
     const voice = validVoices.has(requested) ? requested : "alloy";
-    const instructions = buildAssistantPrompt({
+    // Keep the realtime voice token path deliberately small and audio-first.
+    // The strict text prompt remains in assistant-intelligence.js; this voice session
+    // uses a compact prompt so WebRTC audio stays stable.
+    const instructions = safeVoiceInstructionsFromContext(
       context,
-      message: "browser voice chat session",
-      mode: "voice",
-      direction: "chat",
-      languageName: LANG_NAMES[language] || "English",
-    });
-
+      LANG_NAMES[language] || "English",
+    );
     const openaiResp = await fetch(
       "https://api.openai.com/v1/realtime/client_secrets",
       {
@@ -380,18 +406,10 @@ router.post(
             type: "realtime",
             model: process.env.OPENAI_REALTIME_MODEL || "gpt-realtime",
             instructions,
+            output_modalities: ["audio"],
             audio: {
-              input: {
-                format: { type: "audio/pcm", rate: 24000 },
-                transcription: { model: "gpt-4o-mini-transcribe" },
-                turn_detection: {
-                  type: "server_vad",
-                  threshold: 0.5,
-                  prefix_padding_ms: 300,
-                  silence_duration_ms: 500,
-                },
-              },
-              output: { format: { type: "audio/pcm", rate: 24000 }, voice },
+              output: { voice },
+              input: { turn_detection: { type: "server_vad" } },
             },
           },
         }),
@@ -472,6 +490,43 @@ router.post(
     const buf = Buffer.from(await audio.arrayBuffer());
     res.setHeader("Content-Type", "audio/mpeg");
     res.send(buf);
+  }),
+);
+
+router.get(
+  "/debug-context/:chatbotId",
+  asyncHandler(async (req, res) => {
+    const { chatbotId } = req.params;
+    const context = await loadChatbotContext(chatbotId);
+    const { collectLinks } = require("../../lib/assistant-intelligence");
+    const links = collectLinks(context.chunks || []);
+    res.json({
+      chatbotId,
+      organizationId: context.organization_id,
+      businessName:
+        context.organization?.name ||
+        context.entity?.header_title ||
+        context.entity?.name ||
+        "",
+      stats: context.stats,
+      organization: context.organization || null,
+      linkedAgent: context.linkedAgent
+        ? {
+            id: context.linkedAgent.id,
+            name: context.linkedAgent.name,
+            direction: context.linkedAgent.direction,
+            greeting: context.linkedAgent.greeting,
+          }
+        : null,
+      sampleFaqs: (context.faqs || []).slice(0, 5),
+      sampleChunks: (context.chunks || []).slice(0, 5).map((c) => ({
+        source_url: c.source_url,
+        source_title: c.source_title,
+        content_preview: String(c.content || "").slice(0, 280),
+        links: (c.links || []).slice(0, 8),
+      })),
+      sampleLinks: links.slice(0, 30),
+    });
   }),
 );
 
