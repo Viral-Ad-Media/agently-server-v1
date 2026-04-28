@@ -305,7 +305,7 @@ body>*:not(#agently-root):not(script){display:none!important}
   var REALTIME_WS_BASE = '${cfg.realtimeWsUrl}';
   var COLLECT_LEADS = ${cfg.collectLeads};
   var STORAGE_KEY = 'agently:' + CID;
-  var IDLE_TTL_MS = 3 * 60 * 1000; // Clear local widget chat cache no later than 3 minutes after close
+  var IDLE_TTL_MS = 5 * 60 * 1000; // Clear local widget chat cache only after the widget has been closed for 5 minutes
   var LEAD_CAPTURED_KEY = 'agently:' + CID + ':leadCaptured';
   var AGENT_NAME = '${cfg.agentName}';
   var LANG_NAMES = ${JSON.stringify(LANG_NAMES)};
@@ -897,6 +897,13 @@ body>*:not(#agently-root):not(script){display:none!important}
       }
       else if (msg.type === 'input_audio_buffer.speech_started') { stopPCM(); vmPhase('listening', 'Listening...', ''); }
       else if (msg.type === 'input_audio_buffer.speech_stopped' || msg.type === 'input_audio_buffer.committed') { vmPhase('thinking', 'Thinking...', ''); }
+      else if ((msg.type === 'response.output_audio.delta' || msg.type === 'response.audio.delta') && msg.delta) {
+        // OpenAI Realtime audio arrives as base64 PCM16 JSON deltas on the proxy path.
+        // Keep binary frame support too, so the previous working milestone remains safe.
+        var audioAb = b64ToArrayBuffer(msg.delta);
+        if (audioAb && audioAb.byteLength) playPCM(audioAb);
+        vmPhase('speaking', 'Speaking...', 'Tap end to stop.');
+      }
       else if (msg.type === 'response.created') { vmPhase('speaking', 'Speaking...', 'Tap end to stop.'); }
       else if (msg.type === 'response.done' || msg.type === 'response.audio.done') {
         var waitT = setInterval(function() { if (!vmPlaying && !vmPlayQueue.length) { clearInterval(waitT); if (vmActive) vmPhase('listening', 'Listening...', 'I will reply instantly when you pause.'); } }, 80);
@@ -977,6 +984,16 @@ body>*:not(#agently-root):not(script){display:none!important}
     src.connect(proc);
     proc.connect(actx.destination);
     vmScriptProc = proc;
+  }
+
+  function b64ToArrayBuffer(b64) {
+    try {
+      var bin = atob(String(b64 || '));
+      var len = bin.length;
+      var bytes = new Uint8Array(len);
+      for (var i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+      return bytes.buffer;
+    } catch (_) { return null; }
   }
 
   function playPCM(ab) {

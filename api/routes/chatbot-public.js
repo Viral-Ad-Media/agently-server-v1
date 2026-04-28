@@ -162,12 +162,10 @@ router.post(
         .status(400)
         .json({ error: { message: "chatbotId is required." } });
     if (isRateLimited(`chat:${chatbotId}`))
-      return res
-        .status(429)
-        .json({
-          response:
-            "I'm receiving many messages right now. Please try again in a moment.",
-        });
+      return res.status(429).json({
+        response:
+          "I'm receiving many messages right now. Please try again in a moment.",
+      });
     let result;
     try {
       result = await generateGroundedChatResponse({
@@ -178,12 +176,10 @@ router.post(
       });
     } catch (e) {
       console.error("[chatbot-public/chat] generation failed:", e.message);
-      return res
-        .status(500)
-        .json({
-          response:
-            "I'm sorry, I'm having trouble reaching the assistant right now. Please try again shortly.",
-        });
+      return res.status(500).json({
+        response:
+          "I'm sorry, I'm having trouble reaching the assistant right now. Please try again shortly.",
+      });
     }
     const response = cleanAssistantResponse(result.response);
     const orgId = result.context?.organization_id;
@@ -395,11 +391,9 @@ router.post(
     );
     if (!openaiResp.ok) {
       const detail = await openaiResp.text().catch(() => "");
-      return res
-        .status(openaiResp.status)
-        .json({
-          error: { message: "OpenAI rejected the session request.", detail },
-        });
+      return res.status(openaiResp.status).json({
+        error: { message: "OpenAI rejected the session request.", detail },
+      });
     }
     const data = await openaiResp.json();
     res.json({
