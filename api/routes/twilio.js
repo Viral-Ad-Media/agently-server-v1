@@ -58,6 +58,28 @@ const {
   updateCallRecordById,
   finalizeUsage,
 } = require("../../lib/call-records");
+const { mapTwilioError } = require("../../lib/twilio-errors");
+const {
+  ensureTenantTwilioAccount,
+  searchAvailableRecommendedNumbers,
+  purchaseIncomingNumber,
+  listIncomingNumbers,
+  fetchIncomingNumber,
+  configureTwilioIncomingNumber,
+  applyVoiceDialingPermissions,
+  buildManualSmsGeoInstructions,
+  normalizeCountry,
+  supportedCountries,
+  lowRiskCountries,
+  evaluateNumberRecommendation,
+  twilioRequest,
+  apiBaseUrl,
+  masterSid,
+} = require("../../lib/twilio-platform");
+const {
+  getTwilioNumberReadiness,
+  persistReadiness,
+} = require("../../lib/twilio-number-readiness");
 
 const router = express.Router();
 
@@ -133,11 +155,34 @@ function buildRealtimeTwiml({
 // ─────────────────────────────────────────────────────────────
 async function lookupAgentByPhone(toPhone) {
   const db = getSupabase();
-  // Strip +, spaces, dashes for comparison flexibility
+  const normalized = normalizePhone(toPhone);
+
+  // New source of truth: dedicated Twilio number records. This keeps
+  // recovered/unassigned/configured numbers separate from agent rows.
+  try {
+    const { data: numberRow, error } = await db
+      .from("twilio_phone_numbers")
+      .select("*, voice_agents:assigned_voice_agent_id(*)")
+      .eq("phone_number", normalized)
+      .maybeSingle();
+
+    if (!error && numberRow?.voice_agents?.is_active) {
+      return {
+        ...numberRow.voice_agents,
+        organization_id: numberRow.organization_id,
+        twilio_number_id: numberRow.id,
+        twilio_phone_number: numberRow.phone_number,
+        twilio_phone_sid: numberRow.phone_sid,
+      };
+    }
+  } catch (_) {
+    // Migration may not be applied yet; safely fall back to legacy lookup.
+  }
+
   const { data: agent } = await db
     .from("voice_agents")
     .select("*, organizations(id, name)")
-    .eq("twilio_phone_number", toPhone)
+    .eq("twilio_phone_number", normalized)
     .eq("is_active", true)
     .maybeSingle();
 
@@ -428,6 +473,1390 @@ router.get(
   }),
 );
 
+// ─────────────────────────────────────────────────────────────
+// ── PROTECTED: Tenant Twilio account + readiness helpers ─────
+// ─────────────────────────────────────────────────────────────
+function bodyOrg(req) {
+  const requested =
+    req.body?.organizationId || req.query?.organizationId || req.orgId;
+  if (
+    requested &&
+    requested !== req.orgId &&
+    !["Owner", "Admin"].includes(req.user?.role)
+  ) {
+    const err = new Error(
+      "You cannot access another organization's Twilio resources.",
+    );
+    err.status = 403;
+    throw err;
+  }
+  return req.orgId;
+}
+
+function isE164(phone) {
+  return /^\+[1-9]\d{7,14}$/.test(String(phone || ""));
+}
+
+function guessCountryFromE164(phone) {
+  const value = String(phone || "");
+  if (value.startsWith("+1")) return "US";
+  if (value.startsWith("+44")) return "GB";
+  if (value.startsWith("+234")) return "NG";
+  if (value.startsWith("+61")) return "AU";
+  if (value.startsWith("+353")) return "IE";
+  if (value.startsWith("+64")) return "NZ";
+  return "UNKNOWN";
+}
+
+async function saveNumberRecord(db, payload) {
+  const now = new Date().toISOString();
+  const row = {
+    organization_id: payload.organizationId,
+    twilio_account_id: payload.twilioAccountId || null,
+    phone_number: payload.phoneNumber,
+    phone_sid: payload.phoneSid,
+    account_sid: payload.accountSid,
+    iso_country: normalizeCountry(payload.isoCountry || payload.country || ""),
+    number_type: payload.numberType || "unknown",
+    capabilities: payload.capabilities || {},
+    address_requirements: payload.addressRequirements || "none",
+    regulatory_status: payload.regulatoryStatus || "unknown",
+    bundle_sid: payload.bundleSid || null,
+    address_sid: payload.addressSid || null,
+    regulation_sid: payload.regulationSid || null,
+    regulatory_next_action: payload.regulatoryNextAction || null,
+    voice_url: payload.voiceUrl || "",
+    voice_fallback_url: payload.voiceFallbackUrl || "",
+    status_callback_url: payload.statusCallback || "",
+    sms_url: payload.smsUrl || "",
+    sms_fallback_url: payload.smsFallbackUrl || "",
+    assigned_voice_agent_id: payload.agentId || null,
+    source: payload.source || "purchased",
+    purchase_origin: payload.purchaseOrigin || "in_app_purchase",
+    verification_method: payload.verificationMethod || "api_ownership",
+    verification_status: payload.verificationStatus || "verified",
+    selected_outbound_voice_countries:
+      payload.selectedOutboundVoiceCountries || [],
+    selected_sms_countries: payload.selectedSmsCountries || [],
+    configuration_status: payload.configurationStatus || "needs_configuration",
+    updated_at: now,
+  };
+
+  const { data: existing } = await db
+    .from("twilio_phone_numbers")
+    .select("id")
+    .eq("organization_id", payload.organizationId)
+    .eq("phone_sid", payload.phoneSid)
+    .maybeSingle();
+
+  if (existing?.id) {
+    const { data, error } = await db
+      .from("twilio_phone_numbers")
+      .update(row)
+      .eq("id", existing.id)
+      .select()
+      .single();
+    if (error) throw error;
+    return data;
+  }
+
+  const { data, error } = await db
+    .from("twilio_phone_numbers")
+    .insert({ ...row, created_at: now })
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+async function updateLegacyAgentNumber(
+  db,
+  { organizationId, agentId, phoneNumber, phoneSid, source },
+) {
+  if (!agentId) return;
+  await db
+    .from("voice_agents")
+    .update({
+      twilio_phone_number: phoneNumber,
+      twilio_phone_sid: phoneSid,
+      number_source: source || "purchased",
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", agentId)
+    .eq("organization_id", organizationId);
+}
+
+async function storeVoicePermissionResults(
+  db,
+  { organizationId, twilioAccountId, countries, result },
+) {
+  const now = new Date().toISOString();
+  const rows = (countries || []).map((country) => ({
+    organization_id: organizationId,
+    twilio_account_id: twilioAccountId || null,
+    channel: "voice",
+    iso_country: normalizeCountry(country),
+    low_risk_voice_enabled: !!result?.success,
+    high_risk_special_numbers_enabled: false,
+    high_risk_tollfraud_numbers_enabled: false,
+    status: result?.success ? "enabled" : "failed",
+    last_error: result?.success
+      ? null
+      : result?.message || "Could not enable voice dialing permission.",
+    raw_result: result || {},
+    updated_at: now,
+  }));
+  for (const row of rows) {
+    const { data: existing } = await db
+      .from("twilio_geo_permissions")
+      .select("id")
+      .eq("organization_id", row.organization_id)
+      .eq("channel", row.channel)
+      .eq("iso_country", row.iso_country)
+      .maybeSingle()
+      .catch(() => ({ data: null }));
+    if (existing?.id)
+      await db
+        .from("twilio_geo_permissions")
+        .update(row)
+        .eq("id", existing.id)
+        .catch(() => {});
+    else
+      await db
+        .from("twilio_geo_permissions")
+        .insert({ ...row, created_at: now })
+        .catch(() => {});
+  }
+}
+
+async function refreshAndPersistReadiness(numberId, organizationId) {
+  const readiness = await getTwilioNumberReadiness(numberId, {
+    organizationId,
+  });
+  await persistReadiness(numberId, readiness);
+  return readiness;
+}
+
+async function writeAudit(
+  db,
+  { organizationId, userId, action, entityType, entityId, metadata },
+) {
+  await db
+    .from("audit_logs")
+    .insert({
+      organization_id: organizationId || null,
+      user_id: userId || null,
+      action,
+      entity_type: entityType || null,
+      entity_id: entityId || null,
+      metadata: metadata || {},
+    })
+    .catch(() => {});
+}
+
+function jsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (!value) return [];
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  if (Array.isArray(value.countries)) return value.countries;
+  return [];
+}
+function isPlatformAdminUser(req) {
+  const identifiers = [req.user?.id, req.user?.email]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  const configured = (
+    process.env.PLATFORM_ADMIN_USER_IDS ||
+    process.env.PLATFORM_ADMIN_EMAILS ||
+    ""
+  )
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  if (configured.length) {
+    return identifiers.some((value) => configured.includes(value));
+  }
+
+  // Compatibility fallback for single-owner deployments. In multi-tenant
+  // production, set PLATFORM_ADMIN_USER_IDS/EMAILS and leave this unset.
+  return (
+    process.env.ALLOW_OWNER_MASTER_TWILIO_SYNC === "true" &&
+    req.user?.role === "Owner"
+  );
+}
+
+function normalizeStringList(value) {
+  if (Array.isArray(value))
+    return value.map((item) => String(item || "").trim()).filter(Boolean);
+  if (!value) return [];
+  return String(value)
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function numberSourceLabel(source, twilioFound = true) {
+  if (source === "purchased")
+    return twilioFound
+      ? "Purchased via Agently"
+      : "Purchased (not found on Twilio)";
+  if (source === "existing_twilio_number") return "Existing Twilio number";
+  if (source === "external_twilio_account") return "External Twilio account";
+  if (source === "imported") return "Imported (voice verified)";
+  if (source === "sms_verified") return "Imported (SMS verified)";
+  if (source === "legacy_voice_agent") return "Legacy assigned number";
+  return source || "Twilio number";
+}
+
+function numberCapabilitiesFrom(row, latest) {
+  const raw = latest?.capabilities || row?.capabilities || {};
+  return {
+    voice:
+      raw.voice === true ||
+      raw.voice === "true" ||
+      raw.voice === "True" ||
+      raw.voice === "1",
+    sms:
+      raw.sms === true ||
+      raw.SMS === true ||
+      raw.sms === "true" ||
+      raw.SMS === "true" ||
+      raw.sms === "True" ||
+      raw.SMS === "True" ||
+      raw.sms === "1" ||
+      raw.SMS === "1",
+    mms:
+      raw.mms === true ||
+      raw.MMS === true ||
+      raw.mms === "true" ||
+      raw.MMS === "true" ||
+      raw.mms === "True" ||
+      raw.MMS === "True" ||
+      raw.mms === "1" ||
+      raw.MMS === "1",
+  };
+}
+
+function ownedNumberResponse(row, latest = null, agent = null, warning = null) {
+  const sid = latest?.sid || row.phone_sid || row.twilio_phone_sid;
+  const phoneNumber =
+    latest?.phoneNumber ||
+    latest?.phone_number ||
+    row.phone_number ||
+    row.twilio_phone_number;
+  const source = row.source || row.number_source || "purchased";
+  const agentId =
+    row.assigned_voice_agent_id || agent?.id || row.agent_id || null;
+  const agentName = agent?.name || row.agent_name || row.name || null;
+  const twilioFound = !warning;
+
+  return {
+    sid,
+    phoneSid: sid,
+    phoneNumber,
+    friendlyName:
+      latest?.friendlyName || latest?.friendly_name || agentName || phoneNumber,
+    voiceUrl: latest?.voiceUrl || latest?.voice_url || row.voice_url || "",
+    smsUrl: latest?.smsUrl || latest?.sms_url || row.sms_url || "",
+    dateCreated:
+      latest?.dateCreated || latest?.date_created || row.created_at || null,
+    capabilities: numberCapabilitiesFrom(row, latest),
+    agentId,
+    agentName,
+    assignedAgent: agentId ? { id: agentId, name: agentName } : null,
+    source,
+    sourceLabel: numberSourceLabel(source, twilioFound),
+    accountSid:
+      row.account_sid || latest?.accountSid || latest?.account_sid || null,
+    twilioNumberId: row.twilio_number_id || row.id || null,
+    overallStatus: row.overall_status || row.configuration_status || null,
+    readinessStatus: row.overall_status || row.configuration_status || null,
+    warning: warning || undefined,
+  };
+}
+
+async function fetchLatestOwnedNumber(row) {
+  const phoneSid = row.phone_sid || row.twilio_phone_sid;
+  const accountSid = row.account_sid || masterSid();
+  if (!phoneSid) return null;
+  if (phoneSid.startsWith("SMS_VERIFIED_")) return null;
+
+  if (phoneSid.startsWith("PN")) {
+    return fetchIncomingNumber({ accountSid, phoneSid });
+  }
+
+  if (phoneSid.startsWith("CA")) {
+    const data = await twilioRequest({
+      method: "GET",
+      accountSid,
+      path: `/OutgoingCallerIds/${phoneSid}.json`,
+    });
+    return {
+      sid: data.sid,
+      phoneNumber:
+        data.phone_number || row.phone_number || row.twilio_phone_number,
+      friendlyName: data.friendly_name || row.agent_name || row.name,
+      dateCreated: data.date_created,
+      capabilities: { voice: true, sms: false, mms: false },
+    };
+  }
+
+  return null;
+}
+
+router.post(
+  "/accounts/ensure-subaccount",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    try {
+      const account = await ensureTenantTwilioAccount({
+        organizationId: bodyOrg(req),
+        organizationName: req.organization?.name,
+        createIfMissing: true,
+      });
+      res.json({
+        success: true,
+        account: {
+          id: account.id,
+          accountSid: account.account_sid,
+          status: account.status,
+          authMode: account.auth_mode,
+        },
+      });
+    } catch (err) {
+      const mapped = mapTwilioError(
+        err,
+        "Could not create or load this tenant's Twilio subaccount.",
+      );
+      res
+        .status(err.code === "MIGRATION_REQUIRED" ? 500 : 400)
+        .json({ error: mapped });
+    }
+  }),
+);
+
+router.get(
+  "/accounts/current",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const account = await ensureTenantTwilioAccount({
+      organizationId: req.orgId,
+      organizationName: req.organization?.name,
+      createIfMissing: false,
+    });
+    res.json({
+      account: {
+        id: account.id || null,
+        accountSid: account.account_sid,
+        status: account.status || "active",
+        isFallbackMaster: !!account.isFallbackMaster,
+      },
+    });
+  }),
+);
+
+// New POST contract. The legacy GET /numbers/search route below is kept for compatibility.
+router.post(
+  "/numbers/search",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const organizationId = bodyOrg(req);
+    const showAdvancedRestrictedNumbers =
+      !!req.body?.showAdvancedRestrictedNumbers &&
+      ["Owner", "Admin"].includes(req.user?.role);
+    const requiresSms = !!req.body?.requiresSms;
+    const requiresVoice = req.body?.requiresVoice !== false;
+    const country = normalizeCountry(req.body?.country || "US");
+
+    if (!supportedCountries().includes(country)) {
+      return res.status(400).json({
+        error: {
+          code: "UNSUPPORTED_COUNTRY",
+          message: `Agently is not currently configured to sell numbers in ${country}.`,
+          supportedCountries: supportedCountries(),
+        },
+      });
+    }
+
+    const account = await ensureTenantTwilioAccount({
+      organizationId,
+      organizationName: req.organization?.name,
+      createIfMissing: false,
+    });
+
+    try {
+      const numbers = await searchAvailableRecommendedNumbers({
+        accountSid: account.account_sid,
+        country,
+        areaCode: req.body?.areaCode,
+        contains: req.body?.contains,
+        requiresSms,
+        requiresVoice,
+        showAdvancedRestrictedNumbers,
+        limit: req.body?.limit || 40,
+        type: req.body?.type || req.body?.numberType || "Local",
+      });
+      res.json({
+        numbers,
+        supportedCountries: supportedCountries(),
+        lowRiskVoiceCountries: lowRiskCountries(),
+      });
+    } catch (err) {
+      const mapped = mapTwilioError(err, "Could not search Twilio numbers.");
+      res.status(400).json({ error: mapped });
+    }
+  }),
+);
+
+router.post(
+  "/numbers/purchase",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const organizationId = bodyOrg(req);
+    const phoneNumber = normalizePhone(
+      req.body?.phoneNumber || req.body?.selectedPhoneNumber || "",
+    );
+    const country = normalizeCountry(
+      req.body?.country || req.body?.selectedCountry || "US",
+    );
+    const agentId =
+      req.body?.agentId ||
+      req.body?.voiceAgentId ||
+      req.organization?.active_voice_agent_id ||
+      null;
+    const selectedOutboundVoiceCountries = [
+      ...new Set(
+        [country, ...(req.body?.selectedOutboundVoiceCountries || [])]
+          .map(normalizeCountry)
+          .filter(Boolean),
+      ),
+    ];
+
+    if (!phoneNumber)
+      return res
+        .status(400)
+        .json({ error: { message: "phoneNumber is required." } });
+    if (agentId) {
+      const { data: agent } = await getSupabase()
+        .from("voice_agents")
+        .select("id,name")
+        .eq("id", agentId)
+        .eq("organization_id", organizationId)
+        .maybeSingle();
+      if (!agent)
+        return res.status(404).json({
+          error: { message: "Voice agent not found for this organization." },
+        });
+    }
+
+    const db = getSupabase();
+    try {
+      const account = await ensureTenantTwilioAccount({
+        organizationId,
+        organizationName: req.organization?.name,
+        createIfMissing: true,
+      });
+      const purchased = await purchaseIncomingNumber({
+        accountSid: account.account_sid,
+        phoneNumber,
+        friendlyName: `${req.organization?.name || "Agently"} ${phoneNumber}`,
+        agentId,
+      });
+      const normalized = {
+        phoneSid: purchased.sid,
+        phoneNumber: purchased.phone_number || phoneNumber,
+        accountSid: purchased.account_sid || account.account_sid,
+        country: purchased.iso_country || country,
+        capabilities: {
+          voice: !!purchased.capabilities?.voice,
+          sms: !!(purchased.capabilities?.SMS || purchased.capabilities?.sms),
+          mms: !!(purchased.capabilities?.MMS || purchased.capabilities?.mms),
+        },
+        addressRequirements: purchased.address_requirements || "none",
+        voiceUrl:
+          purchased.voice_url || `${apiBaseUrl()}/api/twilio/voice-inbound`,
+        voiceFallbackUrl:
+          purchased.voice_fallback_url ||
+          `${apiBaseUrl()}/api/twilio/voice-inbound`,
+        statusCallback:
+          purchased.status_callback || `${apiBaseUrl()}/api/twilio/call-status`,
+        smsUrl: purchased.sms_url || `${apiBaseUrl()}/api/twilio/sms-inbound`,
+        smsFallbackUrl:
+          purchased.sms_fallback_url ||
+          `${apiBaseUrl()}/api/twilio/sms-inbound`,
+        bundleSid: purchased.bundle_sid || null,
+        addressSid: purchased.address_sid || null,
+      };
+      const saved = await saveNumberRecord(db, {
+        organizationId,
+        twilioAccountId: account.id || null,
+        ...normalized,
+        agentId,
+        source: "purchased",
+        purchaseOrigin: "in_app_purchase",
+        selectedOutboundVoiceCountries,
+        configurationStatus: "configured",
+      });
+      await updateLegacyAgentNumber(db, {
+        organizationId,
+        agentId,
+        phoneNumber: saved.phone_number,
+        phoneSid: saved.phone_sid,
+        source: "purchased",
+      });
+
+      let voicePermissionResult = null;
+      try {
+        voicePermissionResult = await applyVoiceDialingPermissions({
+          accountSid: account.account_sid,
+          countries: selectedOutboundVoiceCountries,
+        });
+        await storeVoicePermissionResults(db, {
+          organizationId,
+          twilioAccountId: account.id,
+          countries: selectedOutboundVoiceCountries,
+          result: voicePermissionResult,
+        });
+      } catch (err) {
+        voicePermissionResult = {
+          success: false,
+          error: mapTwilioError(
+            err,
+            "Could not update voice dialing permissions.",
+          ),
+        };
+        await storeVoicePermissionResults(db, {
+          organizationId,
+          twilioAccountId: account.id,
+          countries: selectedOutboundVoiceCountries,
+          result: voicePermissionResult,
+        });
+      }
+
+      const readiness = await refreshAndPersistReadiness(
+        saved.id,
+        organizationId,
+      );
+      await writeAudit(db, {
+        organizationId,
+        userId: req.user?.id,
+        action: "twilio_number_purchased",
+        entityType: "twilio_phone_number",
+        entityId: saved.id,
+        metadata: {
+          phoneNumber: saved.phone_number,
+          phoneSid: saved.phone_sid,
+        },
+      });
+      res.json({
+        success: true,
+        phoneNumber: saved.phone_number,
+        phoneSid: saved.phone_sid,
+        agentId,
+        number: saved,
+        readiness,
+        voicePermissionResult,
+      });
+    } catch (err) {
+      const mapped = mapTwilioError(
+        err,
+        "Could not purchase and configure this Twilio number.",
+      );
+      res
+        .status(err.code === "MIGRATION_REQUIRED" ? 500 : 400)
+        .json({ error: mapped });
+    }
+  }),
+);
+
+router.post(
+  "/numbers/sync-owned",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const organizationId = bodyOrg(req);
+    const db = getSupabase();
+    const explicitPhoneNumbers = normalizeStringList(
+      req.body?.phoneNumbers || req.body?.phoneNumber,
+    );
+    const explicitPhoneSids = normalizeStringList(
+      req.body?.phoneSids || req.body?.phoneSid,
+    );
+    const explicitRequested =
+      explicitPhoneNumbers.length > 0 || explicitPhoneSids.length > 0;
+    const includeMasterAccount = !!(
+      req.body?.includeMasterAccount ||
+      req.body?.syncMasterAccount ||
+      req.body?.accountScope === "master"
+    );
+
+    try {
+      const tenantAccount = await ensureTenantTwilioAccount({
+        organizationId,
+        organizationName: req.organization?.name,
+        createIfMissing: false,
+      });
+
+      const accountsToQuery = [];
+      const tenantHasDedicatedSubaccount =
+        tenantAccount?.account_sid &&
+        !tenantAccount.isFallbackMaster &&
+        tenantAccount.account_sid !== masterSid();
+
+      if (tenantHasDedicatedSubaccount && !includeMasterAccount) {
+        accountsToQuery.push({
+          accountSid: tenantAccount.account_sid,
+          twilioAccountId: tenantAccount.id || null,
+          scope: "tenant_subaccount",
+        });
+      } else {
+        if (!isPlatformAdminUser(req)) {
+          return res.status(403).json({
+            error: {
+              code: "PLATFORM_ADMIN_REQUIRED",
+              message:
+                "Master-account number sync requires platform admin permission. Configure a tenant subaccount, or ask a platform admin to sync explicitly selected numbers.",
+            },
+          });
+        }
+        if (!explicitRequested) {
+          return res.status(400).json({
+            error: {
+              code: "EXPLICIT_MASTER_NUMBER_SELECTION_REQUIRED",
+              message:
+                "For safety, master-account sync requires explicit phoneNumbers or phoneSids. Unrestricted master-account sync is blocked.",
+            },
+          });
+        }
+        accountsToQuery.push({
+          accountSid: masterSid(),
+          twilioAccountId: null,
+          scope: "master_explicit",
+        });
+        if (tenantHasDedicatedSubaccount && includeMasterAccount) {
+          accountsToQuery.push({
+            accountSid: tenantAccount.account_sid,
+            twilioAccountId: tenantAccount.id || null,
+            scope: "tenant_subaccount",
+          });
+        }
+      }
+
+      const imported = [];
+      const seen = new Set();
+      for (const account of accountsToQuery) {
+        if (!account.accountSid) continue;
+        let numbers = await listIncomingNumbers({
+          accountSid: account.accountSid,
+        });
+        if (account.scope === "master_explicit") {
+          numbers = numbers.filter(
+            (n) =>
+              explicitPhoneNumbers.includes(n.phoneNumber) ||
+              explicitPhoneSids.includes(n.sid),
+          );
+        }
+        for (const n of numbers) {
+          if (seen.has(n.sid)) continue;
+          seen.add(n.sid);
+          const saved = await saveNumberRecord(db, {
+            organizationId,
+            twilioAccountId: account.twilioAccountId,
+            phoneNumber: n.phoneNumber,
+            phoneSid: n.sid,
+            accountSid: n.accountSid || account.accountSid,
+            country: n.country,
+            capabilities: n.capabilities,
+            addressRequirements: n.addressRequirements,
+            voiceUrl: n.voiceUrl,
+            voiceFallbackUrl: n.voiceFallbackUrl,
+            statusCallback: n.statusCallback,
+            smsUrl: n.smsUrl,
+            smsFallbackUrl: n.smsFallbackUrl,
+            bundleSid: n.bundleSid,
+            addressSid: n.addressSid,
+            source: "existing_twilio_number",
+            purchaseOrigin: "previously_purchased",
+            configurationStatus: "needs_configuration",
+          });
+          const readiness = await refreshAndPersistReadiness(
+            saved.id,
+            organizationId,
+          );
+          imported.push({ ...saved, readiness, syncScope: account.scope });
+        }
+      }
+
+      await writeAudit(db, {
+        organizationId,
+        userId: req.user?.id,
+        action: "twilio_numbers_synced",
+        entityType: "twilio_phone_number",
+        metadata: {
+          count: imported.length,
+          scopes: accountsToQuery.map((a) => a.scope),
+          explicitPhoneNumbers,
+          explicitPhoneSids,
+        },
+      });
+      res.json({ success: true, numbers: imported });
+    } catch (err) {
+      const mapped = mapTwilioError(
+        err,
+        "Could not sync owned Twilio numbers.",
+      );
+      res
+        .status(err.code === "MIGRATION_REQUIRED" ? 500 : 400)
+        .json({ error: mapped });
+    }
+  }),
+);
+
+router.post(
+  "/numbers/:id/configure-existing",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const organizationId = bodyOrg(req);
+    const numberId = req.params.id;
+    const agentId =
+      req.body?.agentId ||
+      req.body?.voiceAgentId ||
+      req.organization?.active_voice_agent_id;
+    const overwrite = !!req.body?.overwriteExistingWebhooks;
+    const db = getSupabase();
+
+    const { data: number, error } = await db
+      .from("twilio_phone_numbers")
+      .select("*")
+      .eq("id", numberId)
+      .eq("organization_id", organizationId)
+      .maybeSingle();
+    if (error) throw error;
+    if (!number)
+      return res.status(404).json({
+        error: { message: "Number not found for this organization." },
+      });
+
+    const latest = await fetchIncomingNumber({
+      accountSid: number.account_sid,
+      phoneSid: number.phone_sid,
+    });
+    const existingVoiceExternal =
+      latest.voiceUrl && !latest.voiceUrl.includes("/api/twilio/voice-inbound");
+    const existingSmsExternal =
+      latest.smsUrl && !latest.smsUrl.includes("/api/twilio/sms-inbound");
+    if (!overwrite && (existingVoiceExternal || existingSmsExternal)) {
+      return res.status(409).json({
+        warning: true,
+        code: "WEBHOOK_OVERWRITE_CONFIRMATION_REQUIRED",
+        message:
+          "This number already has webhook URLs that do not point to Agently. Confirm overwriteExistingWebhooks=true before changing them.",
+        currentWebhooks: { voiceUrl: latest.voiceUrl, smsUrl: latest.smsUrl },
+      });
+    }
+
+    const configured = await configureTwilioIncomingNumber(number.phone_sid, {
+      accountSid: number.account_sid,
+      supportsSms: latest.capabilities?.sms,
+      addressSid: number.address_sid || latest.addressSid,
+      bundleSid: number.bundle_sid || latest.bundleSid,
+    });
+    const selectedOutboundVoiceCountries = [
+      ...new Set(
+        [
+          normalizeCountry(number.iso_country),
+          ...(req.body?.selectedOutboundVoiceCountries || []),
+        ].filter(Boolean),
+      ),
+    ];
+    await saveNumberRecord(db, {
+      organizationId,
+      twilioAccountId: number.twilio_account_id,
+      phoneNumber: configured.phone_number || number.phone_number,
+      phoneSid: configured.sid || number.phone_sid,
+      accountSid: configured.account_sid || number.account_sid,
+      country: configured.iso_country || number.iso_country,
+      capabilities: {
+        voice: !!configured.capabilities?.voice,
+        sms: !!(configured.capabilities?.SMS || configured.capabilities?.sms),
+        mms: !!(configured.capabilities?.MMS || configured.capabilities?.mms),
+      },
+      addressRequirements:
+        configured.address_requirements || number.address_requirements,
+      voiceUrl: configured.voice_url,
+      voiceFallbackUrl: configured.voice_fallback_url,
+      statusCallback: configured.status_callback,
+      smsUrl: configured.sms_url,
+      smsFallbackUrl: configured.sms_fallback_url,
+      bundleSid: configured.bundle_sid || number.bundle_sid,
+      addressSid: configured.address_sid || number.address_sid,
+      agentId,
+      source: number.source || "existing_twilio_number",
+      purchaseOrigin: number.purchase_origin || "previously_purchased",
+      selectedOutboundVoiceCountries,
+      configurationStatus: "configured",
+    });
+    await updateLegacyAgentNumber(db, {
+      organizationId,
+      agentId,
+      phoneNumber: number.phone_number,
+      phoneSid: number.phone_sid,
+      source: number.source || "existing_twilio_number",
+    });
+
+    let voicePermissionResult = null;
+    try {
+      voicePermissionResult = await applyVoiceDialingPermissions({
+        accountSid: number.account_sid,
+        countries: selectedOutboundVoiceCountries,
+      });
+      await storeVoicePermissionResults(db, {
+        organizationId,
+        twilioAccountId: number.twilio_account_id,
+        countries: selectedOutboundVoiceCountries,
+        result: voicePermissionResult,
+      });
+    } catch (err) {
+      voicePermissionResult = {
+        success: false,
+        error: mapTwilioError(
+          err,
+          "Could not update voice dialing permissions.",
+        ),
+      };
+    }
+
+    const readiness = await refreshAndPersistReadiness(
+      numberId,
+      organizationId,
+    );
+    await writeAudit(db, {
+      organizationId,
+      userId: req.user?.id,
+      action: "twilio_number_configured",
+      entityType: "twilio_phone_number",
+      entityId: numberId,
+      metadata: { overwriteExistingWebhooks: overwrite },
+    });
+    res.json({
+      success: true,
+      readiness,
+      configuredNumber: configured,
+      voicePermissionResult,
+    });
+  }),
+);
+
+router.post(
+  "/numbers/:id/voice-countries",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const organizationId = bodyOrg(req);
+    const countries = (req.body?.countries || [])
+      .map(normalizeCountry)
+      .filter(Boolean);
+    const allowHighRiskSpecialNumbers =
+      !!req.body?.allowHighRiskSpecialNumbers && req.user?.role === "Owner";
+    const allowHighRiskTollFraudNumbers =
+      !!req.body?.allowHighRiskTollFraudNumbers && req.user?.role === "Owner";
+    const db = getSupabase();
+    const { data: number } = await db
+      .from("twilio_phone_numbers")
+      .select("*")
+      .eq("id", req.params.id)
+      .eq("organization_id", organizationId)
+      .maybeSingle();
+    if (!number)
+      return res.status(404).json({ error: { message: "Number not found." } });
+
+    try {
+      const result = await applyVoiceDialingPermissions({
+        accountSid: number.account_sid,
+        countries,
+        allowHighRiskSpecialNumbers,
+        allowHighRiskTollFraudNumbers,
+      });
+      await storeVoicePermissionResults(db, {
+        organizationId,
+        twilioAccountId: number.twilio_account_id,
+        countries,
+        result,
+      });
+      await db
+        .from("twilio_phone_numbers")
+        .update({
+          selected_outbound_voice_countries: countries,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", number.id);
+      const readiness = await refreshAndPersistReadiness(
+        number.id,
+        organizationId,
+      );
+      res.json({
+        success: !!result.success,
+        message: result.success
+          ? "Voice dialing permissions updated or requested."
+          : result.message,
+        result,
+        readiness,
+      });
+    } catch (err) {
+      const mapped = mapTwilioError(
+        err,
+        "Could not update voice dialing permissions.",
+      );
+      res.status(400).json({ error: mapped });
+    }
+  }),
+);
+
+router.post(
+  "/numbers/:id/sms-countries",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const organizationId = bodyOrg(req);
+    const countries = (req.body?.countries || [])
+      .map(normalizeCountry)
+      .filter(Boolean);
+    const db = getSupabase();
+    const { data: number } = await db
+      .from("twilio_phone_numbers")
+      .select("id,capabilities")
+      .eq("id", req.params.id)
+      .eq("organization_id", organizationId)
+      .maybeSingle();
+    if (!number)
+      return res.status(404).json({ error: { message: "Number not found." } });
+    await db
+      .from("twilio_phone_numbers")
+      .update({
+        selected_sms_countries: countries,
+        outbound_sms_status: "pending_manual_action",
+        sms_geo_permission_confirmed_by_user: false,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", number.id);
+    const readiness = await refreshAndPersistReadiness(
+      number.id,
+      organizationId,
+    );
+    res.json({
+      success: true,
+      status: "pending_manual_action",
+      manualInstructions: buildManualSmsGeoInstructions(countries),
+      readiness,
+    });
+  }),
+);
+
+router.post(
+  "/numbers/:id/confirm-sms-geo",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const organizationId = bodyOrg(req);
+    const db = getSupabase();
+    const { data: number } = await db
+      .from("twilio_phone_numbers")
+      .select("id")
+      .eq("id", req.params.id)
+      .eq("organization_id", organizationId)
+      .maybeSingle();
+    if (!number)
+      return res.status(404).json({ error: { message: "Number not found." } });
+    await db
+      .from("twilio_phone_numbers")
+      .update({
+        sms_geo_permission_confirmed_by_user: true,
+        outbound_sms_status: "ready",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", number.id);
+    const readiness = await refreshAndPersistReadiness(
+      number.id,
+      organizationId,
+    );
+    res.json({ success: true, readiness });
+  }),
+);
+
+router.get(
+  "/numbers/:id/readiness",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const readiness = await refreshAndPersistReadiness(
+      req.params.id,
+      req.orgId,
+    );
+    res.json({ readiness });
+  }),
+);
+
+router.post(
+  "/calls/outbound",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const organizationId = bodyOrg(req);
+    const toPhone = normalizePhone(req.body?.toPhone || req.body?.to || "");
+    const fromNumberId = req.body?.fromNumberId || req.body?.numberId || null;
+    const agentId = req.body?.agentId || req.body?.voiceAgentId || null;
+    if (!isE164(toPhone))
+      return res.status(400).json({
+        error: {
+          code: "INVALID_PHONE_NUMBER",
+          message: "Destination must be an E.164 number like +14155551234.",
+        },
+      });
+
+    const db = getSupabase();
+    let q = db
+      .from("twilio_phone_numbers")
+      .select("*")
+      .eq("organization_id", organizationId);
+    if (fromNumberId) q = q.eq("id", fromNumberId);
+    else
+      q = q.eq(
+        "assigned_voice_agent_id",
+        agentId || req.organization?.active_voice_agent_id,
+      );
+    const { data: number } = await q.maybeSingle();
+    if (!number)
+      return res.status(404).json({
+        error: {
+          code: "NUMBER_NOT_OWNED",
+          message: "No configured from-number was found for this tenant/agent.",
+        },
+      });
+
+    const capabilities =
+      typeof number.capabilities === "string"
+        ? JSON.parse(number.capabilities || "{}")
+        : number.capabilities || {};
+    if (!capabilities.voice)
+      return res.status(400).json({
+        error: {
+          code: "UNSUPPORTED_CAPABILITY",
+          message: "The selected from-number does not support voice.",
+        },
+      });
+    const actualAgentId =
+      agentId ||
+      number.assigned_voice_agent_id ||
+      req.organization?.active_voice_agent_id;
+    if (!actualAgentId)
+      return res.status(400).json({
+        error: {
+          code: "AGENT_NOT_ASSIGNED",
+          message: "Assign an AI agent before placing outbound calls.",
+        },
+      });
+
+    const readiness = await refreshAndPersistReadiness(
+      number.id,
+      organizationId,
+    );
+    if (
+      !["ready", "pending_manual_action"].includes(readiness.overall_status) ||
+      readiness.inbound_voice.status !== "ready"
+    ) {
+      return res.status(400).json({
+        error: {
+          code: "NUMBER_NOT_READY",
+          message:
+            "This number is not configured for the Agently voice flow yet.",
+          readiness,
+        },
+      });
+    }
+    const destinationCountry = guessCountryFromE164(toPhone);
+    const selected = new Set(
+      [
+        ...jsonArray(number.selected_outbound_voice_countries),
+        normalizeCountry(number.iso_country),
+      ].map(normalizeCountry),
+    );
+    if (!selected.has(destinationCountry) && destinationCountry !== "UNKNOWN") {
+      return res.status(400).json({
+        error: {
+          code: "COUNTRY_NOT_ENABLED",
+          message: `Outbound calls to ${destinationCountry} are not selected/enabled for this number.`,
+        },
+      });
+    }
+
+    const { data: agent } = await db
+      .from("voice_agents")
+      .select("*")
+      .eq("id", actualAgentId)
+      .eq("organization_id", organizationId)
+      .maybeSingle();
+    if (!agent)
+      return res
+        .status(404)
+        .json({ error: { message: "Voice agent not found." } });
+
+    const record = await createCallRecord({
+      organizationId,
+      voiceAgentId: agent.id,
+      callerName: req.body?.customerName || "Outbound Lead",
+      callerPhone: toPhone,
+      leadId: req.body?.leadId || null,
+      direction: "outbound",
+      status: "queued",
+      metadata: { initiatedBy: req.user?.id || null, fromNumberId: number.id },
+    });
+
+    const base = API_URL();
+    const twimlUrl = `${base}/api/twilio/outbound-twiml?agentId=${encodeURIComponent(agent.id)}&callRecordId=${encodeURIComponent(record.id)}`;
+    try {
+      const result = await makeOutboundCall({
+        from: number.phone_number,
+        to: toPhone,
+        twimlUrl,
+        statusCallbackUrl: `${base}/api/twilio/call-status`,
+      });
+      await updateCallRecordById(record.id, {
+        twilio_call_sid: result.callSid,
+        status: result.status || "initiated",
+      });
+      res.json({
+        success: true,
+        callSid: result.callSid,
+        callRecordId: record.id,
+        status: result.status,
+      });
+    } catch (err) {
+      const mapped = mapTwilioError(err, "Could not start outbound call.");
+      await updateCallRecordById(record.id, {
+        status: "failed",
+        metadata: { error: mapped },
+      }).catch(() => {});
+      res.status(400).json({ error: mapped });
+    }
+  }),
+);
+
+router.post(
+  "/import/verify-api",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const organizationId = bodyOrg(req);
+    const accountSid = String(req.body?.accountSid || "").trim();
+    const authToken = String(req.body?.authToken || "").trim();
+    const phoneNumber = normalizePhone(req.body?.phoneNumber || "");
+    if (!accountSid || !authToken || !phoneNumber)
+      return res.status(400).json({
+        error: {
+          message: "accountSid, authToken and phoneNumber are required.",
+        },
+      });
+    try {
+      const data = await twilioRequest({
+        method: "GET",
+        accountSid,
+        authSid: accountSid,
+        authToken,
+        path: "/IncomingPhoneNumbers.json",
+        params: { PhoneNumber: phoneNumber, PageSize: "20" },
+      });
+      const found = (data?.incoming_phone_numbers || [])[0];
+      if (!found)
+        return res.status(404).json({
+          error: {
+            code: "NUMBER_NOT_OWNED",
+            message:
+              "That number was not found in the supplied Twilio account.",
+          },
+        });
+      const n = {
+        phoneNumber: found.phone_number,
+        phoneSid: found.sid,
+        accountSid: found.account_sid || accountSid,
+        country: found.iso_country,
+        capabilities: {
+          voice: !!found.capabilities?.voice,
+          sms: !!(found.capabilities?.SMS || found.capabilities?.sms),
+          mms: !!(found.capabilities?.MMS || found.capabilities?.mms),
+        },
+        addressRequirements: found.address_requirements || "none",
+        voiceUrl: found.voice_url || "",
+        smsUrl: found.sms_url || "",
+        bundleSid: found.bundle_sid || null,
+        addressSid: found.address_sid || null,
+      };
+      const saved = await saveNumberRecord(getSupabase(), {
+        organizationId,
+        ...n,
+        source: "external_twilio_account",
+        purchaseOrigin: "external",
+        verificationMethod: "api_ownership",
+        verificationStatus: "verified",
+        configurationStatus: "needs_configuration",
+      });
+      const readiness = await refreshAndPersistReadiness(
+        saved.id,
+        organizationId,
+      );
+      res.json({
+        success: true,
+        number: saved,
+        readiness,
+        warning:
+          "Agently did not store the supplied Auth Token. Reconnect if you need to refresh this external account later.",
+      });
+    } catch (err) {
+      res.status(400).json({
+        error: mapTwilioError(
+          err,
+          "Could not verify API ownership for this Twilio number.",
+        ),
+      });
+    }
+  }),
+);
+
+router.post(
+  "/import/start-webhook-challenge",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const token = require("crypto").randomBytes(16).toString("hex");
+    const phoneNumber = normalizePhone(req.body?.phoneNumber || "");
+    const callbackUrl = `${apiBaseUrl()}/api/twilio/import/challenge-callback?token=${encodeURIComponent(token)}`;
+    await getSupabase()
+      .from("twilio_import_challenges")
+      .insert({
+        organization_id: req.orgId,
+        phone_number: phoneNumber,
+        challenge_token: token,
+        status: "pending",
+        expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+      })
+      .catch(() => {});
+    res.json({
+      success: true,
+      token,
+      challengeUrl: callbackUrl,
+      instructions:
+        "Paste this URL into the Twilio number VoiceUrl or SmsUrl temporarily. Twilio must call it before the challenge expires.",
+    });
+  }),
+);
+
+router.all(
+  "/import/challenge-callback",
+  asyncHandler(async (req, res) => {
+    const token = req.query?.token || req.body?.token;
+    const calledNumber = normalizePhone(req.body?.To || req.query?.To || "");
+    const db = getSupabase();
+    const { data: challenge } = await db
+      .from("twilio_import_challenges")
+      .select("*")
+      .eq("challenge_token", token)
+      .maybeSingle()
+      .catch(() => ({ data: null }));
+    if (challenge) {
+      await db
+        .from("twilio_import_challenges")
+        .update({
+          status: "verified",
+          verified_at: new Date().toISOString(),
+          twilio_to: calledNumber,
+        })
+        .eq("id", challenge.id)
+        .catch(() => {});
+    }
+    res.setHeader("Content-Type", "text/xml");
+    res.send(
+      `<?xml version="1.0" encoding="UTF-8"?><Response><Say>Agently verification successful. You may return to the dashboard.</Say></Response>`,
+    );
+  }),
+);
+
+router.post(
+  "/import/attach",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const organizationId = bodyOrg(req);
+    const token = req.body?.token;
+    const numberId = req.body?.numberId;
+    const agentId =
+      req.body?.agentId || req.organization?.active_voice_agent_id;
+    const db = getSupabase();
+    let number = null;
+    if (numberId) {
+      const { data } = await db
+        .from("twilio_phone_numbers")
+        .select("*")
+        .eq("id", numberId)
+        .eq("organization_id", organizationId)
+        .maybeSingle();
+      number = data;
+    } else if (token) {
+      const { data: challenge } = await db
+        .from("twilio_import_challenges")
+        .select("*")
+        .eq("challenge_token", token)
+        .eq("organization_id", organizationId)
+        .eq("status", "verified")
+        .maybeSingle();
+      if (challenge) {
+        const { data } = await db
+          .from("twilio_phone_numbers")
+          .select("*")
+          .eq("phone_number", challenge.phone_number || challenge.twilio_to)
+          .eq("organization_id", organizationId)
+          .maybeSingle();
+        number = data;
+      }
+    }
+    if (!number)
+      return res.status(404).json({
+        error: {
+          message:
+            "Verified/imported number not found. Run API verification or webhook challenge first.",
+        },
+      });
+    await db
+      .from("twilio_phone_numbers")
+      .update({
+        assigned_voice_agent_id: agentId,
+        verification_status: "verified",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", number.id);
+    await updateLegacyAgentNumber(db, {
+      organizationId,
+      agentId,
+      phoneNumber: number.phone_number,
+      phoneSid: number.phone_sid,
+      source: number.source || "external_twilio_account",
+    });
+    const readiness = await refreshAndPersistReadiness(
+      number.id,
+      organizationId,
+    );
+    res.json({ success: true, readiness });
+  }),
+);
+
 // Search available numbers
 router.get(
   "/numbers/search",
@@ -471,8 +1900,57 @@ router.get(
   requireAuth,
   asyncHandler(async (req, res) => {
     const db = getSupabase();
+    const numbers = [];
+    const seenSids = new Set();
 
-    // ── STEP 1: Get only the phone SIDs that belong to THIS org ──
+    // STEP 1: New source of truth. These rows include account_sid, so
+    // subaccount-purchased numbers are fetched from the correct Twilio account.
+    try {
+      const { data: numberRows, error: numberErr } = await db
+        .from("twilio_phone_numbers")
+        .select("*, voice_agents:assigned_voice_agent_id(id,name)")
+        .eq("organization_id", req.orgId)
+        .order("created_at", { ascending: false });
+
+      if (numberErr && !["42P01", "PGRST205"].includes(numberErr.code)) {
+        console.warn(
+          "[twilio/numbers/owned] twilio_phone_numbers query failed:",
+          numberErr.message,
+        );
+      }
+
+      for (const row of numberRows || []) {
+        const agent = row.voice_agents || null;
+        const sid = row.phone_sid;
+        if (sid) seenSids.add(sid);
+        try {
+          const latest = await fetchLatestOwnedNumber(row);
+          numbers.push(ownedNumberResponse(row, latest, agent));
+        } catch (fetchErr) {
+          numbers.push(
+            ownedNumberResponse(
+              row,
+              null,
+              agent,
+              "This number could not be confirmed on Twilio. It may have been released, moved, or its account credentials may need review.",
+            ),
+          );
+          console.warn(
+            `[twilio/numbers/owned] fetch failed for SID ${sid}:`,
+            fetchErr.message,
+          );
+        }
+      }
+    } catch (err) {
+      // Migration may not be applied yet. Fall through to legacy voice_agents.
+      console.warn(
+        "[twilio/numbers/owned] new table unavailable, using legacy lookup:",
+        err.message,
+      );
+    }
+
+    // STEP 2: Legacy compatibility fallback. Include any legacy agent number
+    // not already represented by twilio_phone_numbers.
     const { data: agents, error: agentsErr } = await db
       .from("voice_agents")
       .select("id, name, twilio_phone_number, twilio_phone_sid, number_source")
@@ -482,202 +1960,50 @@ router.get(
 
     if (agentsErr) {
       console.error("[twilio/numbers/owned] DB error:", agentsErr.message);
-      return res
-        .status(500)
-        .json({ error: { message: "Failed to load numbers." } });
+      if (!numbers.length)
+        return res
+          .status(500)
+          .json({ error: { message: "Failed to load numbers." } });
     }
 
-    if (!agents || agents.length === 0) {
-      return res.json({ numbers: [] });
-    }
-
-    // ── STEP 2: Fetch details for each org-owned number ────────────────
-    // IncomingPhoneNumbers (PN...) → fetch from /IncomingPhoneNumbers/{sid}
-    // OutgoingCallerIds (CA...)    → fetch from /OutgoingCallerIds/{sid}
-    // SMS_VERIFIED_*               → number is external; show directly from DB
-    const numbers = [];
-
-    // Lazy-load the raw Twilio helper (same fetch pattern used in billing-tracker)
-    const sid = (process.env.TWILIO_ACCOUNT_SID || "").trim();
-    const token = (process.env.TWILIO_AUTH_TOKEN || "").trim();
-    const TWILIO_BASE = `https://api.twilio.com/2010-04-01/Accounts/${sid}`;
-    const basicAuth =
-      "Basic " + Buffer.from(`${sid}:${token}`).toString("base64");
-
-    async function twilioFetch(path) {
-      const res = await fetch(`${TWILIO_BASE}${path}`, {
-        headers: { Authorization: basicAuth },
-      });
-      if (res.status === 404) return null;
-      if (!res.ok) return null;
-      return res.json();
-    }
-
-    for (const agent of agents) {
-      if (!agent.twilio_phone_sid) continue;
-
-      const source =
-        agent.number_source ||
-        (agent.twilio_phone_sid.startsWith("PN")
-          ? "purchased"
-          : agent.twilio_phone_sid.startsWith("CA")
-            ? "imported"
-            : "sms_verified");
-
-      // SMS_VERIFIED numbers are not on Twilio — show from DB directly
-      if (agent.twilio_phone_sid.startsWith("SMS_VERIFIED_")) {
-        numbers.push({
-          sid: agent.twilio_phone_sid,
-          phoneNumber: agent.twilio_phone_number,
-          friendlyName: agent.name,
-          voiceUrl: "",
-          dateCreated: null,
-          capabilities: { voice: false, sms: true },
-          agentId: agent.id,
-          agentName: agent.name,
-          source, // 'sms_verified'
-          sourceLabel: "Imported (SMS verified)",
-        });
+    for (const agent of agents || []) {
+      if (!agent.twilio_phone_sid || seenSids.has(agent.twilio_phone_sid))
         continue;
-      }
+      const legacyRow = {
+        id: null,
+        twilio_number_id: null,
+        organization_id: req.orgId,
+        phone_sid: agent.twilio_phone_sid,
+        phone_number: agent.twilio_phone_number,
+        account_sid: masterSid(),
+        capabilities: agent.twilio_phone_sid.startsWith("SMS_VERIFIED_")
+          ? { voice: false, sms: true, mms: false }
+          : { voice: true, sms: false, mms: false },
+        source: agent.number_source || "legacy_voice_agent",
+        assigned_voice_agent_id: agent.id,
+        agent_name: agent.name,
+      };
 
       try {
-        let data = null;
-
-        if (agent.twilio_phone_sid.startsWith("PN")) {
-          // Purchased Twilio number
-          data = await twilioFetch(
-            `/IncomingPhoneNumbers/${agent.twilio_phone_sid}.json`,
-          );
-        } else if (agent.twilio_phone_sid.startsWith("CA")) {
-          // Imported / CallerID verified number
-          data = await twilioFetch(
-            `/OutgoingCallerIds/${agent.twilio_phone_sid}.json`,
-          );
-          if (data) {
-            // OutgoingCallerIds response has different shape — normalise it
-            data = {
-              sid: data.sid,
-              phone_number: data.phone_number || agent.twilio_phone_number,
-              friendly_name: data.friendly_name || agent.name,
-              voice_url: "",
-              date_created: data.date_created,
-              capabilities: { voice: true, SMS: false },
-            };
-          }
-        }
-
-        if (data && (data.phone_number || agent.twilio_phone_number)) {
-          numbers.push({
-            sid: data.sid || agent.twilio_phone_sid,
-            phoneNumber: data.phone_number || agent.twilio_phone_number,
-            friendlyName: data.friendly_name || agent.name,
-            voiceUrl: data.voice_url || "",
-            dateCreated: data.date_created || null,
-            capabilities: {
-              voice: data.capabilities?.voice ?? true,
-              sms: data.capabilities?.SMS ?? false,
-            },
-            agentId: agent.id,
-            agentName: agent.name,
-            // ── NUMBER SOURCE LABEL ────────────────────────────────────
-            // 'purchased' = bought through Agently from master Twilio account
-            // 'imported'  = user's own number verified via voice CallerID
-            // DO NOT use this to show billing details — see twilio_billing_usd
-            source,
-            sourceLabel:
-              source === "purchased"
-                ? "Purchased via Agently"
-                : source === "imported"
-                  ? "Imported (voice verified)"
-                  : "Imported (SMS verified)",
-          });
-        } else if (!data) {
-          // SID not found on Twilio (released externally) — show from DB with warning
-          numbers.push({
-            sid: agent.twilio_phone_sid,
-            phoneNumber: agent.twilio_phone_number,
-            friendlyName: agent.name,
-            voiceUrl: "",
-            dateCreated: null,
-            capabilities: { voice: true, sms: false },
-            agentId: agent.id,
-            agentName: agent.name,
-            source,
-            sourceLabel:
-              source === "purchased"
-                ? "Purchased (not found on Twilio)"
-                : "Imported",
-            warning:
-              "This number could not be confirmed on Twilio. It may have been released.",
-          });
-        }
+        const latest = await fetchLatestOwnedNumber(legacyRow);
+        numbers.push(ownedNumberResponse(legacyRow, latest, agent));
       } catch (fetchErr) {
+        numbers.push(
+          ownedNumberResponse(
+            legacyRow,
+            null,
+            agent,
+            "This legacy number could not be confirmed on Twilio. It may have been released externally.",
+          ),
+        );
         console.warn(
-          `[twilio/numbers/owned] fetch failed for SID ${agent.twilio_phone_sid}:`,
+          `[twilio/numbers/owned] legacy fetch failed for SID ${agent.twilio_phone_sid}:`,
           fetchErr.message,
         );
       }
     }
 
     return res.json({ numbers });
-  }),
-);
-
-// Purchase a number and assign it to a voice agent
-router.post(
-  "/numbers/purchase",
-  requireAuth,
-  requireAdmin,
-  asyncHandler(async (req, res) => {
-    const { phoneNumber, voiceAgentId } = req.body;
-    if (!phoneNumber) {
-      return res
-        .status(400)
-        .json({ error: { message: "phoneNumber is required." } });
-    }
-
-    const db = getSupabase();
-
-    // Resolve agent
-    const targetAgentId =
-      voiceAgentId || req.organization.active_voice_agent_id;
-    const { data: agent } = await db
-      .from("voice_agents")
-      .select("*")
-      .eq("id", targetAgentId)
-      .eq("organization_id", req.orgId)
-      .single();
-
-    if (!agent) {
-      return res
-        .status(404)
-        .json({ error: { message: "Voice agent not found." } });
-    }
-
-    // Purchase from master Twilio account
-    const purchased = await purchasePhoneNumber({
-      phoneNumber,
-      friendlyName: `${req.organization.name} – ${agent.name}`,
-    });
-
-    // Save to DB — mark as 'purchased' (came through Agently master account)
-    await db
-      .from("voice_agents")
-      .update({
-        twilio_phone_number: phoneNumber,
-        twilio_phone_sid: purchased.sid,
-        number_source: "purchased",
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", targetAgentId);
-
-    res.json({
-      success: true,
-      phoneNumber,
-      phoneSid: purchased.sid,
-      agentId: targetAgentId,
-    });
   }),
 );
 
@@ -1237,16 +2563,33 @@ router.get(
 );
 
 // ─────────────────────────────────────────────────────────────
-// ── BILLING ROUTE INTENTIONALLY REMOVED ──────────────────────
-//
-// GET /api/twilio/billing previously returned master account
-// billing totals — this leaked the app owner's full Twilio
-// spend to any authenticated user. It is removed permanently.
-//
-// Per-number costs are now tracked silently in the backend by
-// lib/billing-tracker.js and stored in voice_agents.twilio_billing_usd.
-// They are NEVER exposed via any API route.
-//
+// ── PROTECTED: Billing compatibility route ───────────────────
+// Returns an org-scoped placeholder only. It intentionally does
+// not expose master Twilio billing totals.
+// ─────────────────────────────────────────────────────────────
+router.get(
+  "/billing",
+  requireAuth,
+  asyncHandler(async (_req, res) => {
+    const now = new Date();
+    const periodStart = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1),
+    ).toISOString();
+    return res.json({
+      billing: {
+        periodStart,
+        voice: { count: "0", minutes: "0", cost: "0.00", currency: "USD" },
+        sms: { count: "0", cost: "0.00", currency: "USD" },
+        implemented: false,
+        orgScoped: true,
+        message:
+          "Org-scoped billing is not implemented yet. Master Twilio billing is intentionally not exposed.",
+      },
+    });
+  }),
+);
+
+// ─────────────────────────────────────────────────────────────
 // ── INTERNAL: Vercel Cron billing sync trigger ────────────────
 // Called only by the Vercel Cron job configured in vercel.json.
 // Protected by a shared secret (CRON_SECRET env var).
