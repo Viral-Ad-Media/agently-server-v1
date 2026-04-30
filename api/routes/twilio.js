@@ -357,13 +357,15 @@ router.post(
               status: CallStatus || "completed",
               timestamp: new Date().toISOString(),
             });
-            await db
-              .rpc("increment_usage", {
+            try {
+              await db.rpc("increment_usage", {
                 org_id: agent.organization_id,
                 calls_inc: 1,
                 minutes_inc: mins,
-              })
-              .catch(() => {});
+              });
+            } catch (_) {
+              // Usage RPC may not exist in older deployments; keep callback non-blocking.
+            }
           }
         }
       } catch (e) {
@@ -415,9 +417,8 @@ router.post(
 
       if (agent) {
         // Store the inbound message for WhatsApp chat history
-        await db
-          .from("whatsapp_messages")
-          .insert({
+        try {
+          await db.from("whatsapp_messages").insert({
             organization_id: agent.organization_id,
             voice_agent_id: agent.id,
             from_number: From,
@@ -425,8 +426,10 @@ router.post(
             body: Body || "",
             direction: "inbound",
             created_at: new Date().toISOString(),
-          })
-          .catch(() => {}); // Table may not exist yet; silently ignore
+          });
+        } catch (_) {
+          // Table may not exist yet; silently ignore.
+        }
       }
 
       // Auto-respond with a short AI reply using the agent's knowledge
@@ -607,25 +610,32 @@ async function storeVoicePermissionResults(
     updated_at: now,
   }));
   for (const row of rows) {
-    const { data: existing } = await db
-      .from("twilio_geo_permissions")
-      .select("id")
-      .eq("organization_id", row.organization_id)
-      .eq("channel", row.channel)
-      .eq("iso_country", row.iso_country)
-      .maybeSingle()
-      .catch(() => ({ data: null }));
-    if (existing?.id)
-      await db
+    let existingResult;
+    try {
+      existingResult = await db
         .from("twilio_geo_permissions")
-        .update(row)
-        .eq("id", existing.id)
-        .catch(() => {});
-    else
-      await db
-        .from("twilio_geo_permissions")
-        .insert({ ...row, created_at: now })
-        .catch(() => {});
+        .select("id")
+        .eq("organization_id", row.organization_id)
+        .eq("channel", row.channel)
+        .eq("iso_country", row.iso_country)
+        .maybeSingle();
+    } catch (err) {
+      existingResult = { data: null, error: err };
+    }
+    const existing = existingResult?.data || null;
+    try {
+      if (existing?.id)
+        await db
+          .from("twilio_geo_permissions")
+          .update(row)
+          .eq("id", existing.id);
+      else
+        await db
+          .from("twilio_geo_permissions")
+          .insert({ ...row, created_at: now });
+    } catch (_) {
+      // Keep voice permission persistence best-effort.
+    }
   }
 }
 
@@ -641,17 +651,18 @@ async function writeAudit(
   db,
   { organizationId, userId, action, entityType, entityId, metadata },
 ) {
-  await db
-    .from("audit_logs")
-    .insert({
+  try {
+    await db.from("audit_logs").insert({
       organization_id: organizationId || null,
       user_id: userId || null,
       action,
       entity_type: entityType || null,
       entity_id: entityId || null,
       metadata: metadata || {},
-    })
-    .catch(() => {});
+    });
+  } catch (_) {
+    // Audit logging is best-effort and should not block Twilio operations.
+  }
 }
 
 function jsonArray(value) {
@@ -954,9 +965,11 @@ router.post(
         .eq("organization_id", organizationId)
         .maybeSingle();
       if (!agent)
-        return res.status(404).json({
-          error: { message: "Voice agent not found for this organization." },
-        });
+        return res
+          .status(404)
+          .json({
+            error: { message: "Voice agent not found for this organization." },
+          });
     }
 
     const db = getSupabase();
@@ -1244,9 +1257,11 @@ router.post(
       .maybeSingle();
     if (error) throw error;
     if (!number)
-      return res.status(404).json({
-        error: { message: "Number not found for this organization." },
-      });
+      return res
+        .status(404)
+        .json({
+          error: { message: "Number not found for this organization." },
+        });
 
     const latest = await fetchIncomingNumber({
       accountSid: number.account_sid,
@@ -1516,12 +1531,14 @@ router.post(
     const fromNumberId = req.body?.fromNumberId || req.body?.numberId || null;
     const agentId = req.body?.agentId || req.body?.voiceAgentId || null;
     if (!isE164(toPhone))
-      return res.status(400).json({
-        error: {
-          code: "INVALID_PHONE_NUMBER",
-          message: "Destination must be an E.164 number like +14155551234.",
-        },
-      });
+      return res
+        .status(400)
+        .json({
+          error: {
+            code: "INVALID_PHONE_NUMBER",
+            message: "Destination must be an E.164 number like +14155551234.",
+          },
+        });
 
     const db = getSupabase();
     let q = db
@@ -1536,35 +1553,42 @@ router.post(
       );
     const { data: number } = await q.maybeSingle();
     if (!number)
-      return res.status(404).json({
-        error: {
-          code: "NUMBER_NOT_OWNED",
-          message: "No configured from-number was found for this tenant/agent.",
-        },
-      });
+      return res
+        .status(404)
+        .json({
+          error: {
+            code: "NUMBER_NOT_OWNED",
+            message:
+              "No configured from-number was found for this tenant/agent.",
+          },
+        });
 
     const capabilities =
       typeof number.capabilities === "string"
         ? JSON.parse(number.capabilities || "{}")
         : number.capabilities || {};
     if (!capabilities.voice)
-      return res.status(400).json({
-        error: {
-          code: "UNSUPPORTED_CAPABILITY",
-          message: "The selected from-number does not support voice.",
-        },
-      });
+      return res
+        .status(400)
+        .json({
+          error: {
+            code: "UNSUPPORTED_CAPABILITY",
+            message: "The selected from-number does not support voice.",
+          },
+        });
     const actualAgentId =
       agentId ||
       number.assigned_voice_agent_id ||
       req.organization?.active_voice_agent_id;
     if (!actualAgentId)
-      return res.status(400).json({
-        error: {
-          code: "AGENT_NOT_ASSIGNED",
-          message: "Assign an AI agent before placing outbound calls.",
-        },
-      });
+      return res
+        .status(400)
+        .json({
+          error: {
+            code: "AGENT_NOT_ASSIGNED",
+            message: "Assign an AI agent before placing outbound calls.",
+          },
+        });
 
     const readiness = await refreshAndPersistReadiness(
       number.id,
@@ -1574,14 +1598,16 @@ router.post(
       !["ready", "pending_manual_action"].includes(readiness.overall_status) ||
       readiness.inbound_voice.status !== "ready"
     ) {
-      return res.status(400).json({
-        error: {
-          code: "NUMBER_NOT_READY",
-          message:
-            "This number is not configured for the Agently voice flow yet.",
-          readiness,
-        },
-      });
+      return res
+        .status(400)
+        .json({
+          error: {
+            code: "NUMBER_NOT_READY",
+            message:
+              "This number is not configured for the Agently voice flow yet.",
+            readiness,
+          },
+        });
     }
     const destinationCountry = guessCountryFromE164(toPhone);
     const selected = new Set(
@@ -1591,12 +1617,14 @@ router.post(
       ].map(normalizeCountry),
     );
     if (!selected.has(destinationCountry) && destinationCountry !== "UNKNOWN") {
-      return res.status(400).json({
-        error: {
-          code: "COUNTRY_NOT_ENABLED",
-          message: `Outbound calls to ${destinationCountry} are not selected/enabled for this number.`,
-        },
-      });
+      return res
+        .status(400)
+        .json({
+          error: {
+            code: "COUNTRY_NOT_ENABLED",
+            message: `Outbound calls to ${destinationCountry} are not selected/enabled for this number.`,
+          },
+        });
     }
 
     const { data: agent } = await db
@@ -1661,11 +1689,13 @@ router.post(
     const authToken = String(req.body?.authToken || "").trim();
     const phoneNumber = normalizePhone(req.body?.phoneNumber || "");
     if (!accountSid || !authToken || !phoneNumber)
-      return res.status(400).json({
-        error: {
-          message: "accountSid, authToken and phoneNumber are required.",
-        },
-      });
+      return res
+        .status(400)
+        .json({
+          error: {
+            message: "accountSid, authToken and phoneNumber are required.",
+          },
+        });
     try {
       const data = await twilioRequest({
         method: "GET",
@@ -1677,13 +1707,15 @@ router.post(
       });
       const found = (data?.incoming_phone_numbers || [])[0];
       if (!found)
-        return res.status(404).json({
-          error: {
-            code: "NUMBER_NOT_OWNED",
-            message:
-              "That number was not found in the supplied Twilio account.",
-          },
-        });
+        return res
+          .status(404)
+          .json({
+            error: {
+              code: "NUMBER_NOT_OWNED",
+              message:
+                "That number was not found in the supplied Twilio account.",
+            },
+          });
       const n = {
         phoneNumber: found.phone_number,
         phoneSid: found.sid,
@@ -1721,12 +1753,14 @@ router.post(
           "Agently did not store the supplied Auth Token. Reconnect if you need to refresh this external account later.",
       });
     } catch (err) {
-      res.status(400).json({
-        error: mapTwilioError(
-          err,
-          "Could not verify API ownership for this Twilio number.",
-        ),
-      });
+      res
+        .status(400)
+        .json({
+          error: mapTwilioError(
+            err,
+            "Could not verify API ownership for this Twilio number.",
+          ),
+        });
     }
   }),
 );
@@ -1739,16 +1773,19 @@ router.post(
     const token = require("crypto").randomBytes(16).toString("hex");
     const phoneNumber = normalizePhone(req.body?.phoneNumber || "");
     const callbackUrl = `${apiBaseUrl()}/api/twilio/import/challenge-callback?token=${encodeURIComponent(token)}`;
-    await getSupabase()
-      .from("twilio_import_challenges")
-      .insert({
-        organization_id: req.orgId,
-        phone_number: phoneNumber,
-        challenge_token: token,
-        status: "pending",
-        expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
-      })
-      .catch(() => {});
+    try {
+      await getSupabase()
+        .from("twilio_import_challenges")
+        .insert({
+          organization_id: req.orgId,
+          phone_number: phoneNumber,
+          challenge_token: token,
+          status: "pending",
+          expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+        });
+    } catch (_) {
+      // Challenge persistence is best-effort for deployments before the migration is applied.
+    }
     res.json({
       success: true,
       token,
@@ -1765,22 +1802,30 @@ router.all(
     const token = req.query?.token || req.body?.token;
     const calledNumber = normalizePhone(req.body?.To || req.query?.To || "");
     const db = getSupabase();
-    const { data: challenge } = await db
-      .from("twilio_import_challenges")
-      .select("*")
-      .eq("challenge_token", token)
-      .maybeSingle()
-      .catch(() => ({ data: null }));
-    if (challenge) {
-      await db
+    let challengeResult;
+    try {
+      challengeResult = await db
         .from("twilio_import_challenges")
-        .update({
-          status: "verified",
-          verified_at: new Date().toISOString(),
-          twilio_to: calledNumber,
-        })
-        .eq("id", challenge.id)
-        .catch(() => {});
+        .select("*")
+        .eq("challenge_token", token)
+        .maybeSingle();
+    } catch (err) {
+      challengeResult = { data: null, error: err };
+    }
+    const challenge = challengeResult?.data || null;
+    if (challenge) {
+      try {
+        await db
+          .from("twilio_import_challenges")
+          .update({
+            status: "verified",
+            verified_at: new Date().toISOString(),
+            twilio_to: calledNumber,
+          })
+          .eq("id", challenge.id);
+      } catch (_) {
+        // Keep challenge callback response non-blocking.
+      }
     }
     res.setHeader("Content-Type", "text/xml");
     res.send(
@@ -1828,12 +1873,14 @@ router.post(
       }
     }
     if (!number)
-      return res.status(404).json({
-        error: {
-          message:
-            "Verified/imported number not found. Run API verification or webhook challenge first.",
-        },
-      });
+      return res
+        .status(404)
+        .json({
+          error: {
+            message:
+              "Verified/imported number not found. Run API verification or webhook challenge first.",
+          },
+        });
     await db
       .from("twilio_phone_numbers")
       .update({
