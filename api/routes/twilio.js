@@ -71,6 +71,7 @@ const {
   normalizeCountry,
   supportedCountries,
   lowRiskCountries,
+  normalizeCountryList,
   evaluateNumberRecommendation,
   twilioRequest,
   apiBaseUrl,
@@ -1379,9 +1380,7 @@ router.post(
   requireAdmin,
   asyncHandler(async (req, res) => {
     const organizationId = bodyOrg(req);
-    const countries = (req.body?.countries || [])
-      .map(normalizeCountry)
-      .filter(Boolean);
+    const countries = normalizeCountryList(req.body?.countries || []);
     const allowHighRiskSpecialNumbers =
       !!req.body?.allowHighRiskSpecialNumbers && req.user?.role === "Owner";
     const allowHighRiskTollFraudNumbers =
@@ -1425,7 +1424,12 @@ router.post(
         message: result.success
           ? "Voice dialing permissions updated or requested."
           : result.message,
-        lowRiskCountriesConfigured: lowRiskCountries(),
+        lowRiskCountriesConfigured:
+          result.lowRiskCountriesConfigured || lowRiskCountries(),
+        requestedCountriesNormalized:
+          result.requestedCountriesNormalized || countries,
+        countriesAllowedAfterLowRiskFilter:
+          result.countriesAllowedAfterLowRiskFilter || [],
         result,
         readiness,
       });
@@ -1434,12 +1438,12 @@ router.post(
         err,
         "Could not update voice dialing permissions.",
       );
-      res
-        .status(400)
-        .json({
-          error: mapped,
-          lowRiskCountriesConfigured: lowRiskCountries(),
-        });
+      res.status(400).json({
+        error: mapped,
+        lowRiskCountriesConfigured: lowRiskCountries(),
+        requestedCountriesNormalized: countries,
+        countriesAllowedAfterLowRiskFilter: [],
+      });
     }
   }),
 );
@@ -1450,9 +1454,7 @@ router.post(
   requireAdmin,
   asyncHandler(async (req, res) => {
     const organizationId = bodyOrg(req);
-    const countries = (req.body?.countries || [])
-      .map(normalizeCountry)
-      .filter(Boolean);
+    const countries = normalizeCountryList(req.body?.countries || []);
     const db = getSupabase();
     const { data: number } = await db
       .from("twilio_phone_numbers")
