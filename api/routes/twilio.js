@@ -1425,6 +1425,7 @@ router.post(
         message: result.success
           ? "Voice dialing permissions updated or requested."
           : result.message,
+        lowRiskCountriesConfigured: lowRiskCountries(),
         result,
         readiness,
       });
@@ -1433,7 +1434,12 @@ router.post(
         err,
         "Could not update voice dialing permissions.",
       );
-      res.status(400).json({ error: mapped });
+      res
+        .status(400)
+        .json({
+          error: mapped,
+          lowRiskCountriesConfigured: lowRiskCountries(),
+        });
     }
   }),
 );
