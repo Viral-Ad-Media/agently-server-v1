@@ -121,13 +121,11 @@ router.post(
 
     if (agentErr || !agentRow) {
       console.error("Voice agent creation error:", agentErr);
-      return res
-        .status(500)
-        .json({
-          error: {
-            message: "Failed to create AI voice agent. Please try again.",
-          },
-        });
+      return res.status(500).json({
+        error: {
+          message: "Failed to create AI voice agent. Please try again.",
+        },
+      });
     }
 
     // Insert FAQs

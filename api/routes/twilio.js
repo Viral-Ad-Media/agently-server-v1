@@ -119,7 +119,11 @@ function hangupTwiml(
 
 function mediaStreamUrl(params) {
   const wsBase = WS_URL();
-  const query = new URLSearchParams(params);
+  const query = new URLSearchParams();
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value === undefined || value === null || value === "") return;
+    query.set(key, String(value));
+  });
   return `${wsBase}/api/twilio/media-stream?${query.toString()}`;
 }
 
@@ -129,26 +133,63 @@ function buildRealtimeTwiml({
   callSid,
   direction,
   callerPhone,
+  recipientPhone,
+  leadId,
+  callPurpose,
+  customInstructions,
 }) {
-  const wsUrl = mediaStreamUrl({
+  const streamParams = {
     orgId: agent.organization_id,
+    organizationId: agent.organization_id,
     agentId: agent.id,
     callRecordId,
     callSid: callSid || "",
     direction: direction || "inbound",
     callerPhone: callerPhone || "",
-  });
+    recipientPhone: recipientPhone || callerPhone || "",
+    leadId: leadId || "",
+    callPurpose: callPurpose || "",
+    customInstructions: customInstructions || "",
+  };
+  const wsUrl = mediaStreamUrl(streamParams);
   return buildMediaStreamTwiml({
     wsUrl,
-    parameters: {
-      organizationId: agent.organization_id,
-      agentId: agent.id,
-      callRecordId,
-      callSid: callSid || "",
-      direction: direction || "inbound",
-      callerPhone: callerPhone || "",
-    },
+    parameters: streamParams,
   });
+}
+
+const DEFAULT_OUTBOUND_TEST_PURPOSE =
+  "Follow up with the lead about the business and ask how the business can help.";
+
+function outboundPurposeFromBody(body = {}) {
+  const supplied = String(body.callPurpose || body.purpose || "").trim();
+  const required =
+    String(process.env.OUTBOUND_CALL_PURPOSE_REQUIRED || "").toLowerCase() ===
+    "true";
+  if (supplied) return { callPurpose: supplied, callPurposeWarning: "" };
+  if (required) {
+    const err = new Error("callPurpose is required for outbound calls.");
+    err.status = 400;
+    err.code = "CALL_PURPOSE_REQUIRED";
+    throw err;
+  }
+  return {
+    callPurpose: DEFAULT_OUTBOUND_TEST_PURPOSE,
+    callPurposeWarning: "No call purpose supplied; using default test purpose.",
+  };
+}
+
+function encodeOutboundTwiMlUrl(base, params = {}) {
+  const query = new URLSearchParams();
+  Object.entries(params).forEach(([key, value]) => {
+    if (value === undefined || value === null || value === "") return;
+    query.set(key, String(value));
+  });
+  return `${base}/api/twilio/outbound-twiml?${query.toString()}`;
+}
+
+function mediaStreamUrlPreview(params = {}) {
+  return mediaStreamUrl(params);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -258,6 +299,12 @@ router.post(
     const agentId = req.query?.agentId || req.body?.agentId || "";
     const callRecordIdFromQuery =
       req.query?.callRecordId || req.body?.callRecordId || "";
+    const leadId = req.query?.leadId || req.body?.leadId || "";
+    const callPurpose = req.query?.callPurpose || req.body?.callPurpose || "";
+    const customInstructions =
+      req.query?.customInstructions || req.body?.customInstructions || "";
+    const recipientPhone =
+      req.query?.recipientPhone || req.body?.recipientPhone || toPhone;
 
     const db = getSupabase();
     let agent = null;
@@ -287,7 +334,13 @@ router.post(
         direction: "outbound",
         status: "queued",
         twilioCallSid: callSid,
-        metadata: { twilioTo: toPhone, twilioFrom: fromPhone },
+        metadata: {
+          twilioTo: toPhone,
+          twilioFrom: fromPhone,
+          leadId: leadId || null,
+          callPurpose: callPurpose || null,
+          customInstructions: customInstructions || null,
+        },
       });
       callRecordId = record.id;
     } else if (callSid) {
@@ -303,6 +356,10 @@ router.post(
       callSid,
       direction: "outbound",
       callerPhone: toPhone,
+      recipientPhone,
+      leadId,
+      callPurpose,
+      customInstructions,
     });
     res.setHeader("Content-Type", "text/xml");
     res.send(twiml);
@@ -1537,7 +1594,29 @@ router.post(
     const organizationId = bodyOrg(req);
     const toPhone = normalizePhone(req.body?.toPhone || req.body?.to || "");
     const fromNumberId = req.body?.fromNumberId || req.body?.numberId || null;
+    const fromNumber = normalizePhone(
+      req.body?.fromNumber || req.body?.from || "",
+    );
     const agentId = req.body?.agentId || req.body?.voiceAgentId || null;
+    const leadId = req.body?.leadId || null;
+    const customInstructions = String(
+      req.body?.customInstructions || "",
+    ).trim();
+    let purpose;
+    try {
+      purpose = outboundPurposeFromBody(req.body || {});
+    } catch (err) {
+      return res
+        .status(err.status || 400)
+        .json({
+          error: {
+            code: err.code || "CALL_PURPOSE_REQUIRED",
+            message: err.message,
+          },
+        });
+    }
+    const { callPurpose, callPurposeWarning } = purpose;
+
     if (!isE164(toPhone))
       return res
         .status(400)
@@ -1554,6 +1633,7 @@ router.post(
       .select("*")
       .eq("organization_id", organizationId);
     if (fromNumberId) q = q.eq("id", fromNumberId);
+    else if (fromNumber) q = q.eq("phone_number", fromNumber);
     else
       q = q.eq(
         "assigned_voice_agent_id",
@@ -1602,27 +1682,42 @@ router.post(
       number.id,
       organizationId,
     );
+    if (readiness.outbound_voice?.status !== "ready") {
+      return res
+        .status(400)
+        .json({
+          error: {
+            code: "OUTBOUND_VOICE_NOT_READY",
+            message: "This number is not ready for outbound voice calls.",
+            readiness,
+          },
+        });
+    }
     if (
-      !["ready", "pending_manual_action"].includes(readiness.overall_status) ||
-      readiness.inbound_voice.status !== "ready"
+      readiness.assigned_agent?.status &&
+      readiness.assigned_agent.status !== "ready"
     ) {
       return res
         .status(400)
         .json({
           error: {
-            code: "NUMBER_NOT_READY",
+            code: "AGENT_NOT_READY",
             message:
-              "This number is not configured for the Agently voice flow yet.",
+              "The selected number is not assigned to an active voice agent.",
             readiness,
           },
         });
     }
+
     const destinationCountry = guessCountryFromE164(toPhone);
+    console.log("[outbound-call] destinationCountry", destinationCountry);
     const selected = new Set(
       [
         ...jsonArray(number.selected_outbound_voice_countries),
         normalizeCountry(number.iso_country),
-      ].map(normalizeCountry),
+      ]
+        .map(normalizeCountry)
+        .filter(Boolean),
     );
     if (!selected.has(destinationCountry) && destinationCountry !== "UNKNOWN") {
       return res
@@ -1631,6 +1726,8 @@ router.post(
           error: {
             code: "COUNTRY_NOT_ENABLED",
             message: `Outbound calls to ${destinationCountry} are not selected/enabled for this number.`,
+            destinationCountry,
+            enabledCountries: [...selected],
           },
         });
     }
@@ -1640,25 +1737,88 @@ router.post(
       .select("*")
       .eq("id", actualAgentId)
       .eq("organization_id", organizationId)
+      .eq("is_active", true)
       .maybeSingle();
     if (!agent)
       return res
         .status(404)
-        .json({ error: { message: "Voice agent not found." } });
+        .json({
+          error: {
+            code: "VOICE_AGENT_NOT_FOUND",
+            message: "Active voice agent not found.",
+          },
+        });
+
+    // Lightweight context readiness check: Railway will load the full prompt, but
+    // the outbound API verifies that the tenant/agent rows are readable first.
+    const { data: organization } = await db
+      .from("organizations")
+      .select("id,name")
+      .eq("id", organizationId)
+      .maybeSingle();
+    if (!organization)
+      return res
+        .status(404)
+        .json({
+          error: {
+            code: "ORGANIZATION_NOT_FOUND",
+            message: "Organization context could not be loaded.",
+          },
+        });
+
+    console.log("[outbound-call] validation passed", {
+      organizationId,
+      agentId: agent.id,
+      fromNumber: number.phone_number,
+      to: toPhone,
+    });
+    console.log("[outbound-call] callPurpose", callPurpose);
 
     const record = await createCallRecord({
       organizationId,
       voiceAgentId: agent.id,
       callerName: req.body?.customerName || "Outbound Lead",
       callerPhone: toPhone,
-      leadId: req.body?.leadId || null,
+      leadId,
       direction: "outbound",
       status: "queued",
-      metadata: { initiatedBy: req.user?.id || null, fromNumberId: number.id },
+      metadata: {
+        initiatedBy: req.user?.id || null,
+        fromNumberId: number.id,
+        fromNumber: number.phone_number,
+        toPhone,
+        leadId,
+        callPurpose,
+        customInstructions,
+        callPurposeWarning: callPurposeWarning || null,
+      },
     });
 
     const base = API_URL();
-    const twimlUrl = `${base}/api/twilio/outbound-twiml?agentId=${encodeURIComponent(agent.id)}&callRecordId=${encodeURIComponent(record.id)}`;
+    const twimlUrl = encodeOutboundTwiMlUrl(base, {
+      orgId: organizationId,
+      agentId: agent.id,
+      callRecordId: record.id,
+      direction: "outbound",
+      recipientPhone: toPhone,
+      callerPhone: toPhone,
+      leadId,
+      callPurpose,
+      customInstructions,
+    });
+    const mediaStreamUrl = mediaStreamUrlPreview({
+      orgId: organizationId,
+      agentId: agent.id,
+      callRecordId: record.id,
+      direction: "outbound",
+      recipientPhone: toPhone,
+      callerPhone: toPhone,
+      leadId,
+      callPurpose,
+      customInstructions,
+    });
+    console.log("[outbound-call] twimlUrl", twimlUrl);
+    console.log("[outbound-call] mediaStreamUrl", mediaStreamUrl);
     try {
       const result = await makeOutboundCall({
         from: number.phone_number,
@@ -1666,6 +1826,7 @@ router.post(
         twimlUrl,
         statusCallbackUrl: `${base}/api/twilio/call-status`,
       });
+      console.log("[outbound-call] callSid", result.callSid);
       await updateCallRecordById(record.id, {
         twilio_call_sid: result.callSid,
         status: result.status || "initiated",
@@ -1675,14 +1836,26 @@ router.post(
         callSid: result.callSid,
         callRecordId: record.id,
         status: result.status,
+        destinationCountry,
+        callPurpose,
+        callPurposeWarning: callPurposeWarning || undefined,
+        twimlUrl,
+        mediaStreamUrl,
       });
     } catch (err) {
       const mapped = mapTwilioError(err, "Could not start outbound call.");
-      await updateCallRecordById(record.id, {
-        status: "failed",
-        metadata: { error: mapped },
-      }).catch(() => {});
-      res.status(400).json({ error: mapped });
+      try {
+        await updateCallRecordById(record.id, {
+          status: "failed",
+          metadata: { error: mapped },
+        });
+      } catch (_) {}
+      res
+        .status(400)
+        .json({
+          error: mapped,
+          callPurposeWarning: callPurposeWarning || undefined,
+        });
     }
   }),
 );
@@ -2678,11 +2851,41 @@ router.post(
   requireAuth,
   requireAdmin,
   asyncHandler(async (req, res) => {
-    const { toPhone, customerName, voiceAgentId, leadId } = req.body;
+    const toPhone = normalizePhone(req.body?.toPhone || req.body?.to || "");
+    const customerName = req.body?.customerName || "Outbound Lead";
+    const voiceAgentId = req.body?.voiceAgentId || req.body?.agentId || null;
+    const leadId = req.body?.leadId || null;
+    const customInstructions = String(
+      req.body?.customInstructions || "",
+    ).trim();
+    let purpose;
+    try {
+      purpose = outboundPurposeFromBody(req.body || {});
+    } catch (err) {
+      return res
+        .status(err.status || 400)
+        .json({
+          error: {
+            code: err.code || "CALL_PURPOSE_REQUIRED",
+            message: err.message,
+          },
+        });
+    }
+    const { callPurpose, callPurposeWarning } = purpose;
+
     if (!toPhone)
       return res
         .status(400)
         .json({ error: { message: "toPhone is required." } });
+    if (!isE164(toPhone))
+      return res
+        .status(400)
+        .json({
+          error: {
+            code: "INVALID_PHONE_NUMBER",
+            message: "Destination must be an E.164 number like +14155551234.",
+          },
+        });
 
     const db = getSupabase();
     const targetAgentId =
@@ -2692,6 +2895,7 @@ router.post(
       .select("*")
       .eq("id", targetAgentId)
       .eq("organization_id", req.orgId)
+      .eq("is_active", true)
       .single();
 
     if (!agent?.twilio_phone_number) {
@@ -2703,25 +2907,111 @@ router.post(
       });
     }
 
+    const { data: number } = await db
+      .from("twilio_phone_numbers")
+      .select("*")
+      .eq("organization_id", req.orgId)
+      .eq("phone_number", agent.twilio_phone_number)
+      .maybeSingle();
+
+    const destinationCountry = guessCountryFromE164(toPhone);
+    console.log("[outbound-call] destinationCountry", destinationCountry);
+    if (number?.id) {
+      const readiness = await refreshAndPersistReadiness(number.id, req.orgId);
+      if (readiness.outbound_voice?.status !== "ready") {
+        return res
+          .status(400)
+          .json({
+            error: {
+              code: "OUTBOUND_VOICE_NOT_READY",
+              message: "This number is not ready for outbound voice calls.",
+              readiness,
+            },
+          });
+      }
+      const selected = new Set(
+        [
+          ...jsonArray(number.selected_outbound_voice_countries),
+          normalizeCountry(number.iso_country),
+        ]
+          .map(normalizeCountry)
+          .filter(Boolean),
+      );
+      if (
+        !selected.has(destinationCountry) &&
+        destinationCountry !== "UNKNOWN"
+      ) {
+        return res
+          .status(400)
+          .json({
+            error: {
+              code: "COUNTRY_NOT_ENABLED",
+              message: `Outbound calls to ${destinationCountry} are not selected/enabled for this number.`,
+              destinationCountry,
+              enabledCountries: [...selected],
+            },
+          });
+      }
+    }
+
+    console.log("[outbound-call] validation passed", {
+      organizationId: req.orgId,
+      agentId: agent.id,
+      fromNumber: agent.twilio_phone_number,
+      to: toPhone,
+    });
+    console.log("[outbound-call] callPurpose", callPurpose);
+
     const record = await createCallRecord({
       organizationId: req.orgId,
       voiceAgentId: agent.id,
-      callerName: customerName || "Outbound Lead",
+      callerName: customerName,
       callerPhone: toPhone,
       leadId: leadId || null,
       direction: "outbound",
       status: "queued",
-      metadata: { initiatedBy: req.user?.id || null },
+      metadata: {
+        initiatedBy: req.user?.id || null,
+        leadId,
+        callPurpose,
+        customInstructions,
+        callPurposeWarning: callPurposeWarning || null,
+      },
     });
 
     const apiBase = API_URL();
-    const twimlUrl = `${apiBase}/api/twilio/outbound-twiml?agentId=${encodeURIComponent(agent.id)}&callRecordId=${encodeURIComponent(record.id)}`;
+    const twimlUrl = encodeOutboundTwiMlUrl(apiBase, {
+      orgId: req.orgId,
+      agentId: agent.id,
+      callRecordId: record.id,
+      direction: "outbound",
+      recipientPhone: toPhone,
+      callerPhone: toPhone,
+      leadId,
+      callPurpose,
+      customInstructions,
+    });
+    const mediaStreamUrl = mediaStreamUrlPreview({
+      orgId: req.orgId,
+      agentId: agent.id,
+      callRecordId: record.id,
+      direction: "outbound",
+      recipientPhone: toPhone,
+      callerPhone: toPhone,
+      leadId,
+      callPurpose,
+      customInstructions,
+    });
+    console.log("[outbound-call] twimlUrl", twimlUrl);
+    console.log("[outbound-call] mediaStreamUrl", mediaStreamUrl);
+
     const result = await makeOutboundCall({
       from: agent.twilio_phone_number,
       to: toPhone,
       twimlUrl,
       statusCallbackUrl: `${apiBase}/api/twilio/call-status`,
     });
+    console.log("[outbound-call] callSid", result.callSid);
 
     await updateCallRecordById(record.id, {
       twilio_call_sid: result.callSid,
@@ -2733,6 +3023,11 @@ router.post(
       callSid: result.callSid,
       callRecordId: record.id,
       status: result.status,
+      destinationCountry,
+      callPurpose,
+      callPurposeWarning: callPurposeWarning || undefined,
+      twimlUrl,
+      mediaStreamUrl,
     });
   }),
 );
