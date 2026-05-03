@@ -24,7 +24,7 @@ router.post(
         organization_id: req.orgId,
         name: body.name || "New AI Agent",
         direction: body.direction || "inbound",
-        voice: body.voice || "Rachel",
+        voice: body.voice || process.env.DEFAULT_AGENT_VOICE || "Domi",
         language: body.language || "English",
         greeting:
           body.greeting ||

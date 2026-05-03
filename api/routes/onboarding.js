@@ -11,14 +11,13 @@ const router = express.Router();
 
 // Voice name migration for onboarding (legacy names → Twilio names)
 const VOICE_MIGRATE = {
-  Zephyr: "Rachel",
+  Zephyr: "Domi",
   Puck: "Josh",
   Charon: "Arnold",
   Kore: "Bella",
   Fenrir: "Domi",
 };
 const VALID_VOICES = [
-  "Rachel",
   "Domi",
   "Bella",
   "Josh",
@@ -32,7 +31,7 @@ const VALID_VOICES = [
 function normalizeVoice(v) {
   if (VOICE_MIGRATE[v]) return VOICE_MIGRATE[v];
   if (VALID_VOICES.includes(v)) return v;
-  return "Rachel";
+  return process.env.DEFAULT_AGENT_VOICE || VALID_VOICES[0] || "Domi";
 }
 
 // ── POST /api/onboarding/faqs ────────────────────────────────
@@ -96,7 +95,9 @@ router.post(
         organization_id: orgId,
         name: agentName,
         direction: agentConfig.direction || "inbound",
-        voice: normalizeVoice(agentConfig.voice || "Rachel"),
+        voice: normalizeVoice(
+          agentConfig.voice || process.env.DEFAULT_AGENT_VOICE || "Domi",
+        ),
         language: agentConfig.language || "English",
         greeting,
         tone: agentConfig.tone || "Professional",

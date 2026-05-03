@@ -94,6 +94,84 @@ const WS_URL = () => {
   return API_URL().replace(/^https?:\/\//, "wss://");
 };
 
+function callRecordingEnabled() {
+  return (
+    String(process.env.CALL_RECORDING_ENABLED || "true")
+      .trim()
+      .toLowerCase() !== "false"
+  );
+}
+
+function recordingStatusCallbackUrl() {
+  const base = API_URL();
+  return base ? `${base}/api/twilio/recording-status` : "";
+}
+
+function recordingStartTwiml() {
+  if (!callRecordingEnabled()) return "";
+  const callback = recordingStatusCallbackUrl();
+  if (!callback) return "";
+  return `  <Start>
+    <Recording channels="dual" track="both" recordingStatusCallback="${safeXmlText(callback)}" recordingStatusCallbackEvent="in-progress completed absent" />
+  </Start>
+`;
+}
+
+function maybeAddInboundRecording(twiml, direction) {
+  if (String(direction || "").toLowerCase() === "outbound") return twiml;
+  const recordingXml = recordingStartTwiml();
+  if (!recordingXml) return twiml;
+  console.log("[recording] started", { direction: direction || "inbound" });
+  return String(twiml || "").replace(
+    "<Response>\n",
+    `<Response>\n${recordingXml}`,
+  );
+}
+
+function mergeMetadata(existing, patch) {
+  const base =
+    existing && typeof existing === "object" && !Array.isArray(existing)
+      ? existing
+      : {};
+  return { ...base, ...(patch || {}) };
+}
+
+async function updateCallRecordMetadataBySid(
+  callSid,
+  metadataPatch,
+  columnsPatch = {},
+) {
+  if (!callSid) return null;
+  const db = getSupabase();
+  try {
+    const { data: existing } = await db
+      .from("call_records")
+      .select("id, metadata")
+      .eq("twilio_call_sid", callSid)
+      .maybeSingle();
+    if (!existing?.id) return null;
+    const patch = {
+      ...columnsPatch,
+      metadata: mergeMetadata(existing.metadata, metadataPatch),
+    };
+    const { data, error } = await db
+      .from("call_records")
+      .update(patch)
+      .eq("id", existing.id)
+      .select("id")
+      .maybeSingle();
+    if (error)
+      console.warn("[call-record] metadata update failed:", error.message);
+    return data || null;
+  } catch (err) {
+    console.warn(
+      "[call-record] metadata update failed:",
+      err.message || String(err),
+    );
+    return null;
+  }
+}
+
 function normalizePhone(phone) {
   return String(phone || "").trim();
 }
@@ -152,10 +230,11 @@ function buildRealtimeTwiml({
     customInstructions: customInstructions || "",
   };
   const wsUrl = mediaStreamUrl(streamParams);
-  return buildMediaStreamTwiml({
+  const twiml = buildMediaStreamTwiml({
     wsUrl,
     parameters: streamParams,
   });
+  return maybeAddInboundRecording(twiml, streamParams.direction);
 }
 
 const DEFAULT_OUTBOUND_TEST_PURPOSE =
@@ -355,7 +434,7 @@ router.post(
       callRecordId,
       callSid,
       direction: "outbound",
-      callerPhone: toPhone,
+      callerPhone: fromPhone,
       recipientPhone,
       leadId,
       callPurpose,
@@ -384,7 +463,29 @@ router.get(
 router.post(
   "/call-status",
   asyncHandler(async (req, res) => {
-    const { CallSid, CallStatus, CallDuration, To } = req.body || {};
+    const { CallSid, CallStatus, CallDuration, To, AnsweredBy } =
+      req.body || {};
+    if (CallSid) {
+      const answeredBy = String(
+        AnsweredBy || req.body?.AnsweredBy || "",
+      ).trim();
+      if (answeredBy) {
+        const voicemailDetected = /machine|fax|unknown/i.test(answeredBy);
+        console.log("[outbound-call] answeredBy=" + answeredBy, {
+          callSid: CallSid,
+          voicemailDetected,
+        });
+        await updateCallRecordMetadataBySid(
+          CallSid,
+          {
+            answered_by: answeredBy,
+            machine_detection_result: answeredBy,
+            voicemail_detected: voicemailDetected,
+          },
+          { status: CallStatus || undefined },
+        );
+      }
+    }
     if (CallStatus === "completed" && CallDuration && To) {
       try {
         const db = getSupabase();
@@ -435,23 +536,90 @@ router.post(
 );
 
 // ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 // ── PUBLIC: Recording Status Callback ────────────────────────
-// Twilio sends this when a recording is ready.
-// We update the call record with the recording URL.
+// Twilio sends this when a recording changes status. We persist
+// recording metadata on call_records without exposing the raw URL
+// through any tenant-facing endpoint yet.
 // ─────────────────────────────────────────────────────────────
 router.post(
   "/recording-status",
   asyncHandler(async (req, res) => {
-    const { CallSid, RecordingUrl, RecordingStatus } = req.body || {};
-    if (RecordingStatus === "completed" && CallSid && RecordingUrl) {
+    const body = req.body || {};
+    const {
+      CallSid,
+      RecordingSid,
+      RecordingUrl,
+      RecordingStatus,
+      RecordingDuration,
+      RecordingChannels,
+      RecordingSource,
+      RecordingTrack,
+      RecordingStartTime,
+    } = body;
+    console.log("[recording] status callback", {
+      callSid: CallSid,
+      recordingSid: RecordingSid,
+      status: RecordingStatus,
+    });
+    if (CallSid) {
+      const recordingUrl = RecordingUrl ? `${RecordingUrl}.mp3` : "";
+      const recordingMetadata = {
+        recording: {
+          call_sid: CallSid,
+          recording_sid: RecordingSid || "",
+          recording_url: recordingUrl,
+          recording_status: RecordingStatus || "",
+          recording_duration: RecordingDuration
+            ? Number(RecordingDuration) || 0
+            : null,
+          recording_channels: RecordingChannels || "",
+          recording_source: RecordingSource || "",
+          recording_track: RecordingTrack || "",
+          recording_start_time: RecordingStartTime || "",
+          raw: body,
+        },
+      };
+      const fullPatch = {
+        recording_sid: RecordingSid || null,
+        recording_url: recordingUrl || null,
+        recording_status: RecordingStatus || null,
+        recording_duration: RecordingDuration
+          ? Number(RecordingDuration) || 0
+          : null,
+        recording_channels: RecordingChannels || null,
+        recording_source: RecordingSource || null,
+        recording_available: RecordingStatus === "completed",
+        recording_error:
+          RecordingStatus === "absent" ? "Recording absent" : null,
+      };
       try {
-        const db = getSupabase();
-        await db
-          .from("call_records")
-          .update({ recording_url: RecordingUrl + ".mp3" })
-          .eq("twilio_call_sid", CallSid);
-      } catch (e) {
-        console.error("[Twilio recording-status] error:", e.message);
+        await updateCallRecordMetadataBySid(
+          CallSid,
+          recordingMetadata,
+          fullPatch,
+        );
+        console.log("[recording] saved recordingSid=" + (RecordingSid || ""), {
+          callSid: CallSid,
+          status: RecordingStatus,
+        });
+      } catch (err) {
+        console.warn(
+          "[recording] full recording column update failed, trying recording_url fallback",
+          err.message || String(err),
+        );
+        try {
+          const db = getSupabase();
+          await db
+            .from("call_records")
+            .update({ recording_url: recordingUrl })
+            .eq("twilio_call_sid", CallSid);
+        } catch (fallbackErr) {
+          console.warn(
+            "[recording] absent/error",
+            fallbackErr.message || String(fallbackErr),
+          );
+        }
       }
     }
     res.json({ received: true });
@@ -1023,11 +1191,9 @@ router.post(
         .eq("organization_id", organizationId)
         .maybeSingle();
       if (!agent)
-        return res
-          .status(404)
-          .json({
-            error: { message: "Voice agent not found for this organization." },
-          });
+        return res.status(404).json({
+          error: { message: "Voice agent not found for this organization." },
+        });
     }
 
     const db = getSupabase();
@@ -1315,11 +1481,9 @@ router.post(
       .maybeSingle();
     if (error) throw error;
     if (!number)
-      return res
-        .status(404)
-        .json({
-          error: { message: "Number not found for this organization." },
-        });
+      return res.status(404).json({
+        error: { message: "Number not found for this organization." },
+      });
 
     const latest = await fetchIncomingNumber({
       accountSid: number.account_sid,
@@ -1606,26 +1770,22 @@ router.post(
     try {
       purpose = outboundPurposeFromBody(req.body || {});
     } catch (err) {
-      return res
-        .status(err.status || 400)
-        .json({
-          error: {
-            code: err.code || "CALL_PURPOSE_REQUIRED",
-            message: err.message,
-          },
-        });
+      return res.status(err.status || 400).json({
+        error: {
+          code: err.code || "CALL_PURPOSE_REQUIRED",
+          message: err.message,
+        },
+      });
     }
     const { callPurpose, callPurposeWarning } = purpose;
 
     if (!isE164(toPhone))
-      return res
-        .status(400)
-        .json({
-          error: {
-            code: "INVALID_PHONE_NUMBER",
-            message: "Destination must be an E.164 number like +14155551234.",
-          },
-        });
+      return res.status(400).json({
+        error: {
+          code: "INVALID_PHONE_NUMBER",
+          message: "Destination must be an E.164 number like +14155551234.",
+        },
+      });
 
     const db = getSupabase();
     let q = db
@@ -1641,72 +1801,61 @@ router.post(
       );
     const { data: number } = await q.maybeSingle();
     if (!number)
-      return res
-        .status(404)
-        .json({
-          error: {
-            code: "NUMBER_NOT_OWNED",
-            message:
-              "No configured from-number was found for this tenant/agent.",
-          },
-        });
+      return res.status(404).json({
+        error: {
+          code: "NUMBER_NOT_OWNED",
+          message: "No configured from-number was found for this tenant/agent.",
+        },
+      });
 
     const capabilities =
       typeof number.capabilities === "string"
         ? JSON.parse(number.capabilities || "{}")
         : number.capabilities || {};
     if (!capabilities.voice)
-      return res
-        .status(400)
-        .json({
-          error: {
-            code: "UNSUPPORTED_CAPABILITY",
-            message: "The selected from-number does not support voice.",
-          },
-        });
+      return res.status(400).json({
+        error: {
+          code: "UNSUPPORTED_CAPABILITY",
+          message: "The selected from-number does not support voice.",
+        },
+      });
     const actualAgentId =
       agentId ||
       number.assigned_voice_agent_id ||
       req.organization?.active_voice_agent_id;
     if (!actualAgentId)
-      return res
-        .status(400)
-        .json({
-          error: {
-            code: "AGENT_NOT_ASSIGNED",
-            message: "Assign an AI agent before placing outbound calls.",
-          },
-        });
+      return res.status(400).json({
+        error: {
+          code: "AGENT_NOT_ASSIGNED",
+          message: "Assign an AI agent before placing outbound calls.",
+        },
+      });
 
     const readiness = await refreshAndPersistReadiness(
       number.id,
       organizationId,
     );
     if (readiness.outbound_voice?.status !== "ready") {
-      return res
-        .status(400)
-        .json({
-          error: {
-            code: "OUTBOUND_VOICE_NOT_READY",
-            message: "This number is not ready for outbound voice calls.",
-            readiness,
-          },
-        });
+      return res.status(400).json({
+        error: {
+          code: "OUTBOUND_VOICE_NOT_READY",
+          message: "This number is not ready for outbound voice calls.",
+          readiness,
+        },
+      });
     }
     if (
       readiness.assigned_agent?.status &&
       readiness.assigned_agent.status !== "ready"
     ) {
-      return res
-        .status(400)
-        .json({
-          error: {
-            code: "AGENT_NOT_READY",
-            message:
-              "The selected number is not assigned to an active voice agent.",
-            readiness,
-          },
-        });
+      return res.status(400).json({
+        error: {
+          code: "AGENT_NOT_READY",
+          message:
+            "The selected number is not assigned to an active voice agent.",
+          readiness,
+        },
+      });
     }
 
     const destinationCountry = guessCountryFromE164(toPhone);
@@ -1720,16 +1869,14 @@ router.post(
         .filter(Boolean),
     );
     if (!selected.has(destinationCountry) && destinationCountry !== "UNKNOWN") {
-      return res
-        .status(400)
-        .json({
-          error: {
-            code: "COUNTRY_NOT_ENABLED",
-            message: `Outbound calls to ${destinationCountry} are not selected/enabled for this number.`,
-            destinationCountry,
-            enabledCountries: [...selected],
-          },
-        });
+      return res.status(400).json({
+        error: {
+          code: "COUNTRY_NOT_ENABLED",
+          message: `Outbound calls to ${destinationCountry} are not selected/enabled for this number.`,
+          destinationCountry,
+          enabledCountries: [...selected],
+        },
+      });
     }
 
     const { data: agent } = await db
@@ -1740,14 +1887,12 @@ router.post(
       .eq("is_active", true)
       .maybeSingle();
     if (!agent)
-      return res
-        .status(404)
-        .json({
-          error: {
-            code: "VOICE_AGENT_NOT_FOUND",
-            message: "Active voice agent not found.",
-          },
-        });
+      return res.status(404).json({
+        error: {
+          code: "VOICE_AGENT_NOT_FOUND",
+          message: "Active voice agent not found.",
+        },
+      });
 
     // Lightweight context readiness check: Railway will load the full prompt, but
     // the outbound API verifies that the tenant/agent rows are readable first.
@@ -1757,14 +1902,12 @@ router.post(
       .eq("id", organizationId)
       .maybeSingle();
     if (!organization)
-      return res
-        .status(404)
-        .json({
-          error: {
-            code: "ORGANIZATION_NOT_FOUND",
-            message: "Organization context could not be loaded.",
-          },
-        });
+      return res.status(404).json({
+        error: {
+          code: "ORGANIZATION_NOT_FOUND",
+          message: "Organization context could not be loaded.",
+        },
+      });
 
     console.log("[outbound-call] validation passed", {
       organizationId,
@@ -1801,7 +1944,7 @@ router.post(
       callRecordId: record.id,
       direction: "outbound",
       recipientPhone: toPhone,
-      callerPhone: toPhone,
+      callerPhone: number.phone_number,
       leadId,
       callPurpose,
       customInstructions,
@@ -1812,7 +1955,7 @@ router.post(
       callRecordId: record.id,
       direction: "outbound",
       recipientPhone: toPhone,
-      callerPhone: toPhone,
+      callerPhone: number.phone_number,
       leadId,
       callPurpose,
       customInstructions,
@@ -1825,6 +1968,11 @@ router.post(
         to: toPhone,
         twimlUrl,
         statusCallbackUrl: `${base}/api/twilio/call-status`,
+        machineDetection: process.env.OUTBOUND_MACHINE_DETECTION || "Enable",
+        record: callRecordingEnabled(),
+      });
+      console.log("[outbound-call] machineDetection enabled", {
+        value: process.env.OUTBOUND_MACHINE_DETECTION || "Enable",
       });
       console.log("[outbound-call] callSid", result.callSid);
       await updateCallRecordById(record.id, {
@@ -1850,12 +1998,10 @@ router.post(
           metadata: { error: mapped },
         });
       } catch (_) {}
-      res
-        .status(400)
-        .json({
-          error: mapped,
-          callPurposeWarning: callPurposeWarning || undefined,
-        });
+      res.status(400).json({
+        error: mapped,
+        callPurposeWarning: callPurposeWarning || undefined,
+      });
     }
   }),
 );
@@ -1870,13 +2016,11 @@ router.post(
     const authToken = String(req.body?.authToken || "").trim();
     const phoneNumber = normalizePhone(req.body?.phoneNumber || "");
     if (!accountSid || !authToken || !phoneNumber)
-      return res
-        .status(400)
-        .json({
-          error: {
-            message: "accountSid, authToken and phoneNumber are required.",
-          },
-        });
+      return res.status(400).json({
+        error: {
+          message: "accountSid, authToken and phoneNumber are required.",
+        },
+      });
     try {
       const data = await twilioRequest({
         method: "GET",
@@ -1888,15 +2032,13 @@ router.post(
       });
       const found = (data?.incoming_phone_numbers || [])[0];
       if (!found)
-        return res
-          .status(404)
-          .json({
-            error: {
-              code: "NUMBER_NOT_OWNED",
-              message:
-                "That number was not found in the supplied Twilio account.",
-            },
-          });
+        return res.status(404).json({
+          error: {
+            code: "NUMBER_NOT_OWNED",
+            message:
+              "That number was not found in the supplied Twilio account.",
+          },
+        });
       const n = {
         phoneNumber: found.phone_number,
         phoneSid: found.sid,
@@ -1934,14 +2076,12 @@ router.post(
           "Agently did not store the supplied Auth Token. Reconnect if you need to refresh this external account later.",
       });
     } catch (err) {
-      res
-        .status(400)
-        .json({
-          error: mapTwilioError(
-            err,
-            "Could not verify API ownership for this Twilio number.",
-          ),
-        });
+      res.status(400).json({
+        error: mapTwilioError(
+          err,
+          "Could not verify API ownership for this Twilio number.",
+        ),
+      });
     }
   }),
 );
@@ -2054,14 +2194,12 @@ router.post(
       }
     }
     if (!number)
-      return res
-        .status(404)
-        .json({
-          error: {
-            message:
-              "Verified/imported number not found. Run API verification or webhook challenge first.",
-          },
-        });
+      return res.status(404).json({
+        error: {
+          message:
+            "Verified/imported number not found. Run API verification or webhook challenge first.",
+        },
+      });
     await db
       .from("twilio_phone_numbers")
       .update({
@@ -2862,14 +3000,12 @@ router.post(
     try {
       purpose = outboundPurposeFromBody(req.body || {});
     } catch (err) {
-      return res
-        .status(err.status || 400)
-        .json({
-          error: {
-            code: err.code || "CALL_PURPOSE_REQUIRED",
-            message: err.message,
-          },
-        });
+      return res.status(err.status || 400).json({
+        error: {
+          code: err.code || "CALL_PURPOSE_REQUIRED",
+          message: err.message,
+        },
+      });
     }
     const { callPurpose, callPurposeWarning } = purpose;
 
@@ -2878,14 +3014,12 @@ router.post(
         .status(400)
         .json({ error: { message: "toPhone is required." } });
     if (!isE164(toPhone))
-      return res
-        .status(400)
-        .json({
-          error: {
-            code: "INVALID_PHONE_NUMBER",
-            message: "Destination must be an E.164 number like +14155551234.",
-          },
-        });
+      return res.status(400).json({
+        error: {
+          code: "INVALID_PHONE_NUMBER",
+          message: "Destination must be an E.164 number like +14155551234.",
+        },
+      });
 
     const db = getSupabase();
     const targetAgentId =
@@ -2919,15 +3053,13 @@ router.post(
     if (number?.id) {
       const readiness = await refreshAndPersistReadiness(number.id, req.orgId);
       if (readiness.outbound_voice?.status !== "ready") {
-        return res
-          .status(400)
-          .json({
-            error: {
-              code: "OUTBOUND_VOICE_NOT_READY",
-              message: "This number is not ready for outbound voice calls.",
-              readiness,
-            },
-          });
+        return res.status(400).json({
+          error: {
+            code: "OUTBOUND_VOICE_NOT_READY",
+            message: "This number is not ready for outbound voice calls.",
+            readiness,
+          },
+        });
       }
       const selected = new Set(
         [
@@ -2941,16 +3073,14 @@ router.post(
         !selected.has(destinationCountry) &&
         destinationCountry !== "UNKNOWN"
       ) {
-        return res
-          .status(400)
-          .json({
-            error: {
-              code: "COUNTRY_NOT_ENABLED",
-              message: `Outbound calls to ${destinationCountry} are not selected/enabled for this number.`,
-              destinationCountry,
-              enabledCountries: [...selected],
-            },
-          });
+        return res.status(400).json({
+          error: {
+            code: "COUNTRY_NOT_ENABLED",
+            message: `Outbound calls to ${destinationCountry} are not selected/enabled for this number.`,
+            destinationCountry,
+            enabledCountries: [...selected],
+          },
+        });
       }
     }
 
@@ -2986,7 +3116,7 @@ router.post(
       callRecordId: record.id,
       direction: "outbound",
       recipientPhone: toPhone,
-      callerPhone: toPhone,
+      callerPhone: agent.twilio_phone_number,
       leadId,
       callPurpose,
       customInstructions,
@@ -2997,7 +3127,7 @@ router.post(
       callRecordId: record.id,
       direction: "outbound",
       recipientPhone: toPhone,
-      callerPhone: toPhone,
+      callerPhone: agent.twilio_phone_number,
       leadId,
       callPurpose,
       customInstructions,
@@ -3010,6 +3140,11 @@ router.post(
       to: toPhone,
       twimlUrl,
       statusCallbackUrl: `${apiBase}/api/twilio/call-status`,
+      machineDetection: process.env.OUTBOUND_MACHINE_DETECTION || "Enable",
+      record: callRecordingEnabled(),
+    });
+    console.log("[outbound-call] machineDetection enabled", {
+      value: process.env.OUTBOUND_MACHINE_DETECTION || "Enable",
     });
     console.log("[outbound-call] callSid", result.callSid);
 
