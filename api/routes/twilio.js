@@ -172,6 +172,151 @@ async function updateCallRecordMetadataBySid(
   }
 }
 
+async function loadCallRecordForRecording(callSid) {
+  if (!callSid) return null;
+  const db = getSupabase();
+  const { data, error } = await db
+    .from("call_records")
+    .select("id, organization_id, transcript, summary, metadata")
+    .eq("twilio_call_sid", callSid)
+    .maybeSingle();
+  if (error) {
+    console.warn("[recording] call record lookup failed", {
+      callSid,
+      error: error.message,
+    });
+    return null;
+  }
+  return data || null;
+}
+
+function twilioBasicAuthHeader() {
+  const sid = process.env.TWILIO_ACCOUNT_SID;
+  const token = process.env.TWILIO_AUTH_TOKEN;
+  if (!sid || !token) return "";
+  return "Basic " + Buffer.from(`${sid}:${token}`).toString("base64");
+}
+
+async function downloadTwilioRecordingMp3(recordingUrl) {
+  if (!recordingUrl) throw new Error("Missing RecordingUrl");
+  const mediaUrl = String(recordingUrl).endsWith(".mp3")
+    ? String(recordingUrl)
+    : `${recordingUrl}.mp3`;
+  const auth = twilioBasicAuthHeader();
+  if (!auth)
+    throw new Error("Missing Twilio credentials for recording download");
+  const res = await fetch(mediaUrl, { headers: { Authorization: auth } });
+  if (!res.ok)
+    throw new Error(`Twilio recording download failed: ${res.status}`);
+  const arrayBuffer = await res.arrayBuffer();
+  return {
+    buffer: Buffer.from(arrayBuffer),
+    mediaUrl,
+    mimeType: res.headers.get("content-type") || "audio/mpeg",
+  };
+}
+
+async function uploadRecordingToSupabase({
+  callRecord,
+  recordingSid,
+  buffer,
+  mimeType,
+}) {
+  const provider = String(
+    process.env.CALL_RECORDING_STORAGE_PROVIDER || "supabase",
+  ).toLowerCase();
+  if (provider !== "supabase") return { skipped: true, provider };
+  const bucket = process.env.SUPABASE_RECORDINGS_BUCKET || "call-recordings";
+  if (!callRecord?.organization_id || !callRecord?.id || !recordingSid) {
+    throw new Error("Missing call record identifiers for recording upload");
+  }
+  const storagePath = `${callRecord.organization_id}/${callRecord.id}/${recordingSid}.mp3`;
+  const db = getSupabase();
+  const { error } = await db.storage.from(bucket).upload(storagePath, buffer, {
+    contentType: mimeType || "audio/mpeg",
+    upsert: true,
+  });
+  if (error)
+    throw new Error(error.message || "Supabase recording upload failed");
+  return { provider: "supabase", bucket, storagePath };
+}
+
+function transcriptToText(transcript) {
+  if (!transcript) return "";
+  if (Array.isArray(transcript)) {
+    return transcript
+      .map(
+        (t) =>
+          `${t.role || t.speaker || "speaker"}: ${t.text || t.transcript || ""}`,
+      )
+      .join("\n");
+  }
+  if (typeof transcript === "string") return transcript;
+  return "";
+}
+
+async function transcribeRecordingWithOpenAI({
+  buffer,
+  filename = "call-recording.mp3",
+}) {
+  if (
+    String(process.env.TRANSCRIBE_CALL_RECORDINGS || "false").toLowerCase() !==
+    "true"
+  ) {
+    return { skipped: true, status: "disabled" };
+  }
+  if (
+    String(process.env.TRANSCRIPTION_PROVIDER || "openai").toLowerCase() !==
+    "openai"
+  ) {
+    return { skipped: true, status: "provider_disabled" };
+  }
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return { skipped: true, status: "missing_openai_key" };
+  const maxBytes = Number(
+    process.env.OPENAI_TRANSCRIPTION_MAX_BYTES || 24 * 1024 * 1024,
+  );
+  if (buffer.length > maxBytes)
+    return { skipped: true, status: "file_too_large" };
+  const model =
+    process.env.OPENAI_TRANSCRIPTION_MODEL || "gpt-4o-mini-transcribe";
+  const form = new FormData();
+  form.append("model", model);
+  form.append("file", new Blob([buffer], { type: "audio/mpeg" }), filename);
+  const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}` },
+    body: form,
+  });
+  const text = await res.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { text };
+  }
+  if (!res.ok)
+    throw new Error(
+      data?.error?.message ||
+        data?.message ||
+        `OpenAI transcription failed: ${res.status}`,
+    );
+  return {
+    skipped: false,
+    status: "completed",
+    model,
+    text: data?.text || "",
+    raw: data,
+  };
+}
+
+function makeShortSummary(text) {
+  const clean = String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return clean ? clean.slice(0, 1200) : "";
+}
+
 function normalizePhone(phone) {
   return String(phone || "").trim();
 }
@@ -562,66 +707,168 @@ router.post(
       recordingSid: RecordingSid,
       status: RecordingStatus,
     });
-    if (CallSid) {
-      const recordingUrl = RecordingUrl ? `${RecordingUrl}.mp3` : "";
-      const recordingMetadata = {
-        recording: {
-          call_sid: CallSid,
-          recording_sid: RecordingSid || "",
-          recording_url: recordingUrl,
-          recording_status: RecordingStatus || "",
-          recording_duration: RecordingDuration
-            ? Number(RecordingDuration) || 0
-            : null,
-          recording_channels: RecordingChannels || "",
-          recording_source: RecordingSource || "",
-          recording_track: RecordingTrack || "",
-          recording_start_time: RecordingStartTime || "",
-          raw: body,
-        },
-      };
-      const fullPatch = {
-        recording_sid: RecordingSid || null,
-        recording_url: recordingUrl || null,
-        recording_status: RecordingStatus || null,
+
+    if (!CallSid)
+      return res.json({ received: true, ignored: "missing_call_sid" });
+
+    const recordingUrl = RecordingUrl ? `${RecordingUrl}.mp3` : "";
+    const callRecord = await loadCallRecordForRecording(CallSid);
+    const baseRecordingMeta = {
+      recording: {
+        call_sid: CallSid,
+        recording_sid: RecordingSid || "",
+        recording_url: recordingUrl,
+        recording_status: RecordingStatus || "",
         recording_duration: RecordingDuration
           ? Number(RecordingDuration) || 0
           : null,
-        recording_channels: RecordingChannels || null,
-        recording_source: RecordingSource || null,
-        recording_available: RecordingStatus === "completed",
-        recording_error:
-          RecordingStatus === "absent" ? "Recording absent" : null,
-      };
-      try {
-        await updateCallRecordMetadataBySid(
-          CallSid,
-          recordingMetadata,
-          fullPatch,
-        );
-        console.log("[recording] saved recordingSid=" + (RecordingSid || ""), {
+        recording_channels: RecordingChannels || "",
+        recording_source: RecordingSource || "",
+        recording_track: RecordingTrack || "",
+        recording_start_time: RecordingStartTime || "",
+        raw: body,
+      },
+    };
+
+    const baseColumns = {
+      recording_sid: RecordingSid || null,
+      recording_url: recordingUrl || null,
+      recording_status: RecordingStatus || null,
+      recording_duration: RecordingDuration
+        ? Number(RecordingDuration) || 0
+        : null,
+      recording_channels: RecordingChannels || null,
+      recording_source: RecordingSource || null,
+      recording_available: RecordingStatus === "completed",
+      recording_error: RecordingStatus === "absent" ? "Recording absent" : null,
+    };
+
+    if (RecordingStatus !== "completed") {
+      await updateCallRecordMetadataBySid(
+        CallSid,
+        baseRecordingMeta,
+        baseColumns,
+      );
+      if (RecordingStatus === "absent")
+        console.warn("[recording] absent/error", {
           callSid: CallSid,
-          status: RecordingStatus,
+          recordingSid: RecordingSid,
         });
-      } catch (err) {
-        console.warn(
-          "[recording] full recording column update failed, trying recording_url fallback",
-          err.message || String(err),
-        );
-        try {
-          const db = getSupabase();
-          await db
-            .from("call_records")
-            .update({ recording_url: recordingUrl })
-            .eq("twilio_call_sid", CallSid);
-        } catch (fallbackErr) {
-          console.warn(
-            "[recording] absent/error",
-            fallbackErr.message || String(fallbackErr),
-          );
+      return res.json({ received: true });
+    }
+
+    let columnsPatch = { ...baseColumns };
+    let metadataPatch = { ...baseRecordingMeta };
+
+    try {
+      if (callRecord?.id && RecordingSid && RecordingUrl) {
+        const downloaded = await downloadTwilioRecordingMp3(RecordingUrl);
+        const upload = await uploadRecordingToSupabase({
+          callRecord,
+          recordingSid: RecordingSid,
+          buffer: downloaded.buffer,
+          mimeType: downloaded.mimeType,
+        });
+        if (!upload?.skipped) {
+          columnsPatch = {
+            ...columnsPatch,
+            recording_storage_provider: upload.provider,
+            recording_storage_path: upload.storagePath,
+            recording_mime_type: downloaded.mimeType,
+            recording_file_size: downloaded.buffer.length,
+            recording_archived_at: new Date().toISOString(),
+          };
+          metadataPatch.recording = {
+            ...metadataPatch.recording,
+            storage_provider: upload.provider,
+            storage_path: upload.storagePath,
+          };
+          console.log("[recording] archived to Supabase", {
+            callSid: CallSid,
+            recordingSid: RecordingSid,
+            storagePath: upload.storagePath,
+          });
+
+          try {
+            const tx = await transcribeRecordingWithOpenAI({
+              buffer: downloaded.buffer,
+              filename: `${RecordingSid}.mp3`,
+            });
+            columnsPatch.transcription_provider = "openai";
+            columnsPatch.transcription_status =
+              tx.status || (tx.skipped ? "skipped" : "completed");
+            metadataPatch.transcription = {
+              provider: "openai",
+              model:
+                tx.model ||
+                process.env.OPENAI_TRANSCRIPTION_MODEL ||
+                "gpt-4o-mini-transcribe",
+              status: tx.status || "unknown",
+              completed_at: new Date().toISOString(),
+              skipped: Boolean(tx.skipped),
+            };
+            if (tx.text) {
+              const existingTranscript = transcriptToText(
+                callRecord.transcript,
+              );
+              if (!existingTranscript)
+                columnsPatch.transcript = [
+                  {
+                    role: "transcription",
+                    text: tx.text,
+                    ts: new Date().toISOString(),
+                  },
+                ];
+              if (!callRecord.summary)
+                columnsPatch.summary = makeShortSummary(tx.text);
+            }
+          } catch (txErr) {
+            columnsPatch.transcription_provider = "openai";
+            columnsPatch.transcription_status = "failed";
+            columnsPatch.transcription_error = txErr.message || String(txErr);
+            metadataPatch.transcription = {
+              provider: "openai",
+              status: "failed",
+              error: columnsPatch.transcription_error,
+              completed_at: new Date().toISOString(),
+            };
+            console.warn("[recording] transcription failed", {
+              callSid: CallSid,
+              error: columnsPatch.transcription_error,
+            });
+          }
         }
       }
+      await updateCallRecordMetadataBySid(CallSid, metadataPatch, columnsPatch);
+      console.log("[recording] saved recordingSid=" + (RecordingSid || ""), {
+        callSid: CallSid,
+        status: RecordingStatus,
+      });
+    } catch (err) {
+      console.warn("[recording] absent/error", {
+        callSid: CallSid,
+        recordingSid: RecordingSid,
+        error: err.message || String(err),
+      });
+      await updateCallRecordMetadataBySid(
+        CallSid,
+        {
+          ...metadataPatch,
+          recording: {
+            ...(metadataPatch.recording || {}),
+            error: err.message || String(err),
+          },
+        },
+        {
+          ...columnsPatch,
+          recording_error: err.message || String(err),
+          recording_available: Boolean(
+            columnsPatch.recording_storage_path || recordingUrl,
+          ),
+        },
+      );
     }
+
     res.json({ received: true });
   }),
 );

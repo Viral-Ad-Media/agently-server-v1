@@ -134,6 +134,137 @@ router.post(
   }),
 );
 
+function redactCallMetadata(metadata = {}) {
+  const safe =
+    metadata && typeof metadata === "object" && !Array.isArray(metadata)
+      ? { ...metadata }
+      : {};
+  if (safe.recording?.recording_url) delete safe.recording.recording_url;
+  if (safe.recording?.raw) safe.recording.raw = "[redacted]";
+  return safe;
+}
+
+// ── GET /api/calls/:id ──────────────────────────────────────
+router.get(
+  "/:id",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const db = getSupabase();
+    const { data: call, error } = await db
+      .from("call_records")
+      .select("*")
+      .eq("id", id)
+      .eq("organization_id", req.orgId)
+      .maybeSingle();
+    if (error || !call) {
+      return res
+        .status(404)
+        .json({ error: { message: "Call record not found." } });
+    }
+
+    let lead = null;
+    const leadId =
+      call.metadata?.inbound_call_message?.lead_id ||
+      call.lead_id ||
+      call.metadata?.leadId ||
+      null;
+    if (leadId) {
+      const { data: leadRow } = await db
+        .from("leads")
+        .select(
+          "id, name, phone, email, reason, status, source, created_at, voice_agent_id",
+        )
+        .eq("id", leadId)
+        .eq("organization_id", req.orgId)
+        .maybeSingle();
+      lead = leadRow || null;
+    }
+
+    res.json({
+      call: {
+        id: call.id,
+        organization_id: call.organization_id,
+        voice_agent_id: call.voice_agent_id,
+        direction: call.direction,
+        status: call.status,
+        from:
+          call.metadata?.fromNumber ||
+          call.metadata?.twilioFrom ||
+          call.caller_phone ||
+          "",
+        to: call.metadata?.toPhone || call.metadata?.twilioTo || "",
+        duration:
+          call.duration || call.metadata?.call_end_details?.duration || null,
+        summary: call.summary || "",
+        transcript: call.transcript || [],
+        recording_available: Boolean(call.recording_available),
+        recording_status: call.recording_status || null,
+        recording_sid: call.recording_sid || null,
+        recording_storage_provider: call.recording_storage_provider || null,
+        recording_storage_path: call.recording_storage_path || null,
+        metadata: redactCallMetadata({
+          voicemail_detected: call.metadata?.voicemail_detected,
+          answered_by: call.metadata?.answered_by,
+          machine_detection_result: call.metadata?.machine_detection_result,
+          hangup_reason:
+            call.metadata?.hangup_reason ||
+            call.metadata?.call_end_details?.reason,
+        }),
+        lead,
+      },
+    });
+  }),
+);
+
+// ── GET /api/calls/:id/recording ────────────────────────────
+router.get(
+  "/:id/recording",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const db = getSupabase();
+    const { data: call, error } = await db
+      .from("call_records")
+      .select(
+        "id, organization_id, recording_available, recording_status, recording_storage_provider, recording_storage_path, recording_mime_type",
+      )
+      .eq("id", id)
+      .eq("organization_id", req.orgId)
+      .maybeSingle();
+    if (error || !call)
+      return res
+        .status(404)
+        .json({ error: { message: "Call record not found." } });
+    if (!call.recording_available || !call.recording_storage_path) {
+      return res
+        .status(404)
+        .json({ error: { message: "Recording is not available yet." } });
+    }
+    const bucket = process.env.SUPABASE_RECORDINGS_BUCKET || "call-recordings";
+    const expiresIn = Number(
+      process.env.RECORDING_SIGNED_URL_TTL_SECONDS || 300,
+    );
+    const { data, error: signedError } = await db.storage
+      .from(bucket)
+      .createSignedUrl(call.recording_storage_path, expiresIn);
+    if (signedError || !data?.signedUrl) {
+      return res.status(500).json({
+        error: { message: "Failed to create recording playback URL." },
+      });
+    }
+    return res.json({
+      recording: {
+        call_id: call.id,
+        recording_status: call.recording_status,
+        mime_type: call.recording_mime_type || "audio/mpeg",
+        expires_in: expiresIn,
+        signed_url: data.signedUrl,
+      },
+    });
+  }),
+);
+
 // ── GET /api/calls/:id/report ────────────────────────────────
 router.get(
   "/:id/report",
