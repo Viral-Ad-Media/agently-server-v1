@@ -59,6 +59,7 @@ const {
   finalizeUsage,
 } = require("../../lib/call-records");
 const { mapTwilioError } = require("../../lib/twilio-errors");
+const { checkOpenAIRealtimeProvider } = require("../../lib/ai-provider-health");
 const {
   ensureTenantTwilioAccount,
   searchAvailableRecommendedNumbers,
@@ -2164,6 +2165,11 @@ router.post(
     });
     console.log("[outbound-call] callPurpose", callPurpose);
 
+    const aiProvider = await checkOpenAIRealtimeProvider();
+    if (!aiProvider.success) {
+      return res.status(503).json(aiProvider);
+    }
+
     const record = await createCallRecord({
       organizationId,
       voiceAgentId: agent.id,
@@ -3338,6 +3344,11 @@ router.post(
       to: toPhone,
     });
     console.log("[outbound-call] callPurpose", callPurpose);
+
+    const aiProvider = await checkOpenAIRealtimeProvider();
+    if (!aiProvider.success) {
+      return res.status(503).json(aiProvider);
+    }
 
     const record = await createCallRecord({
       organizationId: req.orgId,
