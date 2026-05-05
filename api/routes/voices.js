@@ -14,7 +14,10 @@ const {
 const router = express.Router();
 
 async function loadTenantGreeting(db, req) {
-  const agentId = req.body?.agentId || req.query?.agentId || req.organization?.active_voice_agent_id;
+  const agentId =
+    req.body?.agentId ||
+    req.query?.agentId ||
+    req.organization?.active_voice_agent_id;
   if (!agentId) return "";
   try {
     const { data } = await db
@@ -34,7 +37,9 @@ router.get(
   requireAuth,
   asyncHandler(async (req, res) => {
     const db = getSupabase();
-    const provider = String(req.query?.provider || "elevenlabs").trim().toLowerCase();
+    const provider = String(req.query?.provider || "elevenlabs")
+      .trim()
+      .toLowerCase();
     const result = await listVoiceCatalog({ db, provider });
     res.json({
       success: true,
@@ -61,7 +66,9 @@ router.post(
   requireAuth,
   asyncHandler(async (req, res) => {
     const db = getSupabase();
-    const provider = String(req.body?.provider || "elevenlabs").trim().toLowerCase();
+    const provider = String(req.body?.provider || "elevenlabs")
+      .trim()
+      .toLowerCase();
     if (provider !== "elevenlabs") {
       return res.status(400).json({
         success: false,
@@ -84,6 +91,7 @@ router.post(
       text: previewText,
       modelId: req.body?.modelId || voice.modelId,
       outputFormat: req.body?.outputFormat,
+      voiceSettings: req.body?.voiceSettings || req.body?.voice_settings || {},
     });
 
     res.setHeader("Content-Type", audio.mimeType || "audio/mpeg");
@@ -94,6 +102,10 @@ router.post(
     res.setHeader("X-Voice-Preview-Cache-Key", audio.cacheKey);
     res.setHeader("X-ElevenLabs-Model", audio.modelId);
     res.setHeader("X-ElevenLabs-Output-Format", audio.outputFormat);
+    res.setHeader(
+      "X-ElevenLabs-Voice-Settings",
+      JSON.stringify(audio.voiceSettings || {}),
+    );
     return res.status(200).send(audio.buffer);
   }),
 );

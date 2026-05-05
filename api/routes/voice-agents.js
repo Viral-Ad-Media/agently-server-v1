@@ -29,6 +29,7 @@ router.post(
           body.voiceProvider || process.env.VOICE_PROVIDER_DEFAULT || null,
         voice_id: body.voiceId || null,
         voice_catalog_id: body.voiceCatalogId || null,
+        voice_settings: body.voiceSettings || body.voice_settings || {},
         language: body.language || "English",
         greeting:
           body.greeting ||
@@ -82,6 +83,8 @@ router.patch(
     if (body.voiceId !== undefined) updates.voice_id = body.voiceId || null;
     if (body.voiceCatalogId !== undefined)
       updates.voice_catalog_id = body.voiceCatalogId || null;
+    if (body.voiceSettings !== undefined || body.voice_settings !== undefined)
+      updates.voice_settings = body.voiceSettings || body.voice_settings || {};
     if (body.language !== undefined) updates.language = body.language;
     if (body.greeting !== undefined) updates.greeting = body.greeting;
     if (body.tone !== undefined) updates.tone = body.tone;
