@@ -24,7 +24,11 @@ router.post(
         organization_id: req.orgId,
         name: body.name || "New AI Agent",
         direction: body.direction || "inbound",
-        voice: body.voice || process.env.DEFAULT_AGENT_VOICE || "Domi",
+        voice: body.voice || process.env.DEFAULT_AGENT_VOICE || "alloy",
+        voice_provider:
+          body.voiceProvider || process.env.VOICE_PROVIDER_DEFAULT || null,
+        voice_id: body.voiceId || null,
+        voice_catalog_id: body.voiceCatalogId || null,
         language: body.language || "English",
         greeting:
           body.greeting ||
@@ -73,6 +77,11 @@ router.patch(
     if (body.name !== undefined) updates.name = body.name;
     if (body.direction !== undefined) updates.direction = body.direction;
     if (body.voice !== undefined) updates.voice = body.voice;
+    if (body.voiceProvider !== undefined)
+      updates.voice_provider = body.voiceProvider || null;
+    if (body.voiceId !== undefined) updates.voice_id = body.voiceId || null;
+    if (body.voiceCatalogId !== undefined)
+      updates.voice_catalog_id = body.voiceCatalogId || null;
     if (body.language !== undefined) updates.language = body.language;
     if (body.greeting !== undefined) updates.greeting = body.greeting;
     if (body.tone !== undefined) updates.tone = body.tone;

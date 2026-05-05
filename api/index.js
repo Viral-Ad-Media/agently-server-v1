@@ -85,6 +85,10 @@ app.get("/health", (_req, res) => {
       SUPABASE_SERVICE_KEY: !!process.env.SUPABASE_SERVICE_KEY,
       JWT_SECRET: !!process.env.JWT_SECRET,
       OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
+      ELEVENLABS_API_KEY: !!process.env.ELEVENLABS_API_KEY,
+      ELEVENLABS_DEFAULT_MODEL: !!process.env.ELEVENLABS_DEFAULT_MODEL,
+      VOICE_PROVIDER_DEFAULT: process.env.VOICE_PROVIDER_DEFAULT || "openai",
+      VOICE_PROVIDER_FALLBACK: process.env.VOICE_PROVIDER_FALLBACK || "openai",
       RESEND_API_KEY: !!process.env.RESEND_API_KEY,
       TWILIO_ACCOUNT_SID: !!process.env.TWILIO_ACCOUNT_SID,
       TWILIO_AUTH_TOKEN: !!process.env.TWILIO_AUTH_TOKEN,
@@ -155,6 +159,7 @@ safeMount(
   "chatbot-public",
 );
 safeMount("/api/twilio", () => require("./routes/twilio"), "twilio");
+safeMount("/api/voices", () => require("./routes/voices"), "voices");
 safeMount("/api", () => require("./routes/misc"), "misc");
 safeMount("/chatbot-widget", () => require("./routes/widget"), "widget");
 

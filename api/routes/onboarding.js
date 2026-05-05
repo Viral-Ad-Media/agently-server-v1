@@ -88,7 +88,7 @@ router.post(
         ? agentConfig.greeting
         : `Hello, thank you for calling ${businessName}! This is ${agentName}. How can I help you today?`;
 
-    // Create voice agent (no VAPI dependency — uses Twilio ConversationRelay)
+    // Create voice agent using Twilio/OpenAI realtime pipeline
     const { data: agentRow, error: agentErr } = await db
       .from("voice_agents")
       .insert({
