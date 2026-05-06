@@ -18,6 +18,7 @@ const chatbotDeployRoutes = require("./routes/chatbot-deploy");
 const messengerRoutes = require("./routes/messenger");
 const callsRoutes = require("./routes/calls");
 const leadsRoutes = require("./routes/leads");
+const outreachRoutes = require("./routes/outreach");
 const miscRoutes = require("./routes/misc");
 const widgetRoutes = require("./routes/widget");
 const chatbotPublicRoutes = require("./routes/chatbot-public");
@@ -80,6 +81,7 @@ app.use("/api/chatbots", chatbotDeployRoutes); // /deploy + /deploy-status
 app.use("/api/messenger", messengerRoutes);
 app.use("/api/calls", callsRoutes);
 app.use("/api/leads", leadsRoutes);
+app.use("/api/outreach", outreachRoutes);
 app.use("/api/chatbot-public", chatbotPublicRoutes);
 app.use("/api/twilio", twilioRoutes); // ← NEW: all Twilio routes
 app.use("/api", miscRoutes); // team, billing, settings, contact
