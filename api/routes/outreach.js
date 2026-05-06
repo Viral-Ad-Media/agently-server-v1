@@ -99,20 +99,13 @@ async function refreshScheduleProgress(db, organizationId, scheduleId) {
     remaining: 0,
   };
   for (const run of runs || []) {
-    const status = run.status || "pending";
-    if (status === "pending") progress.pending += 1;
-    else if (status === "processing") progress.processing += 1;
-    else if (status === "queued_to_twilio") progress.queuedToTwilio += 1;
+    const status = run.status || "queued";
+    if (status === "queued") progress.pending += 1;
+    else if (status === "initiated") progress.processing += 1;
     else if (status === "completed") progress.completed += 1;
     else if (status === "failed") progress.failed += 1;
-    else if (status === "no_answer") progress.noAnswer += 1;
-    else if (status === "voicemail") progress.voicemail += 1;
-    else if (status === "skipped") progress.skipped += 1;
-    else if (status === "retry_scheduled") progress.retryScheduled += 1;
-    else if (String(status).startsWith("blocked")) progress.blocked += 1;
   }
-  progress.remaining =
-    progress.pending + progress.processing + progress.retryScheduled;
+  progress.remaining = progress.pending + progress.processing;
   await db
     .from("lead_outreach_schedules")
     .update({ progress, updated_at: nowIso() })
@@ -148,7 +141,7 @@ async function generateRunsForSchedule(
       .delete()
       .eq("organization_id", organizationId)
       .eq("schedule_id", schedule.id)
-      .in("status", ["pending", "retry_scheduled"]);
+      .eq("status", "queued");
   }
 
   const rows = [];
@@ -167,7 +160,7 @@ async function generateRunsForSchedule(
         target_name: lead.name || "Unknown",
         run_key: `lead:${lead.id}:${scheduledFor}:${index + 1}`,
         scheduled_for: scheduledFor,
-        status: "pending",
+        status: "queued",
         attempt_number: index + 1,
         outcome_metadata: {
           scheduleType: schedule.schedule_type,
@@ -191,7 +184,7 @@ async function generateRunsForSchedule(
         target_name: recipient.name || "Direct recipient",
         run_key: `direct:${recipient.phone}:${scheduledFor}:${index + 1}`,
         scheduled_for: scheduledFor,
-        status: "pending",
+        status: "queued",
         attempt_number: index + 1,
         outcome_metadata: {
           scheduleType: schedule.schedule_type,
@@ -224,12 +217,18 @@ async function generateRunsForSchedule(
   const inserted = [];
   for (let i = 0; i < rowsToInsert.length; i += 100) {
     const chunk = rowsToInsert.slice(i, i + 100);
+    console.log("[outreach] creating run status=queued", {
+      count: chunk.length,
+      scheduleId: schedule.id,
+    });
     const { data, error } = await db
       .from("lead_outreach_runs")
       .insert(chunk)
       .select();
     if (error) throw error;
     inserted.push(...(data || []));
+    for (const run of data || [])
+      console.log("[outreach] run created id=", run.id);
   }
   await refreshScheduleProgress(db, organizationId, schedule.id);
   return { inserted: inserted.length, runs: inserted };
@@ -345,6 +344,28 @@ router.post(
         });
     }
 
+    const targetType =
+      directRecipients.length && leadIds.length
+        ? "lead_list"
+        : directRecipients.length
+          ? directRecipients.length === 1
+            ? "direct_number"
+            : "direct_numbers"
+          : leadIds.length === 1
+            ? "lead"
+            : "lead_list";
+
+    console.log("[outreach] creating schedule", {
+      organizationId,
+      voiceAgentId,
+      scheduleType,
+      startAt,
+    });
+    console.log("[outreach] target_type", { targetType });
+    console.log("[outreach] direct recipients count", {
+      count: directRecipients.length,
+    });
+
     const row = {
       organization_id: organizationId,
       voice_agent_id: voiceAgentId,
@@ -357,14 +378,7 @@ router.post(
           : null,
       lead_ids: leadIds,
       direct_recipients: directRecipients,
-      target_type:
-        directRecipients.length && leadIds.length
-          ? "mixed"
-          : directRecipients.length
-            ? "direct_numbers"
-            : leadIds.length === 1
-              ? "lead"
-              : "lead_list",
+      target_type: targetType,
       name:
         String(body.name || "Scheduled outreach").trim() ||
         "Scheduled outreach",
@@ -775,28 +789,23 @@ router.get(
         .from("lead_outreach_runs")
         .select("id")
         .eq("organization_id", req.orgId)
-        .eq("status", "pending"),
+        .eq("status", "queued"),
       db
         .from("lead_outreach_runs")
         .select("id")
         .eq("organization_id", req.orgId)
-        .in("status", [
-          "failed",
-          "blocked_provider_unavailable",
-          "blocked_country",
-          "blocked_quota",
-        ]),
+        .eq("status", "failed"),
       db
         .from("lead_outreach_runs")
         .select("id")
         .eq("organization_id", req.orgId)
-        .in("status", ["completed", "queued_to_twilio"]),
+        .in("status", ["completed", "initiated"]),
     ]);
     const next = await db
       .from("lead_outreach_runs")
       .select("scheduled_for")
       .eq("organization_id", req.orgId)
-      .eq("status", "pending")
+      .eq("status", "queued")
       .gte("scheduled_for", new Date().toISOString())
       .order("scheduled_for", { ascending: true })
       .limit(1)
