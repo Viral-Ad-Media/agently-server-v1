@@ -8,6 +8,7 @@ const {
   isUuid,
   isE164,
   cleanPhone,
+  normalizeDirectRecipients,
   normalizeArray,
   normalizeScheduleStatus,
   normalizeScheduleType,
@@ -132,6 +133,9 @@ async function generateRunsForSchedule(
       : schedule.lead_id
         ? [schedule.lead_id]
         : [];
+  const directRecipients = normalizeDirectRecipients(
+    schedule.direct_recipients || schedule.metadata?.directRecipients || [],
+  );
   const leads = await loadLeads(db, organizationId, leadIds);
   const scheduledTimes = buildRunCandidates(schedule, {
     horizonDays: Number(schedule.metadata?.generation_horizon_days || 30),
@@ -161,12 +165,39 @@ async function generateRunsForSchedule(
         destination_phone: destination,
         target_phone: destination,
         target_name: lead.name || "Unknown",
+        run_key: `lead:${lead.id}:${scheduledFor}:${index + 1}`,
         scheduled_for: scheduledFor,
         status: "pending",
         attempt_number: index + 1,
         outcome_metadata: {
           scheduleType: schedule.schedule_type,
           callPurpose: schedule.call_purpose || "",
+          targetType: "lead",
+        },
+      });
+    });
+  }
+
+  for (const recipient of directRecipients) {
+    scheduledTimes.forEach((scheduledFor, index) => {
+      rows.push({
+        organization_id: organizationId,
+        schedule_id: schedule.id,
+        lead_id: null,
+        voice_agent_id: schedule.voice_agent_id,
+        from_number_id: schedule.from_number_id || null,
+        destination_phone: recipient.phone,
+        target_phone: recipient.phone,
+        target_name: recipient.name || "Direct recipient",
+        run_key: `direct:${recipient.phone}:${scheduledFor}:${index + 1}`,
+        scheduled_for: scheduledFor,
+        status: "pending",
+        attempt_number: index + 1,
+        outcome_metadata: {
+          scheduleType: schedule.schedule_type,
+          callPurpose: schedule.call_purpose || "",
+          targetType: "direct_number",
+          directRecipient: recipient,
         },
       });
     });
@@ -177,15 +208,25 @@ async function generateRunsForSchedule(
     return { inserted: 0, runs: [] };
   }
 
+  const { data: existingRows, error: existingError } = await db
+    .from("lead_outreach_runs")
+    .select("run_key")
+    .eq("organization_id", organizationId)
+    .eq("schedule_id", schedule.id);
+  if (existingError) throw existingError;
+  const existingKeys = new Set(
+    (existingRows || []).map((row) => row.run_key).filter(Boolean),
+  );
+  const rowsToInsert = rows.filter(
+    (row) => !row.run_key || !existingKeys.has(row.run_key),
+  );
+
   const inserted = [];
-  for (let i = 0; i < rows.length; i += 100) {
-    const chunk = rows.slice(i, i + 100);
+  for (let i = 0; i < rowsToInsert.length; i += 100) {
+    const chunk = rowsToInsert.slice(i, i + 100);
     const { data, error } = await db
       .from("lead_outreach_runs")
-      .upsert(chunk, {
-        onConflict: "schedule_id,lead_id,scheduled_for,attempt_number",
-        ignoreDuplicates: true,
-      })
+      .insert(chunk)
       .select();
     if (error) throw error;
     inserted.push(...(data || []));
@@ -208,6 +249,15 @@ router.post(
     const leadIds = normalizeArray(
       body.leadIds || body.lead_ids || body.leadId || body.lead_id,
     ).filter(isUuid);
+    const directRecipients = normalizeDirectRecipients(
+      body.directRecipients ||
+        body.direct_recipients ||
+        body.directNumbers ||
+        body.direct_numbers ||
+        body.recipients ||
+        body.numbers ||
+        [],
+    );
     const scheduleType = normalizeScheduleType(
       body.scheduleType || body.schedule_type,
     );
@@ -226,38 +276,45 @@ router.post(
     );
 
     if (!voiceAgentId) {
-      return res.status(400).json({
-        error: {
-          code: "VOICE_AGENT_REQUIRED",
-          message: "voiceAgentId is required.",
-        },
-      });
+      return res
+        .status(400)
+        .json({
+          error: {
+            code: "VOICE_AGENT_REQUIRED",
+            message: "voiceAgentId is required.",
+          },
+        });
     }
-    if (!leadIds.length) {
+    if (!leadIds.length && !directRecipients.length) {
       return res.status(400).json({
         error: {
-          code: "LEADS_REQUIRED",
-          message: "At least one leadId is required.",
+          code: "RECIPIENTS_REQUIRED",
+          message:
+            "Provide at least one leadId or one direct recipient phone number.",
         },
       });
     }
     if (!startAt) {
-      return res.status(400).json({
-        error: {
-          code: "START_AT_REQUIRED",
-          message: "startAt is required as an ISO UTC timestamp.",
-        },
-      });
+      return res
+        .status(400)
+        .json({
+          error: {
+            code: "START_AT_REQUIRED",
+            message: "startAt is required as an ISO UTC timestamp.",
+          },
+        });
     }
 
     const agent = await ensureAgent(db, organizationId, voiceAgentId);
     if (!agent)
-      return res.status(404).json({
-        error: {
-          code: "VOICE_AGENT_NOT_FOUND",
-          message: "Voice agent not found.",
-        },
-      });
+      return res
+        .status(404)
+        .json({
+          error: {
+            code: "VOICE_AGENT_NOT_FOUND",
+            message: "Voice agent not found.",
+          },
+        });
 
     const number = await ensureFromNumber(db, organizationId, {
       fromNumberId,
@@ -265,23 +322,27 @@ router.post(
       voiceAgentId,
     });
     if (!number) {
-      return res.status(404).json({
-        error: {
-          code: "FROM_NUMBER_NOT_FOUND",
-          message:
-            "A configured from-number is required for scheduled outbound calls.",
-        },
-      });
+      return res
+        .status(404)
+        .json({
+          error: {
+            code: "FROM_NUMBER_NOT_FOUND",
+            message:
+              "A configured from-number is required for scheduled outbound calls.",
+          },
+        });
     }
 
     const leads = await loadLeads(db, organizationId, leadIds);
     if (leads.length !== leadIds.length) {
-      return res.status(400).json({
-        error: {
-          code: "INVALID_LEADS",
-          message: "One or more leads were not found for this tenant.",
-        },
-      });
+      return res
+        .status(400)
+        .json({
+          error: {
+            code: "INVALID_LEADS",
+            message: "One or more leads were not found for this tenant.",
+          },
+        });
     }
 
     const row = {
@@ -290,9 +351,20 @@ router.post(
       from_number_id: number.id,
       from_number:
         number.phone_number || fromNumber || agent.twilio_phone_number || "",
-      lead_id: leadIds.length === 1 ? leadIds[0] : null,
+      lead_id:
+        leadIds.length === 1 && directRecipients.length === 0
+          ? leadIds[0]
+          : null,
       lead_ids: leadIds,
-      target_type: leadIds.length === 1 ? "lead" : "lead_list",
+      direct_recipients: directRecipients,
+      target_type:
+        directRecipients.length && leadIds.length
+          ? "mixed"
+          : directRecipients.length
+            ? "direct_numbers"
+            : leadIds.length === 1
+              ? "lead"
+              : "lead_list",
       name:
         String(body.name || "Scheduled outreach").trim() ||
         "Scheduled outreach",
@@ -341,6 +413,7 @@ router.post(
       metadata: {
         createdBy: req.user?.id || null,
         scheduleVersion: 1,
+        directRecipients,
         limits: {
           ...(body.limits && typeof body.limits === "object"
             ? body.limits
@@ -378,11 +451,13 @@ router.post(
       schedule,
       { replacePending: false },
     );
-    res.status(201).json({
-      success: true,
-      schedule: serializeSchedule(schedule),
-      generatedRuns: generated.inserted,
-    });
+    res
+      .status(201)
+      .json({
+        success: true,
+        schedule: serializeSchedule(schedule),
+        generatedRuns: generated.inserted,
+      });
   }),
 );
 

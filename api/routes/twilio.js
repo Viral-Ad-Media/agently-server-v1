@@ -640,68 +640,40 @@ router.post(
           .select("id, metadata")
           .eq("twilio_call_sid", CallSid)
           .maybeSingle();
-        const scheduleRunId =
-          scheduledRecord?.metadata?.scheduleRunId ||
-          scheduledRecord?.metadata?.billing?.run_id ||
-          null;
+        const scheduleRunId = scheduledRecord?.metadata?.scheduleRunId || scheduledRecord?.metadata?.billing?.run_id || null;
         if (scheduleRunId) {
-          const terminalStatuses = new Set([
-            "completed",
-            "failed",
-            "busy",
-            "no-answer",
-            "canceled",
-            "cancelled",
-          ]);
+          const terminalStatuses = new Set(["completed", "failed", "busy", "no-answer", "canceled", "cancelled"]);
           let runStatus = "queued_to_twilio";
           if (CallStatus === "completed") runStatus = "completed";
           else if (CallStatus === "no-answer") runStatus = "no_answer";
           else if (CallStatus === "busy") runStatus = "retry_scheduled";
-          else if (["failed", "canceled", "cancelled"].includes(CallStatus))
-            runStatus = "failed";
+          else if (["failed", "canceled", "cancelled"].includes(CallStatus)) runStatus = "failed";
           const patch = {
             status: runStatus,
             twilio_call_sid: CallSid,
             call_record_id: scheduledRecord.id,
-            outcome_metadata: {
-              twilioCallStatus: CallStatus,
-              answeredBy: AnsweredBy || "",
-              raw: req.body || {},
-            },
+            outcome_metadata: { twilioCallStatus: CallStatus, answeredBy: AnsweredBy || "", raw: req.body || {} },
             updated_at: new Date().toISOString(),
           };
-          if (terminalStatuses.has(CallStatus))
-            patch.completed_at = new Date().toISOString();
+          if (terminalStatuses.has(CallStatus)) patch.completed_at = new Date().toISOString();
           if (CallStatus === "busy") {
             const { data: existingRun } = await db
               .from("lead_outreach_runs")
-              .select(
-                "schedule_id, lead_id, voice_agent_id, from_number_id, destination_phone, target_phone, target_name, attempt_number, scheduled_for",
-              )
+              .select("schedule_id, lead_id, voice_agent_id, from_number_id, destination_phone, target_phone, target_name, attempt_number, scheduled_for")
               .eq("id", scheduleRunId)
               .maybeSingle();
             if (existingRun) {
-              const retryDelayMinutes = Number(
-                process.env.SCHEDULED_CALL_BUSY_RETRY_DELAY_MINUTES || 60,
-              );
-              patch.scheduled_for = new Date(
-                Date.now() + retryDelayMinutes * 60_000,
-              ).toISOString();
+              const retryDelayMinutes = Number(process.env.SCHEDULED_CALL_BUSY_RETRY_DELAY_MINUTES || 60);
+              patch.scheduled_for = new Date(Date.now() + retryDelayMinutes * 60_000).toISOString();
               patch.completed_at = null;
               patch.error_code = "BUSY_RETRY_SCHEDULED";
               patch.error_message = `Busy; retry scheduled in ${retryDelayMinutes} minutes.`;
             }
           }
-          await db
-            .from("lead_outreach_runs")
-            .update(patch)
-            .eq("id", scheduleRunId);
+          await db.from("lead_outreach_runs").update(patch).eq("id", scheduleRunId);
         }
       } catch (err) {
-        console.warn("[scheduled-outreach] run status update skipped", {
-          callSid: CallSid,
-          error: err.message || String(err),
-        });
+        console.warn("[scheduled-outreach] run status update skipped", { callSid: CallSid, error: err.message || String(err) });
       }
     }
 
