@@ -385,7 +385,19 @@ router.post(
       String(
         body.timezone || req.organization?.timezone || "America/New_York",
       ).trim() || "America/New_York";
-    const startAt = resolveStartAt(body, timezone);
+    let startAt = null;
+    try {
+      startAt = resolveStartAt(body, timezone);
+    } catch (err) {
+      return res.status(400).json({
+        error: {
+          code: "INVALID_SCHEDULE_TIME",
+          message:
+            "Schedule time could not be parsed. Please provide a valid date, time, and timezone.",
+          detail: err.message || String(err),
+        },
+      });
+    }
     const timesPerDay = normalizeTimesPerDay(
       body.timesPerDay || body.times_per_day,
       body.startTime || body.start_time || body.time || undefined,
@@ -416,6 +428,37 @@ router.post(
         error: {
           code: "START_AT_REQUIRED",
           message: "startAt is required as an ISO UTC timestamp.",
+        },
+      });
+    }
+
+    const scheduledAt = new Date(startAt);
+    if (Number.isNaN(scheduledAt.getTime())) {
+      return res.status(400).json({
+        error: {
+          code: "INVALID_SCHEDULE_TIME",
+          message:
+            "Schedule time could not be parsed. Please choose a valid future time.",
+          timezone,
+        },
+      });
+    }
+
+    const minimumLeadSeconds = Math.max(
+      0,
+      Number(process.env.SCHEDULE_MIN_LEAD_SECONDS || 60),
+    );
+    const earliestAllowed = new Date(Date.now() + minimumLeadSeconds * 1000);
+    if (scheduleType === "one_time" && scheduledAt < earliestAllowed) {
+      return res.status(400).json({
+        error: {
+          code: "SCHEDULE_TIME_IN_PAST",
+          message:
+            "Schedule time is already in the past. Please choose a future time.",
+          scheduledForUtc: scheduledAt.toISOString(),
+          earliestAllowedUtc: earliestAllowed.toISOString(),
+          minimumLeadSeconds,
+          timezone,
         },
       });
     }
