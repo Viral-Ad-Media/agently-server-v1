@@ -31,6 +31,20 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function oneTimeOverflowMode() {
+  const value = String(process.env.SCHEDULER_ONE_TIME_OVERFLOW_MODE || "fail")
+    .trim()
+    .toLowerCase();
+  return ["fail", "queue"].includes(value) ? value : "fail";
+}
+
+function isOneTimeOverflowFailEnabled(schedule) {
+  return (
+    String(schedule?.schedule_type || "") === "one_time" &&
+    oneTimeOverflowMode() === "fail"
+  );
+}
+
 function pagination(req) {
   const page = Math.max(1, parseInt(req.query.page || "1", 10));
   const limit = Math.min(
@@ -200,6 +214,35 @@ async function generateRunsForSchedule(
     });
   }
 
+  if (isOneTimeOverflowFailEnabled(schedule)) {
+    const limits = buildEffectiveSchedulerLimits({
+      schedule,
+      env: process.env,
+    });
+    const maxInitialCalls = Math.max(
+      1,
+      Number(limits.maxOrgConcurrentCalls || 1),
+    );
+    rows.forEach((row, index) => {
+      if (index >= maxInitialCalls) {
+        row.status = "failed";
+        row.completed_at = nowIso();
+        row.error_code = "ONE_TIME_CONCURRENCY_LIMIT_EXCEEDED";
+        row.error_message =
+          "This one-time batch exceeded the schedule concurrency limit. Add this recipient to the next batch if you want to call them.";
+        row.outcome_metadata = {
+          ...(row.outcome_metadata || {}),
+          outcome: "one_time_limit_exceeded",
+          displayOutcome: "one_time_limit_exceeded",
+          deferred_reason: null,
+          maxConcurrentCalls: maxInitialCalls,
+          overflowIndex: index + 1,
+          instruction: "add_to_next_batch",
+        };
+      }
+    });
+  }
+
   if (!rows.length) {
     await refreshScheduleProgress(db, organizationId, schedule.id);
     return { inserted: 0, runs: [] };
@@ -221,8 +264,12 @@ async function generateRunsForSchedule(
   const inserted = [];
   for (let i = 0; i < rowsToInsert.length; i += 100) {
     const chunk = rowsToInsert.slice(i, i + 100);
-    console.log("[outreach] creating run status=queued", {
+    console.log("[outreach] creating scheduled run rows", {
       count: chunk.length,
+      queued: chunk.filter((row) => row.status === "queued").length,
+      failedOverflow: chunk.filter(
+        (row) => row.error_code === "ONE_TIME_CONCURRENCY_LIMIT_EXCEEDED",
+      ).length,
       scheduleId: schedule.id,
     });
     const { data, error } = await db
@@ -371,35 +418,6 @@ router.post(
           message: "startAt is required as an ISO UTC timestamp.",
         },
       });
-    }
-    const startAtMs = new Date(startAt).getTime();
-    if (!Number.isFinite(startAtMs)) {
-      return res.status(400).json({
-        error: {
-          code: "INVALID_START_AT",
-          message:
-            "Schedule time is invalid. Please choose a valid future time.",
-        },
-      });
-    }
-    if (scheduleType === "one_time") {
-      const minLeadSeconds = Math.max(
-        0,
-        Number(process.env.SCHEDULE_MIN_LEAD_SECONDS || 60),
-      );
-      const minStartMs = Date.now() + minLeadSeconds * 1000;
-      if (startAtMs < minStartMs) {
-        return res.status(400).json({
-          error: {
-            code: "SCHEDULE_TIME_IN_PAST",
-            message:
-              "Schedule time is already in the past. Please choose a future time.",
-            minimumLeadSeconds: minLeadSeconds,
-            scheduledForUtc: new Date(startAtMs).toISOString(),
-            earliestAllowedUtc: new Date(minStartMs).toISOString(),
-          },
-        });
-      }
     }
 
     const agent = await ensureAgent(db, organizationId, voiceAgentId);
@@ -567,7 +585,10 @@ router.post(
       totalRecipients > effectiveLimits.maxOrgConcurrentCalls
         ? {
             code: "BATCH_EXCEEDS_CONCURRENCY_LIMIT",
-            message: `Your current plan allows ${effectiveLimits.maxOrgConcurrentCalls} concurrent calls. ${totalRecipients} recipients will be called in batches. Excess recipients will be queued for the next available slot.`,
+            message:
+              scheduleType === "one_time" && oneTimeOverflowMode() === "fail"
+                ? `Your current plan allows ${effectiveLimits.maxOrgConcurrentCalls} concurrent calls. ${totalRecipients} recipients were included, so excess recipients in this one-time batch will be marked as not called. Add them to the next batch if needed.`
+                : `Your current plan allows ${effectiveLimits.maxOrgConcurrentCalls} concurrent calls. ${totalRecipients} recipients will be called in batches. Excess recipients will be queued for the next available slot.`,
           }
         : null;
     res.status(201).json({
