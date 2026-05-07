@@ -372,6 +372,35 @@ router.post(
         },
       });
     }
+    const startAtMs = new Date(startAt).getTime();
+    if (!Number.isFinite(startAtMs)) {
+      return res.status(400).json({
+        error: {
+          code: "INVALID_START_AT",
+          message:
+            "Schedule time is invalid. Please choose a valid future time.",
+        },
+      });
+    }
+    if (scheduleType === "one_time") {
+      const minLeadSeconds = Math.max(
+        0,
+        Number(process.env.SCHEDULE_MIN_LEAD_SECONDS || 60),
+      );
+      const minStartMs = Date.now() + minLeadSeconds * 1000;
+      if (startAtMs < minStartMs) {
+        return res.status(400).json({
+          error: {
+            code: "SCHEDULE_TIME_IN_PAST",
+            message:
+              "Schedule time is already in the past. Please choose a future time.",
+            minimumLeadSeconds: minLeadSeconds,
+            scheduledForUtc: new Date(startAtMs).toISOString(),
+            earliestAllowedUtc: new Date(minStartMs).toISOString(),
+          },
+        });
+      }
+    }
 
     const agent = await ensureAgent(db, organizationId, voiceAgentId);
     if (!agent)
