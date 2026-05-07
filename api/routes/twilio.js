@@ -361,6 +361,8 @@ function buildRealtimeTwiml({
   leadId,
   callPurpose,
   customInstructions,
+  voiceProviderOverride,
+  voiceProviderFallbackReason,
 }) {
   const streamParams = {
     orgId: agent.organization_id,
@@ -374,6 +376,8 @@ function buildRealtimeTwiml({
     leadId: leadId || "",
     callPurpose: callPurpose || "",
     customInstructions: customInstructions || "",
+    voiceProviderOverride: voiceProviderOverride || "",
+    voiceProviderFallbackReason: voiceProviderFallbackReason || "",
   };
   const wsUrl = mediaStreamUrl(streamParams);
   const twiml = buildMediaStreamTwiml({
@@ -528,6 +532,12 @@ router.post(
     const callPurpose = req.query?.callPurpose || req.body?.callPurpose || "";
     const customInstructions =
       req.query?.customInstructions || req.body?.customInstructions || "";
+    const voiceProviderOverride =
+      req.query?.voiceProviderOverride || req.body?.voiceProviderOverride || "";
+    const voiceProviderFallbackReason =
+      req.query?.voiceProviderFallbackReason ||
+      req.body?.voiceProviderFallbackReason ||
+      "";
     const recipientPhone =
       req.query?.recipientPhone || req.body?.recipientPhone || toPhone;
 
@@ -585,6 +595,8 @@ router.post(
       leadId,
       callPurpose,
       customInstructions,
+      voiceProviderOverride,
+      voiceProviderFallbackReason,
     });
     res.setHeader("Content-Type", "text/xml");
     res.send(twiml);
