@@ -17,6 +17,10 @@ const {
   resolveStartAt,
   buildEffectiveSchedulerLimits,
   buildRunCandidates,
+  detailedOutcome,
+  displayStatusForRun,
+  durationSecondsForRun,
+  retryAtForRun,
   serializeSchedule,
   serializeRun,
 } = require("../../lib/outreach-utils");
@@ -234,6 +238,75 @@ async function generateRunsForSchedule(
   return { inserted: inserted.length, runs: inserted };
 }
 
+function buildScheduleStatusResponse(schedule, runs) {
+  const recipients = (runs || []).map((run) => ({
+    runId: run.id,
+    name: run.target_name || "Recipient",
+    phone: run.destination_phone || run.target_phone || "",
+    displayStatus: displayStatusForRun(run),
+    status: run.status,
+    twilioCallSid: run.twilio_call_sid || null,
+    callRecordId: run.call_record_id || null,
+    durationSeconds: durationSecondsForRun(run),
+    outcome: detailedOutcome(run),
+    retryAt: retryAtForRun(run),
+    errorCode: run.error_code || null,
+    errorMessage: run.error_message || null,
+    scheduledFor: run.scheduled_for || null,
+    startedAt: run.started_at || null,
+    completedAt: run.completed_at || null,
+  }));
+  const counts = {
+    totalRecipients: recipients.length,
+    queued: 0,
+    deferred: 0,
+    initiated: 0,
+    answered: 0,
+    completed: 0,
+    noAnswer: 0,
+    voicemail: 0,
+    busy: 0,
+    failed: 0,
+    retryScheduled: 0,
+  };
+  for (const recipient of recipients) {
+    if (recipient.outcome === "queued") counts.queued += 1;
+    else if (recipient.outcome === "deferred_concurrency_limit")
+      counts.deferred += 1;
+    else if (
+      recipient.outcome === "initiated" ||
+      recipient.status === "initiated"
+    )
+      counts.initiated += 1;
+    else if (recipient.outcome === "answered") counts.answered += 1;
+    else if (recipient.outcome === "completed") counts.completed += 1;
+    else if (recipient.outcome === "no_answer") counts.noAnswer += 1;
+    else if (recipient.outcome === "voicemail") counts.voicemail += 1;
+    else if (recipient.outcome === "busy") counts.busy += 1;
+    else if (recipient.outcome === "retry_scheduled")
+      counts.retryScheduled += 1;
+    else if (recipient.outcome === "failed") counts.failed += 1;
+  }
+  const nextQueued = (runs || [])
+    .filter((run) => String(run.status || "") === "queued")
+    .sort((a, b) =>
+      String(a.scheduled_for || "").localeCompare(
+        String(b.scheduled_for || ""),
+      ),
+    )[0];
+  return {
+    schedule: {
+      id: schedule.id,
+      name: schedule.name || "",
+      status:
+        schedule.status || (schedule.is_active === false ? "paused" : "active"),
+      ...counts,
+      nextRunAt: nextQueued?.scheduled_for || null,
+    },
+    recipients,
+  };
+}
+
 router.post(
   "/schedules",
   requireAuth,
@@ -275,14 +348,12 @@ router.post(
     );
 
     if (!voiceAgentId) {
-      return res
-        .status(400)
-        .json({
-          error: {
-            code: "VOICE_AGENT_REQUIRED",
-            message: "voiceAgentId is required.",
-          },
-        });
+      return res.status(400).json({
+        error: {
+          code: "VOICE_AGENT_REQUIRED",
+          message: "voiceAgentId is required.",
+        },
+      });
     }
     if (!leadIds.length && !directRecipients.length) {
       return res.status(400).json({
@@ -294,26 +365,22 @@ router.post(
       });
     }
     if (!startAt) {
-      return res
-        .status(400)
-        .json({
-          error: {
-            code: "START_AT_REQUIRED",
-            message: "startAt is required as an ISO UTC timestamp.",
-          },
-        });
+      return res.status(400).json({
+        error: {
+          code: "START_AT_REQUIRED",
+          message: "startAt is required as an ISO UTC timestamp.",
+        },
+      });
     }
 
     const agent = await ensureAgent(db, organizationId, voiceAgentId);
     if (!agent)
-      return res
-        .status(404)
-        .json({
-          error: {
-            code: "VOICE_AGENT_NOT_FOUND",
-            message: "Voice agent not found.",
-          },
-        });
+      return res.status(404).json({
+        error: {
+          code: "VOICE_AGENT_NOT_FOUND",
+          message: "Voice agent not found.",
+        },
+      });
 
     const number = await ensureFromNumber(db, organizationId, {
       fromNumberId,
@@ -321,27 +388,23 @@ router.post(
       voiceAgentId,
     });
     if (!number) {
-      return res
-        .status(404)
-        .json({
-          error: {
-            code: "FROM_NUMBER_NOT_FOUND",
-            message:
-              "A configured from-number is required for scheduled outbound calls.",
-          },
-        });
+      return res.status(404).json({
+        error: {
+          code: "FROM_NUMBER_NOT_FOUND",
+          message:
+            "A configured from-number is required for scheduled outbound calls.",
+        },
+      });
     }
 
     const leads = await loadLeads(db, organizationId, leadIds);
     if (leads.length !== leadIds.length) {
-      return res
-        .status(400)
-        .json({
-          error: {
-            code: "INVALID_LEADS",
-            message: "One or more leads were not found for this tenant.",
-          },
-        });
+      return res.status(400).json({
+        error: {
+          code: "INVALID_LEADS",
+          message: "One or more leads were not found for this tenant.",
+        },
+      });
     }
 
     const targetType =
@@ -465,13 +528,25 @@ router.post(
       schedule,
       { replacePending: false },
     );
-    res
-      .status(201)
-      .json({
-        success: true,
-        schedule: serializeSchedule(schedule),
-        generatedRuns: generated.inserted,
-      });
+    const effectiveLimits = buildEffectiveSchedulerLimits({
+      organization: req.organization || {},
+      schedule,
+      env: process.env,
+    });
+    const totalRecipients = leadIds.length + directRecipients.length;
+    const warning =
+      totalRecipients > effectiveLimits.maxOrgConcurrentCalls
+        ? {
+            code: "BATCH_EXCEEDS_CONCURRENCY_LIMIT",
+            message: `Your current plan allows ${effectiveLimits.maxOrgConcurrentCalls} concurrent calls. ${totalRecipients} recipients will be called in batches. Excess recipients will be queued for the next available slot.`,
+          }
+        : null;
+    res.status(201).json({
+      success: true,
+      schedule: serializeSchedule(schedule),
+      generatedRuns: generated.inserted,
+      warning,
+    });
   }),
 );
 
@@ -692,6 +767,41 @@ router.post(
 );
 
 router.get(
+  "/schedules/:id/status",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const [
+      { data: schedule, error: scheduleError },
+      { data: runs, error: runsError },
+    ] = await Promise.all([
+      db
+        .from("lead_outreach_schedules")
+        .select("*")
+        .eq("id", req.params.id)
+        .eq("organization_id", req.orgId)
+        .maybeSingle(),
+      db
+        .from("lead_outreach_runs")
+        .select("*")
+        .eq("schedule_id", req.params.id)
+        .eq("organization_id", req.orgId)
+        .order("scheduled_for", { ascending: true }),
+    ]);
+    if (scheduleError) throw scheduleError;
+    if (runsError) throw runsError;
+    if (!schedule)
+      return res
+        .status(404)
+        .json({ error: { message: "Schedule not found." } });
+    res.json({
+      success: true,
+      ...buildScheduleStatusResponse(schedule, runs || []),
+    });
+  }),
+);
+
+router.get(
   "/schedules/:id/runs",
   requireAuth,
   asyncHandler(async (req, res) => {
@@ -787,17 +897,17 @@ router.get(
         .gte("scheduled_for", today.toISOString()),
       db
         .from("lead_outreach_runs")
-        .select("id")
+        .select("id,status,outcome_metadata,scheduled_for")
         .eq("organization_id", req.orgId)
         .eq("status", "queued"),
       db
         .from("lead_outreach_runs")
-        .select("id")
+        .select("id,status,outcome_metadata,error_code,error_message")
         .eq("organization_id", req.orgId)
         .eq("status", "failed"),
       db
         .from("lead_outreach_runs")
-        .select("id")
+        .select("id,status,outcome_metadata,call_duration,completed_at")
         .eq("organization_id", req.orgId)
         .in("status", ["completed", "initiated"]),
     ]);
@@ -815,10 +925,28 @@ router.get(
       metrics: {
         scheduledCallsToday: (todayRuns || []).length,
         pendingScheduledCalls: (pendingRuns || []).length,
+        activeSchedules: (schedules || []).filter((s) => s.status === "active")
+          .length,
         activeCampaigns: (schedules || []).filter((s) => s.status === "active")
           .length,
+        scheduledRecipientsTotal: (todayRuns || []).length,
+        scheduledRecipientsCalled: (completedRuns || []).length,
+        scheduledRecipientsAnswered: (completedRuns || []).filter(
+          (run) => detailedOutcome(run) === "answered",
+        ).length,
+        scheduledRecipientsNoAnswer: (failedRuns || []).filter(
+          (run) => detailedOutcome(run) === "no_answer",
+        ).length,
+        scheduledRecipientsVoicemail: (completedRuns || []).filter(
+          (run) => detailedOutcome(run) === "voicemail",
+        ).length,
+        scheduledRecipientsDeferred: (pendingRuns || []).filter(
+          (run) => detailedOutcome(run) === "deferred_concurrency_limit",
+        ).length,
+        scheduledRecipientsFailed: (failedRuns || []).length,
         failedScheduledCalls: (failedRuns || []).length,
         callsCompletedFromCampaigns: (completedRuns || []).length,
+        nextScheduledCallAt: next.data?.scheduled_for || null,
         nextScheduledCallTime: next.data?.scheduled_for || null,
       },
     });

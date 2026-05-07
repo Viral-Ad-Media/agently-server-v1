@@ -85,11 +85,11 @@ const {
 
 const router = express.Router();
 
-const API_URL = () => (process.env.API_URL || "").replace(/\/$/, "");
+const API_URL = () => (process.env.API_URL || "").trim().replace(/\/+$/, "");
 
 /** WebSocket base URL — defaults to API_URL but can be overridden for separate WS server */
 const WS_URL = () => {
-  const explicit = (process.env.TWILIO_WS_URL || "").replace(/\/$/, "");
+  const explicit = (process.env.TWILIO_WS_URL || "").trim().replace(/\/+$/, "");
   if (explicit) return explicit;
   // Derive from API_URL: https://x.vercel.app → wss://x.vercel.app
   return API_URL().replace(/^https?:\/\//, "wss://");
@@ -105,7 +105,7 @@ function callRecordingEnabled() {
 
 function recordingStatusCallbackUrl() {
   const base = API_URL();
-  return base ? `${base}/api/twilio/recording-status` : "";
+  return base ? new URL("/api/twilio/recording-status", base).toString() : "";
 }
 
 function recordingStartTwiml() {
@@ -343,12 +343,12 @@ function hangupTwiml(
 
 function mediaStreamUrl(params) {
   const wsBase = WS_URL();
-  const query = new URLSearchParams();
+  const url = new URL("/api/twilio/media-stream", wsBase);
   Object.entries(params || {}).forEach(([key, value]) => {
     if (value === undefined || value === null || value === "") return;
-    query.set(key, String(value));
+    url.searchParams.set(key, String(value));
   });
-  return `${wsBase}/api/twilio/media-stream?${query.toString()}`;
+  return url.toString();
 }
 
 function buildRealtimeTwiml({
@@ -363,6 +363,8 @@ function buildRealtimeTwiml({
   customInstructions,
   voiceProviderOverride,
   voiceProviderFallbackReason,
+  scheduleId,
+  scheduleRunId,
 }) {
   const streamParams = {
     orgId: agent.organization_id,
@@ -378,6 +380,8 @@ function buildRealtimeTwiml({
     customInstructions: customInstructions || "",
     voiceProviderOverride: voiceProviderOverride || "",
     voiceProviderFallbackReason: voiceProviderFallbackReason || "",
+    scheduleId: scheduleId || "",
+    scheduleRunId: scheduleRunId || "",
   };
   const wsUrl = mediaStreamUrl(streamParams);
   const twiml = buildMediaStreamTwiml({
@@ -409,12 +413,12 @@ function outboundPurposeFromBody(body = {}) {
 }
 
 function encodeOutboundTwiMlUrl(base, params = {}) {
-  const query = new URLSearchParams();
+  const url = new URL("/api/twilio/outbound-twiml", base);
   Object.entries(params).forEach(([key, value]) => {
     if (value === undefined || value === null || value === "") return;
-    query.set(key, String(value));
+    url.searchParams.set(key, String(value));
   });
-  return `${base}/api/twilio/outbound-twiml?${query.toString()}`;
+  return url.toString();
 }
 
 function mediaStreamUrlPreview(params = {}) {
@@ -538,6 +542,9 @@ router.post(
       req.query?.voiceProviderFallbackReason ||
       req.body?.voiceProviderFallbackReason ||
       "";
+    const scheduleId = req.query?.scheduleId || req.body?.scheduleId || "";
+    const scheduleRunId =
+      req.query?.scheduleRunId || req.body?.scheduleRunId || "";
     const recipientPhone =
       req.query?.recipientPhone || req.body?.recipientPhone || toPhone;
 
@@ -597,6 +604,8 @@ router.post(
       customInstructions,
       voiceProviderOverride,
       voiceProviderFallbackReason,
+      scheduleId,
+      scheduleRunId,
     });
     res.setHeader("Content-Type", "text/xml");
     res.send(twiml);
@@ -612,6 +621,37 @@ router.get(
     );
   }),
 );
+
+function normalizeTwilioCallOutcome(callStatus, answeredBy, duration) {
+  const status = String(callStatus || "").toLowerCase();
+  const machine = /machine|fax/.test(String(answeredBy || "").toLowerCase());
+  const seconds = Number(duration || 0) || 0;
+  if (machine) return "voicemail";
+  if (status === "busy") return "busy";
+  if (status === "no-answer") return "no_answer";
+  if (["failed", "canceled", "cancelled"].includes(status)) return "failed";
+  if (status === "completed" && seconds > 0) return "answered";
+  if (status === "completed") return "completed";
+  if (status === "ringing") return "ringing";
+  if (status === "answered" || status === "in-progress") return "answered";
+  return status || "initiated";
+}
+
+function dbRunStatusFromOutcome(outcome, callStatus) {
+  if (["answered", "completed", "voicemail"].includes(outcome))
+    return "completed";
+  if (
+    ["busy", "no_answer", "failed", "canceled", "cancelled"].includes(outcome)
+  )
+    return "failed";
+  if (
+    ["ringing", "initiated", "in-progress", "answered"].includes(
+      String(callStatus || "").toLowerCase(),
+    )
+  )
+    return "initiated";
+  return "initiated";
+}
 
 // ─────────────────────────────────────────────────────────────
 // ── PUBLIC: Call Status Callback ─────────────────────────────
@@ -665,52 +705,100 @@ router.post(
             "canceled",
             "cancelled",
           ]);
-          let runStatus = "initiated";
-          if (CallStatus === "completed") runStatus = "completed";
-          else if (
-            ["no-answer", "busy", "failed", "canceled", "cancelled"].includes(
-              CallStatus,
+          const durationSeconds = Number(CallDuration || 0) || 0;
+          const outcome = normalizeTwilioCallOutcome(
+            CallStatus,
+            AnsweredBy,
+            durationSeconds,
+          );
+          let runStatus = dbRunStatusFromOutcome(outcome, CallStatus);
+          const { data: existingRun } = await db
+            .from("lead_outreach_runs")
+            .select(
+              "id,status,outcome_metadata,schedule_id,lead_id,voice_agent_id,from_number_id,destination_phone,target_phone,target_name,attempt_number,scheduled_for",
             )
-          )
-            runStatus = "failed";
+            .eq("id", scheduleRunId)
+            .maybeSingle();
+          const existingMeta =
+            existingRun?.outcome_metadata &&
+            typeof existingRun.outcome_metadata === "object"
+              ? existingRun.outcome_metadata
+              : {};
+          const voicemailDetected = outcome === "voicemail";
           const patch = {
             status: runStatus,
             twilio_call_sid: CallSid,
             call_record_id: scheduledRecord.id,
             outcome_metadata: {
+              ...existingMeta,
               twilioCallStatus: CallStatus,
+              callStatus: CallStatus,
               answeredBy: AnsweredBy || "",
+              callDuration: durationSeconds,
+              durationSeconds,
+              outcome,
+              outcomeSummary:
+                outcome === "answered"
+                  ? "Recipient answered the scheduled call."
+                  : outcome === "no_answer"
+                    ? "Recipient did not answer."
+                    : outcome === "voicemail"
+                      ? "Voicemail or machine detected."
+                      : outcome === "busy"
+                        ? "Recipient line was busy."
+                        : outcome === "failed"
+                          ? "Twilio reported the call failed."
+                          : `Twilio status: ${CallStatus || "unknown"}`,
+              voicemailDetected,
+              machineDetectionResult: AnsweredBy || "",
               raw: req.body || {},
             },
             updated_at: new Date().toISOString(),
           };
-          if (terminalStatuses.has(CallStatus))
+          if (
+            terminalStatuses.has(String(CallStatus || "").toLowerCase()) ||
+            ["completed", "failed", "busy", "no_answer", "voicemail"].includes(
+              outcome,
+            )
+          ) {
             patch.completed_at = new Date().toISOString();
-          if (CallStatus === "busy") {
-            const { data: existingRun } = await db
-              .from("lead_outreach_runs")
-              .select(
-                "schedule_id, lead_id, voice_agent_id, from_number_id, destination_phone, target_phone, target_name, attempt_number, scheduled_for",
-              )
-              .eq("id", scheduleRunId)
-              .maybeSingle();
-            if (existingRun) {
-              const retryDelayMinutes = Number(
-                process.env.SCHEDULED_CALL_BUSY_RETRY_DELAY_MINUTES || 60,
-              );
-              patch.scheduled_for = new Date(
-                Date.now() + retryDelayMinutes * 60_000,
-              ).toISOString();
-              patch.status = "queued";
-              patch.completed_at = null;
-              patch.error_code = "BUSY_RETRY_SCHEDULED";
-              patch.error_message = `Busy; retry scheduled in ${retryDelayMinutes} minutes.`;
-            }
+          }
+          if (
+            String(CallStatus || "").toLowerCase() === "busy" &&
+            existingRun
+          ) {
+            const retryDelayMinutes = Number(
+              process.env.SCHEDULED_CALL_BUSY_RETRY_DELAY_MINUTES || 60,
+            );
+            patch.scheduled_for = new Date(
+              Date.now() + retryDelayMinutes * 60_000,
+            ).toISOString();
+            patch.status = "queued";
+            patch.completed_at = null;
+            patch.error_code = "BUSY_RETRY_SCHEDULED";
+            patch.error_message = `Busy; retry scheduled in ${retryDelayMinutes} minutes.`;
+            patch.outcome_metadata = {
+              ...patch.outcome_metadata,
+              outcome: "retry_scheduled",
+              retryAt: patch.scheduled_for,
+            };
           }
           await db
             .from("lead_outreach_runs")
             .update(patch)
             .eq("id", scheduleRunId);
+          await db
+            .from("call_records")
+            .update({
+              status: CallStatus || undefined,
+              duration: durationSeconds || undefined,
+              outcome: outcome || undefined,
+              metadata: {
+                ...(scheduledRecord.metadata || {}),
+                scheduledOutcome: patch.outcome_metadata,
+              },
+            })
+            .eq("id", scheduledRecord.id);
         }
       } catch (err) {
         console.warn("[scheduled-outreach] run status update skipped", {
