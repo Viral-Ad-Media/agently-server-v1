@@ -155,11 +155,6 @@ safeMount("/api/calls", () => require("./routes/calls"), "calls");
 safeMount("/api/leads", () => require("./routes/leads"), "leads");
 safeMount("/api/outreach", () => require("./routes/outreach"), "outreach");
 safeMount(
-  "/api/call-schedules",
-  () => require("./routes/call-schedules"),
-  "call-schedules",
-);
-safeMount(
   "/api/chatbot-public",
   () => require("./routes/chatbot-public"),
   "chatbot-public",
@@ -176,11 +171,7 @@ safeMount(
   () => require("./routes/agent-voice-config"),
   "agent-voice-config",
 );
-safeMount(
-  "/api/notifications",
-  () => require("./routes/notifications"),
-  "notifications",
-);
+
 safeMount("/api", () => require("./routes/misc"), "misc");
 safeMount("/chatbot-widget", () => require("./routes/widget"), "widget");
 
