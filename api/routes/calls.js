@@ -317,4 +317,211 @@ ${transcriptLines || "No transcript available."}
   }),
 );
 
+// ── GET /api/calls ──────────────────────────────────────────
+router.get(
+  "/",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit || 25)));
+    const page = Math.max(1, Number(req.query.page || 1));
+    const from = (page - 1) * limit;
+    const to = from + limit - 1;
+    const { data, error, count } = await db
+      .from("call_records")
+      .select("*", { count: "exact" })
+      .eq("organization_id", req.orgId)
+      .order("created_at", { ascending: false })
+      .range(from, to);
+    if (error) throw error;
+    res.json({
+      success: true,
+      calls: (data || []).map(serializeCall),
+      page,
+      limit,
+      total: count || 0,
+    });
+  }),
+);
+
+// ── GET /api/calls/:id/messages ─────────────────────────────
+router.get(
+  "/:id/messages",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const { data: call, error } = await db
+      .from("call_records")
+      .select("id,transcript")
+      .eq("id", req.params.id)
+      .eq("organization_id", req.orgId)
+      .maybeSingle();
+    if (error || !call)
+      return res
+        .status(404)
+        .json({ error: { message: "Call record not found." } });
+    res.json({
+      success: true,
+      callId: call.id,
+      messages: call.transcript || [],
+    });
+  }),
+);
+
+// ── GET /api/calls/:id/transcript ───────────────────────────
+router.get(
+  "/:id/transcript",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const { data: call, error } = await db
+      .from("call_records")
+      .select("id,transcript,summary,outcome")
+      .eq("id", req.params.id)
+      .eq("organization_id", req.orgId)
+      .maybeSingle();
+    if (error || !call)
+      return res
+        .status(404)
+        .json({ error: { message: "Call record not found." } });
+    res.json({
+      success: true,
+      callId: call.id,
+      transcript: call.transcript || [],
+      summary: call.summary || "",
+      outcome: call.outcome || "",
+    });
+  }),
+);
+
+// ── POST /api/calls/:id/summarize ───────────────────────────
+router.post(
+  "/:id/summarize",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const { data: call, error } = await db
+      .from("call_records")
+      .select("id,transcript,outcome")
+      .eq("id", req.params.id)
+      .eq("organization_id", req.orgId)
+      .maybeSingle();
+    if (error || !call)
+      return res
+        .status(404)
+        .json({ error: { message: "Call record not found." } });
+    const transcriptText = (call.transcript || [])
+      .map(
+        (l) =>
+          `${l.speaker || l.role || "speaker"}: ${l.text || l.transcript || ""}`,
+      )
+      .join("\n");
+    const summary = await generateCallSummary(
+      transcriptText,
+      call.outcome || "completed",
+    );
+    await db
+      .from("call_records")
+      .update({ summary, updated_at: new Date().toISOString() })
+      .eq("id", call.id)
+      .eq("organization_id", req.orgId);
+    res.json({ success: true, callId: call.id, summary });
+  }),
+);
+
+// ── GET /api/calls/:id/unanswered-questions ─────────────────
+router.get(
+  "/:id/unanswered-questions",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const { data: call, error: callError } = await db
+      .from("call_records")
+      .select("id")
+      .eq("id", req.params.id)
+      .eq("organization_id", req.orgId)
+      .maybeSingle();
+    if (callError || !call)
+      return res
+        .status(404)
+        .json({ error: { message: "Call record not found." } });
+    const { data, error } = await db
+      .from("unanswered_questions")
+      .select("*")
+      .eq("organization_id", req.orgId)
+      .eq("call_record_id", call.id)
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    res.json({
+      success: true,
+      callId: call.id,
+      unansweredQuestions: data || [],
+    });
+  }),
+);
+
+// ── POST /api/calls/:id/end ─────────────────────────────────
+router.post(
+  "/:id/end",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const { data, error } = await db
+      .from("call_records")
+      .update({
+        status: "completed",
+        ended_at: new Date().toISOString(),
+        end_reason: req.body?.reason || "ended_by_user",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", req.params.id)
+      .eq("organization_id", req.orgId)
+      .select("*")
+      .maybeSingle();
+    if (error || !data)
+      return res
+        .status(404)
+        .json({ error: { message: "Call record not found." } });
+    res.json({ success: true, call: serializeCall(data) });
+  }),
+);
+
+// ── POST /api/calls/:id/transfer ────────────────────────────
+router.post(
+  "/:id/transfer",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const transferNumber = String(
+      req.body?.to || req.body?.number || "",
+    ).trim();
+    if (!transferNumber)
+      return res
+        .status(400)
+        .json({ error: { message: "Transfer number is required." } });
+    const { data, error } = await db
+      .from("call_records")
+      .update({
+        outcome: "Escalated",
+        end_reason: "transfer_requested",
+        metadata: { transferRequested: true, transferNumber },
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", req.params.id)
+      .eq("organization_id", req.orgId)
+      .select("*")
+      .maybeSingle();
+    if (error || !data)
+      return res
+        .status(404)
+        .json({ error: { message: "Call record not found." } });
+    res.json({
+      success: true,
+      message:
+        "Transfer request recorded. Active-call transfer is handled by the websocket/Twilio relay when available.",
+      call: serializeCall(data),
+    });
+  }),
+);
+
 module.exports = router;

@@ -3695,4 +3695,133 @@ router.get(
   }),
 );
 
+// ── Compatibility aliases requested by backend stabilization checklist ──
+router.get(
+  "/available-numbers",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    req.url =
+      "/numbers/search" +
+      (req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "");
+    return router.handle(req, res);
+  }),
+);
+
+router.get(
+  "/owned-numbers",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    req.url = "/numbers/owned";
+    return router.handle(req, res);
+  }),
+);
+
+router.get(
+  "/numbers",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    req.url = "/numbers/owned";
+    return router.handle(req, res);
+  }),
+);
+
+router.post(
+  "/purchase-number",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    req.url = "/numbers/purchase";
+    return router.handle(req, res);
+  }),
+);
+
+router.post(
+  "/numbers/:numberId/assign-agent",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const agentId =
+      req.body?.agentId || req.body?.voice_agent_id || req.body?.voiceAgentId;
+    if (!agentId)
+      return res
+        .status(400)
+        .json({ error: { message: "agentId is required." } });
+    const { data: number, error: numberError } = await db
+      .from("twilio_phone_numbers")
+      .select("*")
+      .eq("id", req.params.numberId)
+      .eq("organization_id", req.orgId)
+      .maybeSingle();
+    if (numberError) throw numberError;
+    if (!number)
+      return res.status(404).json({ error: { message: "Number not found." } });
+    const { data: agent, error: agentError } = await db
+      .from("voice_agents")
+      .select("id")
+      .eq("id", agentId)
+      .eq("organization_id", req.orgId)
+      .maybeSingle();
+    if (agentError) throw agentError;
+    if (!agent)
+      return res.status(404).json({ error: { message: "Agent not found." } });
+    const { data, error } = await db
+      .from("twilio_phone_numbers")
+      .update({
+        assigned_voice_agent_id: agentId,
+        assigned_agent_status: "assigned",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", number.id)
+      .eq("organization_id", req.orgId)
+      .select("*")
+      .maybeSingle();
+    if (error) throw error;
+    await db
+      .from("voice_agents")
+      .update({
+        twilio_phone_number: number.phone_number || "",
+        twilio_phone_sid: number.phone_sid || "",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", agentId)
+      .eq("organization_id", req.orgId);
+    res.json({ success: true, number: data });
+  }),
+);
+
+router.patch(
+  "/numbers/:numberId",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const allowed = [
+      "voice_url",
+      "voice_fallback_url",
+      "status_callback_url",
+      "sms_url",
+      "sms_fallback_url",
+      "selected_outbound_voice_countries",
+      "selected_sms_countries",
+      "configuration_status",
+      "overall_status",
+    ];
+    const updates = { updated_at: new Date().toISOString() };
+    for (const key of allowed)
+      if (req.body?.[key] !== undefined) updates[key] = req.body[key];
+    const { data, error } = await db
+      .from("twilio_phone_numbers")
+      .update(updates)
+      .eq("id", req.params.numberId)
+      .eq("organization_id", req.orgId)
+      .select("*")
+      .maybeSingle();
+    if (error) throw error;
+    if (!data)
+      return res.status(404).json({ error: { message: "Number not found." } });
+    res.json({ success: true, number: data });
+  }),
+);
+
 module.exports = router;
