@@ -24,6 +24,10 @@ const {
   serializeSchedule,
   serializeRun,
 } = require("../../lib/outreach-utils");
+const {
+  ScheduleValidationError,
+  generateScheduleOccurrences,
+} = require("../../lib/schedule-generator");
 
 const router = express.Router();
 
@@ -132,6 +136,199 @@ async function refreshScheduleProgress(db, organizationId, scheduleId) {
   return progress;
 }
 
+function scheduleValidationResponse(res, error) {
+  const details =
+    error?.details && typeof error.details === "object" ? error.details : {};
+  return res.status(400).json({
+    error: {
+      code: error.code || "INVALID_SCHEDULE",
+      message: error.message || "Invalid schedule configuration.",
+      ...details,
+    },
+  });
+}
+
+function maxGeneratedRuns() {
+  const parsed = parseInt(
+    String(process.env.MAX_GENERATED_RUNS_PER_SCHEDULE || "1000"),
+    10,
+  );
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1000;
+}
+
+function minScheduleLeadSeconds() {
+  const parsed = parseInt(
+    String(process.env.SCHEDULE_MIN_LEAD_SECONDS || "60"),
+    10,
+  );
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 60;
+}
+
+function recipientInputsFromLoaded({ leads = [], directRecipients = [] } = {}) {
+  const recipients = [];
+  for (const lead of leads || []) {
+    const destination = cleanPhone(lead.phone || lead.mobile || "");
+    if (!isE164(destination)) continue;
+    recipients.push({
+      type: "lead",
+      lead,
+      phone: destination,
+      name: lead.name || "Unknown",
+    });
+  }
+  for (const recipient of directRecipients || []) {
+    recipients.push({
+      type: "direct_number",
+      directRecipient: recipient,
+      phone: recipient.phone,
+      name: recipient.name || "Direct recipient",
+    });
+  }
+  return recipients;
+}
+
+function scheduleConfigFromBody(body = {}, scheduleType) {
+  return {
+    scheduleType,
+    startLocalDate:
+      body.startLocalDate ||
+      body.start_local_date ||
+      body.localDate ||
+      body.date ||
+      null,
+    startTime:
+      body.startTime || body.start_time || body.localTime || body.time || null,
+    startTimes: body.startTimes || body.start_times || null,
+    timezone: body.timezone || null,
+    batchMode: body.batchMode || body.batch_mode || null,
+    repeat: body.repeat || null,
+    monthEndBehavior: body.monthEndBehavior || body.month_end_behavior || null,
+    scheduleConfig: body.scheduleConfig || body.schedule_config || null,
+  };
+}
+
+function buildOccurrenceGeneration(
+  body,
+  { timezone, scheduleType, leads, directRecipients } = {},
+) {
+  return generateScheduleOccurrences({
+    ...body,
+    scheduleType,
+    timezone,
+    recipients: recipientInputsFromLoaded({ leads, directRecipients }),
+    maxGeneratedRuns: maxGeneratedRuns(),
+    minLeadSeconds: minScheduleLeadSeconds(),
+  });
+}
+
+function buildRunRowsFromOccurrences({
+  organizationId,
+  schedule,
+  occurrences,
+}) {
+  const rows = [];
+  for (const occurrence of occurrences || []) {
+    const recipient = occurrence.recipient || {};
+    const isLead = recipient.type === "lead" && recipient.lead?.id;
+    const phone = cleanPhone(recipient.phone || "");
+    if (!isE164(phone)) continue;
+    rows.push({
+      organization_id: organizationId,
+      schedule_id: schedule.id,
+      lead_id: isLead ? recipient.lead.id : null,
+      voice_agent_id: schedule.voice_agent_id,
+      from_number_id: schedule.from_number_id || null,
+      destination_phone: phone,
+      target_phone: phone,
+      target_name:
+        recipient.name ||
+        (isLead ? recipient.lead.name : "Direct recipient") ||
+        "Recipient",
+      run_key: `${isLead ? "lead:" + recipient.lead.id : "direct:" + phone}:${occurrence.scheduledForUtc}:${occurrence.occurrenceIndex || 1}`,
+      scheduled_for: occurrence.scheduledForUtc,
+      status: "queued",
+      attempt_number: 1,
+      outcome_metadata: {
+        scheduleType: schedule.schedule_type,
+        callPurpose: schedule.call_purpose || "",
+        targetType: isLead ? "lead" : "direct_number",
+        localDate: occurrence.localDate,
+        localTime: occurrence.localTime,
+        timezone: occurrence.timezone,
+        occurrenceIndex: occurrence.occurrenceIndex || null,
+        ...(isLead
+          ? {}
+          : {
+              directRecipient: recipient.directRecipient || {
+                name: recipient.name,
+                phone,
+              },
+            }),
+      },
+    });
+  }
+  return rows;
+}
+
+async function insertRunRows(db, organizationId, schedule, rows) {
+  if (isOneTimeOverflowFailEnabled(schedule)) {
+    const limits = buildEffectiveSchedulerLimits({
+      schedule,
+      env: process.env,
+    });
+    const maxInitialCalls = Math.max(
+      1,
+      Number(limits.maxOrgConcurrentCalls || 1),
+    );
+    rows.forEach((row, index) => {
+      if (index >= maxInitialCalls) {
+        row.status = "failed";
+        row.completed_at = nowIso();
+        row.error_code = "ONE_TIME_CONCURRENCY_LIMIT_EXCEEDED";
+        row.error_message =
+          "This one-time batch exceeded the schedule concurrency limit. Add this recipient to the next batch if you want to call them.";
+        row.outcome_metadata = {
+          ...(row.outcome_metadata || {}),
+          outcome: "one_time_limit_exceeded",
+          displayOutcome: "one_time_limit_exceeded",
+          deferred_reason: null,
+          maxConcurrentCalls: maxInitialCalls,
+          overflowIndex: index + 1,
+          instruction: "add_to_next_batch",
+        };
+      }
+    });
+  }
+
+  if (!rows.length) {
+    await refreshScheduleProgress(db, organizationId, schedule.id);
+    return { inserted: 0, runs: [] };
+  }
+
+  const inserted = [];
+  for (let i = 0; i < rows.length; i += 100) {
+    const chunk = rows.slice(i, i + 100);
+    console.log("[outreach] creating scheduled run rows", {
+      count: chunk.length,
+      queued: chunk.filter((row) => row.status === "queued").length,
+      failedOverflow: chunk.filter(
+        (row) => row.error_code === "ONE_TIME_CONCURRENCY_LIMIT_EXCEEDED",
+      ).length,
+      scheduleId: schedule.id,
+    });
+    const { data, error } = await db
+      .from("lead_outreach_runs")
+      .insert(chunk)
+      .select();
+    if (error) throw error;
+    inserted.push(...(data || []));
+    for (const run of data || [])
+      console.log("[outreach] run created id=", run.id);
+  }
+  await refreshScheduleProgress(db, organizationId, schedule.id);
+  return { inserted: inserted.length, runs: inserted };
+}
+
 async function generateRunsForSchedule(
   db,
   organizationId,
@@ -148,6 +345,54 @@ async function generateRunsForSchedule(
     schedule.direct_recipients || schedule.metadata?.directRecipients || [],
   );
   const leads = await loadLeads(db, organizationId, leadIds);
+
+  if (schedule.metadata?.scheduleConfig || schedule.metadata?.recurrenceRule) {
+    let generation = null;
+    try {
+      generation = generateScheduleOccurrences({
+        ...(schedule.metadata?.scheduleConfig || {}),
+        scheduleType: schedule.schedule_type,
+        timezone: schedule.timezone,
+        recipients: recipientInputsFromLoaded({ leads, directRecipients }),
+        maxGeneratedRuns: maxGeneratedRuns(),
+        minLeadSeconds: 0,
+      });
+    } catch (error) {
+      if (!(error instanceof ScheduleValidationError)) throw error;
+      generation = null;
+    }
+    if (generation) {
+      if (replacePending) {
+        await db
+          .from("lead_outreach_runs")
+          .delete()
+          .eq("organization_id", organizationId)
+          .eq("schedule_id", schedule.id)
+          .eq("status", "queued");
+      }
+      const rows = buildRunRowsFromOccurrences({
+        organizationId,
+        schedule,
+        occurrences: generation.occurrences,
+      });
+      const { data: existingRows, error: existingError } = await db
+        .from("lead_outreach_runs")
+        .select("run_key")
+        .eq("organization_id", organizationId)
+        .eq("schedule_id", schedule.id);
+      if (existingError) throw existingError;
+      const existingKeys = new Set(
+        (existingRows || []).map((row) => row.run_key).filter(Boolean),
+      );
+      return insertRunRows(
+        db,
+        organizationId,
+        schedule,
+        rows.filter((row) => !row.run_key || !existingKeys.has(row.run_key)),
+      );
+    }
+  }
+
   const scheduledTimes = buildRunCandidates(schedule, {
     horizonDays: Number(schedule.metadata?.generation_horizon_days || 30),
     maxRuns: Number(schedule.metadata?.generation_max_runs || 500),
@@ -355,6 +600,76 @@ function buildScheduleStatusResponse(schedule, runs) {
 }
 
 router.post(
+  "/schedules/preview",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const body = req.body || {};
+    const organizationId = req.orgId;
+    const leadIds = normalizeArray(
+      body.leadIds || body.lead_ids || body.leadId || body.lead_id,
+    ).filter(isUuid);
+    const directRecipients = normalizeDirectRecipients(
+      body.directRecipients ||
+        body.direct_recipients ||
+        body.directNumbers ||
+        body.direct_numbers ||
+        body.recipients ||
+        body.numbers ||
+        [],
+    );
+    if (!leadIds.length && !directRecipients.length) {
+      return res.status(400).json({
+        error: {
+          code: "RECIPIENTS_REQUIRED",
+          message:
+            "Provide at least one leadId or one direct recipient phone number.",
+        },
+      });
+    }
+    const timezone =
+      String(
+        body.timezone || req.organization?.timezone || "America/New_York",
+      ).trim() || "America/New_York";
+    const scheduleType = normalizeScheduleType(
+      body.scheduleType || body.schedule_type,
+    );
+    const leads = await loadLeads(db, organizationId, leadIds);
+    if (leads.length !== leadIds.length) {
+      return res.status(400).json({
+        error: {
+          code: "INVALID_LEADS",
+          message: "One or more leads were not found for this tenant.",
+        },
+      });
+    }
+    let generation;
+    try {
+      generation = buildOccurrenceGeneration(body, {
+        timezone,
+        scheduleType,
+        leads,
+        directRecipients,
+      });
+    } catch (error) {
+      if (error instanceof ScheduleValidationError)
+        return scheduleValidationResponse(res, error);
+      throw error;
+    }
+    res.json({
+      success: true,
+      timezone: generation.timezone,
+      scheduleType: generation.scheduleType,
+      recipientCount: generation.recipientCount,
+      totalRuns: generation.totalRuns,
+      preview: generation.preview,
+      warnings: generation.warnings || [],
+    });
+  }),
+);
+
+router.post(
   "/schedules",
   requireAuth,
   requireAdmin,
@@ -385,20 +700,8 @@ router.post(
       String(
         body.timezone || req.organization?.timezone || "America/New_York",
       ).trim() || "America/New_York";
-    let startAt = null;
-    try {
-      startAt = resolveStartAt(body, timezone);
-    } catch (err) {
-      return res.status(400).json({
-        error: {
-          code: "INVALID_SCHEDULE_TIME",
-          message:
-            "Schedule time could not be parsed. Please provide a valid date, time, and timezone.",
-          detail: err.message || String(err),
-        },
-      });
-    }
-    const timesPerDay = normalizeTimesPerDay(
+    let startAt = resolveStartAt(body, timezone);
+    let timesPerDay = normalizeTimesPerDay(
       body.timesPerDay || body.times_per_day,
       body.startTime || body.start_time || body.time || undefined,
     );
@@ -423,46 +726,6 @@ router.post(
         },
       });
     }
-    if (!startAt) {
-      return res.status(400).json({
-        error: {
-          code: "START_AT_REQUIRED",
-          message: "startAt is required as an ISO UTC timestamp.",
-        },
-      });
-    }
-
-    const scheduledAt = new Date(startAt);
-    if (Number.isNaN(scheduledAt.getTime())) {
-      return res.status(400).json({
-        error: {
-          code: "INVALID_SCHEDULE_TIME",
-          message:
-            "Schedule time could not be parsed. Please choose a valid future time.",
-          timezone,
-        },
-      });
-    }
-
-    const minimumLeadSeconds = Math.max(
-      0,
-      Number(process.env.SCHEDULE_MIN_LEAD_SECONDS || 60),
-    );
-    const earliestAllowed = new Date(Date.now() + minimumLeadSeconds * 1000);
-    if (scheduleType === "one_time" && scheduledAt < earliestAllowed) {
-      return res.status(400).json({
-        error: {
-          code: "SCHEDULE_TIME_IN_PAST",
-          message:
-            "Schedule time is already in the past. Please choose a future time.",
-          scheduledForUtc: scheduledAt.toISOString(),
-          earliestAllowedUtc: earliestAllowed.toISOString(),
-          minimumLeadSeconds,
-          timezone,
-        },
-      });
-    }
-
     const agent = await ensureAgent(db, organizationId, voiceAgentId);
     if (!agent)
       return res.status(404).json({
@@ -496,6 +759,28 @@ router.post(
         },
       });
     }
+
+    let generation;
+    try {
+      generation = buildOccurrenceGeneration(body, {
+        timezone,
+        scheduleType,
+        leads,
+        directRecipients,
+      });
+    } catch (error) {
+      if (error instanceof ScheduleValidationError)
+        return scheduleValidationResponse(res, error);
+      throw error;
+    }
+    startAt = generation.firstRunAt;
+    timesPerDay = [
+      ...new Set(
+        (generation.occurrences || [])
+          .map((item) => item.localTime)
+          .filter(Boolean),
+      ),
+    ].sort();
 
     const targetType =
       directRecipients.length && leadIds.length
@@ -581,6 +866,20 @@ router.post(
         createdBy: req.user?.id || null,
         scheduleVersion: 1,
         directRecipients,
+        scheduleConfig: scheduleConfigFromBody(body, scheduleType),
+        recurrenceRule: {
+          type: generation.scheduleType,
+          timezone: generation.timezone,
+          totalRuns: generation.totalRuns,
+          firstRunAt: generation.firstRunAt,
+          lastRunAt: generation.lastRunAt,
+          preview: generation.preview,
+        },
+        generation: {
+          totalRuns: generation.totalRuns,
+          firstRunAt: generation.firstRunAt,
+          lastRunAt: generation.lastRunAt,
+        },
         limits: {
           ...(body.limits && typeof body.limits === "object"
             ? body.limits
@@ -612,11 +911,15 @@ router.post(
       .single();
     if (error) throw error;
 
-    const generated = await generateRunsForSchedule(
+    const generated = await insertRunRows(
       db,
       organizationId,
       schedule,
-      { replacePending: false },
+      buildRunRowsFromOccurrences({
+        organizationId,
+        schedule,
+        occurrences: generation.occurrences,
+      }),
     );
     const effectiveLimits = buildEffectiveSchedulerLimits({
       organization: req.organization || {},
@@ -633,12 +936,17 @@ router.post(
                 ? `Your current plan allows ${effectiveLimits.maxOrgConcurrentCalls} concurrent calls. ${totalRecipients} recipients were included, so excess recipients in this one-time batch will be marked as not called. Add them to the next batch if needed.`
                 : `Your current plan allows ${effectiveLimits.maxOrgConcurrentCalls} concurrent calls. ${totalRecipients} recipients will be called in batches. Excess recipients will be queued for the next available slot.`,
           }
-        : null;
+        : generation.warnings?.[0] || null;
     res.status(201).json({
       success: true,
       schedule: serializeSchedule(schedule),
       generatedRuns: generated.inserted,
       warning,
+      preview: {
+        firstRunAt: generation.firstRunAt,
+        lastRunAt: generation.lastRunAt,
+        totalRuns: generation.totalRuns,
+      },
     });
   }),
 );
