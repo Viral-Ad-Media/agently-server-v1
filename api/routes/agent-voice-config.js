@@ -63,6 +63,55 @@ function pick(body, ...names) {
   return undefined;
 }
 
+function toFrontendVoice(voice) {
+  const voiceId = voice.voice_id || voice.voiceId || voice.id;
+  const name = voice.name || voice.displayName || voice.display_name || voiceId;
+  const metadata =
+    voice.metadata && typeof voice.metadata === "object" ? voice.metadata : {};
+  const previewUrl =
+    voice.preview_url || voice.previewUrl || metadata.preview_url || null;
+  const labels = voice.labels || metadata.labels || {};
+  return {
+    id: voiceId,
+    provider: "elevenlabs",
+    name,
+    displayName: name,
+    voice_id: voiceId,
+    voiceId,
+    category: voice.category || metadata.category || null,
+    labels,
+    gender: voice.gender || labels.gender || null,
+    language: voice.language || labels.language || labels.languages || null,
+    accent: voice.accent || labels.accent || null,
+    model_id:
+      voice.model_id ||
+      voice.modelId ||
+      process.env.ELEVENLABS_DEFAULT_MODEL ||
+      "eleven_flash_v2_5",
+    modelId:
+      voice.modelId ||
+      voice.model_id ||
+      process.env.ELEVENLABS_DEFAULT_MODEL ||
+      "eleven_flash_v2_5",
+    preview_url: previewUrl,
+    previewUrl,
+    previewAvailable: Boolean(previewUrl || voiceId),
+    metadata,
+  };
+}
+
+function wantsJsonAudio(req) {
+  const body = req.body || {};
+  const accept = String(req.headers.accept || "").toLowerCase();
+  return (
+    body.returnJson === true ||
+    body.return_json === true ||
+    body.returnBase64 === true ||
+    body.return_base64 === true ||
+    accept.includes("application/json")
+  );
+}
+
 function buildVoiceUpdates(body = {}) {
   const updates = {};
   const provider = pick(body, "voice_provider", "voiceProvider", "provider");
@@ -132,13 +181,17 @@ router.get(
     const db = getSupabase();
     const agent = await loadAgent(db, req.orgId, req.params.agentId);
     if (!agent)
-      return res
-        .status(404)
-        .json({
-          success: false,
-          error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
-        });
-    const result = await listVoiceCatalog({ db, provider: "elevenlabs" });
+      return res.status(404).json({
+        success: false,
+        error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
+      });
+    const source = String(req.query.source || "api").toLowerCase();
+    const result = await listVoiceCatalog({
+      db,
+      provider: "elevenlabs",
+      source,
+      preferApi: source !== "catalog",
+    });
     res.json({
       success: true,
       agentId: agent.id,
@@ -149,7 +202,8 @@ router.get(
         elevenlabs_voice_name: agent.elevenlabs_voice_name || null,
         voice_settings: agent.voice_settings || {},
       },
-      voices: result.voices,
+      voices: result.voices.map(toFrontendVoice),
+      count: result.voices.length,
       source: result.source,
       warning: result.warning || undefined,
     });
@@ -162,12 +216,10 @@ router.get(
     const db = getSupabase();
     const agent = await loadAgent(db, req.orgId, req.params.agentId);
     if (!agent)
-      return res
-        .status(404)
-        .json({
-          success: false,
-          error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
-        });
+      return res.status(404).json({
+        success: false,
+        error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
+      });
     res.json({
       success: true,
       agentId: agent.id,
@@ -205,22 +257,18 @@ router.patch(
       .select(AGENT_SELECT)
       .maybeSingle();
     if (error)
-      return res
-        .status(500)
-        .json({
-          success: false,
-          error: {
-            code: error.code || "UPDATE_FAILED",
-            message: error.message || "Failed to update voice config.",
-          },
-        });
+      return res.status(500).json({
+        success: false,
+        error: {
+          code: error.code || "UPDATE_FAILED",
+          message: error.message || "Failed to update voice config.",
+        },
+      });
     if (!data)
-      return res
-        .status(404)
-        .json({
-          success: false,
-          error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
-        });
+      return res.status(404).json({
+        success: false,
+        error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
+      });
     res.json({
       success: true,
       agent: serializeAgent(data, []),
@@ -245,22 +293,18 @@ async function updateAgentVoice(req, res) {
     .select(AGENT_SELECT)
     .maybeSingle();
   if (error)
-    return res
-      .status(500)
-      .json({
-        success: false,
-        error: {
-          code: error.code || "UPDATE_FAILED",
-          message: error.message || "Failed to update voice.",
-        },
-      });
+    return res.status(500).json({
+      success: false,
+      error: {
+        code: error.code || "UPDATE_FAILED",
+        message: error.message || "Failed to update voice.",
+      },
+    });
   if (!data)
-    return res
-      .status(404)
-      .json({
-        success: false,
-        error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
-      });
+    return res.status(404).json({
+      success: false,
+      error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
+    });
   res.json({ success: true, agent: serializeAgent(data, []) });
 }
 
@@ -284,12 +328,10 @@ router.post(
     const db = getSupabase();
     const agent = await loadAgent(db, req.orgId, req.params.agentId);
     if (!agent)
-      return res
-        .status(404)
-        .json({
-          success: false,
-          error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
-        });
+      return res.status(404).json({
+        success: false,
+        error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
+      });
     const body = req.body || {};
     const voiceId =
       body.elevenlabs_voice_id ||
@@ -311,11 +353,22 @@ router.post(
       voiceSettings:
         body.voiceSettings || body.voice_settings || agent.voice_settings || {},
     });
-    res.setHeader("Content-Type", audio.mimeType || "audio/mpeg");
-    res.setHeader("Content-Length", String(audio.buffer.length));
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("X-Voice-Provider", "elevenlabs");
     res.setHeader("X-Voice-Id", voice.voiceId);
+    if (wantsJsonAudio(req)) {
+      return res.json({
+        success: true,
+        provider: "elevenlabs",
+        voice_id: voice.voiceId,
+        voiceId: voice.voiceId,
+        mimeType: audio.mimeType || "audio/mpeg",
+        audioBase64: audio.buffer.toString("base64"),
+        size: audio.buffer.length,
+      });
+    }
+    res.setHeader("Content-Type", audio.mimeType || "audio/mpeg");
+    res.setHeader("Content-Length", String(audio.buffer.length));
     res.status(200).send(audio.buffer);
   }),
 );
