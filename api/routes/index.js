@@ -23,6 +23,10 @@ const miscRoutes = require("./routes/misc");
 const widgetRoutes = require("./routes/widget");
 const chatbotPublicRoutes = require("./routes/chatbot-public");
 const twilioRoutes = require("./routes/twilio");
+const notificationsRoutes = require("./routes/notifications");
+const elevenlabsRoutes = require("./routes/elevenlabs");
+const voicesRoutes = require("./routes/voices");
+const agentVoiceConfigRoutes = require("./routes/agent-voice-config");
 const { errorHandler } = require("../middleware/error");
 
 const app = express();
@@ -84,6 +88,10 @@ app.use("/api/leads", leadsRoutes);
 app.use("/api/outreach", outreachRoutes);
 app.use("/api/chatbot-public", chatbotPublicRoutes);
 app.use("/api/twilio", twilioRoutes); // ← NEW: all Twilio routes
+app.use("/api/notifications", notificationsRoutes);
+app.use("/api/elevenlabs", elevenlabsRoutes);
+app.use("/api/voices", voicesRoutes);
+app.use("/api/agents", agentVoiceConfigRoutes);
 app.use("/api", miscRoutes); // team, billing, settings, contact
 
 app.use("/chatbot-widget", widgetRoutes);
