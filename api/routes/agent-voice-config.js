@@ -11,6 +11,10 @@ const {
   synthesizeElevenLabsPreview,
   normalizePreviewText,
 } = require("../../lib/elevenlabs");
+const {
+  synthesizeOpenAIPreview,
+  normalizePreviewText: normalizeOpenAIPreviewText,
+} = require("../../lib/openai-voices");
 
 const router = express.Router();
 
@@ -89,6 +93,18 @@ function normalizeOpenAiSettings(value = {}) {
 function pick(body, ...names) {
   for (const name of names) if (body[name] !== undefined) return body[name];
   return undefined;
+}
+
+function wantsJsonAudio(req) {
+  const body = req.body || {};
+  const accept = String(req.headers.accept || "").toLowerCase();
+  return (
+    body.returnJson === true ||
+    body.return_json === true ||
+    body.returnBase64 === true ||
+    body.return_base64 === true ||
+    accept.includes("application/json")
+  );
 }
 
 function buildVoiceUpdates(body = {}) {
@@ -380,9 +396,87 @@ router.post(
         success: false,
         error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
       });
+
     const body = req.body || {};
+    const provider = normalizeProvider(
+      body.voice_provider ||
+        body.voiceProvider ||
+        body.provider ||
+        agent.voice_provider,
+      "openai",
+    );
+    const settings =
+      body.voiceSettings || body.voice_settings || agent.voice_settings || {};
+
+    if (provider === "openai") {
+      const voiceId =
+        body.openai_voice_id ||
+        body.openaiVoiceId ||
+        body.voiceId ||
+        body.voice_id ||
+        body.voice ||
+        agent.voice_id ||
+        agent.voice ||
+        process.env.OPENAI_TTS_DEFAULT_VOICE ||
+        "alloy";
+      const audio = await synthesizeOpenAIPreview({
+        voiceId,
+        text: normalizeOpenAIPreviewText(
+          body.text ||
+            agent.greeting ||
+            "Hello, this is an OpenAI voice test from Agently.",
+        ),
+        model:
+          body.model ||
+          body.model_id ||
+          body.modelId ||
+          settings.model ||
+          process.env.OPENAI_TTS_MODEL ||
+          "gpt-4o-mini-tts",
+        responseFormat:
+          body.response_format ||
+          body.responseFormat ||
+          body.output_format ||
+          body.outputFormat ||
+          settings.response_format ||
+          settings.responseFormat ||
+          process.env.OPENAI_TTS_RESPONSE_FORMAT ||
+          "mp3",
+        speed:
+          body.speed || settings.speed || process.env.OPENAI_TTS_SPEED || 1,
+        instructions:
+          body.instructions ||
+          settings.instructions ||
+          process.env.OPENAI_TTS_INSTRUCTIONS ||
+          "",
+      });
+
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("X-Voice-Provider", "openai");
+      res.setHeader("X-Voice-Id", audio.voiceId);
+      res.setHeader("X-OpenAI-TTS-Model", audio.model);
+      res.setHeader("X-OpenAI-Response-Format", audio.responseFormat);
+      if (wantsJsonAudio(req)) {
+        return res.json({
+          success: true,
+          provider: "openai",
+          voice_id: audio.voiceId,
+          voiceId: audio.voiceId,
+          model: audio.model,
+          responseFormat: audio.responseFormat,
+          mimeType: audio.mimeType || "audio/mpeg",
+          audioBase64: audio.buffer.toString("base64"),
+          size: audio.buffer.length,
+        });
+      }
+      res.setHeader("Content-Type", audio.mimeType || "audio/mpeg");
+      res.setHeader("Content-Length", String(audio.buffer.length));
+      return res.status(200).send(audio.buffer);
+    }
+
     const voiceId =
       body.elevenlabs_voice_id ||
+      body.elevenLabsVoiceId ||
       body.voiceId ||
       body.voice_id ||
       agent.elevenlabs_voice_id ||
@@ -398,15 +492,25 @@ router.post(
       text,
       modelId: body.modelId || body.model_id || voice.modelId,
       outputFormat: body.outputFormat || body.output_format,
-      voiceSettings:
-        body.voiceSettings || body.voice_settings || agent.voice_settings || {},
+      voiceSettings: settings,
     });
-    res.setHeader("Content-Type", audio.mimeType || "audio/mpeg");
-    res.setHeader("Content-Length", String(audio.buffer.length));
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("X-Voice-Provider", "elevenlabs");
     res.setHeader("X-Voice-Id", voice.voiceId);
-    res.status(200).send(audio.buffer);
+    if (wantsJsonAudio(req)) {
+      return res.json({
+        success: true,
+        provider: "elevenlabs",
+        voice_id: voice.voiceId,
+        voiceId: voice.voiceId,
+        mimeType: audio.mimeType || "audio/mpeg",
+        audioBase64: audio.buffer.toString("base64"),
+        size: audio.buffer.length,
+      });
+    }
+    res.setHeader("Content-Type", audio.mimeType || "audio/mpeg");
+    res.setHeader("Content-Length", String(audio.buffer.length));
+    return res.status(200).send(audio.buffer);
   }),
 );
 
