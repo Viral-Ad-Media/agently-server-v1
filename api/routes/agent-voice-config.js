@@ -9,16 +9,11 @@ const {
   listVoiceCatalog,
   resolveVoice,
   synthesizeElevenLabsPreview,
-  normalizePreviewText: normalizeElevenLabsPreviewText,
+  normalizePreviewText,
 } = require("../../lib/elevenlabs");
-const {
-  listOpenAIVoices,
-  normalizeVoiceId: normalizeOpenAIVoiceId,
-  synthesizeOpenAIPreview,
-  normalizePreviewText: normalizeOpenAIPreviewText,
-} = require("../../lib/openai-voices");
 
 const router = express.Router();
+
 const AGENT_SELECT = "*";
 
 function normalizeProvider(value, fallback = "openai") {
@@ -63,17 +58,13 @@ function normalizeElevenLabsSettings(value = {}) {
   };
 }
 
-function normalizeOpenAISettings(value = {}) {
+function normalizeOpenAiSettings(value = {}) {
   const input =
     value && typeof value === "object" && !Array.isArray(value) ? value : {};
-  const speed = Number(input.speed ?? process.env.OPENAI_TTS_SPEED ?? 1);
-  const settings = {
+  const speedNum = Number(input.speed ?? process.env.OPENAI_TTS_SPEED ?? 1);
+  return {
     model: String(
-      input.model ||
-        input.model_id ||
-        input.modelId ||
-        process.env.OPENAI_TTS_MODEL ||
-        "gpt-4o-mini-tts",
+      input.model || process.env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts",
     ),
     response_format: String(
       input.response_format ||
@@ -81,13 +72,18 @@ function normalizeOpenAISettings(value = {}) {
         process.env.OPENAI_TTS_RESPONSE_FORMAT ||
         "mp3",
     ),
-    speed: Math.max(0.25, Math.min(4, Number.isFinite(speed) ? speed : 1)),
+    speed: Math.max(
+      0.25,
+      Math.min(4, Number.isFinite(speedNum) ? speedNum : 1),
+    ),
+    ...(input.instructions || process.env.OPENAI_TTS_INSTRUCTIONS
+      ? {
+          instructions: String(
+            input.instructions || process.env.OPENAI_TTS_INSTRUCTIONS,
+          ),
+        }
+      : {}),
   };
-  const instructions = String(
-    input.instructions || process.env.OPENAI_TTS_INSTRUCTIONS || "",
-  ).trim();
-  if (instructions) settings.instructions = instructions.slice(0, 1000);
-  return settings;
 }
 
 function pick(body, ...names) {
@@ -95,88 +91,23 @@ function pick(body, ...names) {
   return undefined;
 }
 
-function wantsJsonAudio(req) {
-  const body = req.body || {};
-  const accept = String(req.headers.accept || "").toLowerCase();
-  return (
-    body.returnJson === true ||
-    body.return_json === true ||
-    body.returnBase64 === true ||
-    body.return_base64 === true ||
-    accept.includes("application/json")
-  );
-}
-
-function toElevenLabsFrontendVoice(voice) {
-  const voiceId = voice.voice_id || voice.voiceId || voice.id;
-  const name = voice.name || voice.displayName || voice.display_name || voiceId;
-  const metadata =
-    voice.metadata && typeof voice.metadata === "object" ? voice.metadata : {};
-  const previewUrl =
-    voice.preview_url || voice.previewUrl || metadata.preview_url || null;
-  const labels = voice.labels || metadata.labels || {};
-  return {
-    id: voiceId,
-    provider: "elevenlabs",
-    name,
-    displayName: name,
-    voice_id: voiceId,
-    voiceId,
-    category: voice.category || metadata.category || null,
-    labels,
-    gender: voice.gender || labels.gender || null,
-    language: voice.language || labels.language || labels.languages || null,
-    accent: voice.accent || labels.accent || null,
-    model_id:
-      voice.model_id ||
-      voice.modelId ||
-      process.env.ELEVENLABS_DEFAULT_MODEL ||
-      "eleven_flash_v2_5",
-    modelId:
-      voice.modelId ||
-      voice.model_id ||
-      process.env.ELEVENLABS_DEFAULT_MODEL ||
-      "eleven_flash_v2_5",
-    preview_url: previewUrl,
-    previewUrl,
-    previewAvailable: Boolean(previewUrl || voiceId),
-    metadata,
-  };
-}
-
 function buildVoiceUpdates(body = {}) {
   const updates = {};
-  const provider = normalizeProvider(
-    pick(body, "voice_provider", "voiceProvider", "provider"),
-    "openai",
+  const providerInput = pick(
+    body,
+    "voice_provider",
+    "voiceProvider",
+    "provider",
   );
-  const providerWasProvided =
-    pick(body, "voice_provider", "voiceProvider", "provider") !== undefined;
+  const provider =
+    providerInput !== undefined
+      ? normalizeProvider(providerInput, "openai")
+      : undefined;
   const settings = pick(body, "voice_settings", "voiceSettings");
 
-  if (providerWasProvided) updates.voice_provider = provider;
+  if (provider !== undefined) updates.voice_provider = provider;
 
-  if (provider === "openai") {
-    const rawOpenAIVoice = pick(
-      body,
-      "openai_voice_id",
-      "openaiVoiceId",
-      "voiceId",
-      "voice_id",
-      "voice",
-    );
-    if (rawOpenAIVoice !== undefined || providerWasProvided) {
-      updates.voice_id = normalizeOpenAIVoiceId(
-        rawOpenAIVoice,
-        process.env.OPENAI_TTS_DEFAULT_VOICE || "alloy",
-      );
-      updates.voice_catalog_id = null;
-      updates.elevenlabs_voice_id = null;
-      updates.elevenlabs_voice_name = null;
-    }
-    if (settings !== undefined)
-      updates.voice_settings = normalizeOpenAISettings(settings || {});
-  } else {
+  if (provider === "elevenlabs") {
     const elevenId = pick(
       body,
       "elevenlabs_voice_id",
@@ -190,16 +121,47 @@ function buildVoiceUpdates(body = {}) {
       "elevenLabsVoiceName",
       "voiceName",
       "voice_name",
+      "displayName",
+      "name",
     );
-    if (elevenId !== undefined) {
-      updates.elevenlabs_voice_id = String(elevenId || "").trim() || null;
-      updates.voice_id = updates.elevenlabs_voice_id;
-      updates.voice_catalog_id = null;
-    }
-    if (elevenName !== undefined)
-      updates.elevenlabs_voice_name = String(elevenName || "").trim() || null;
+    const normalizedId = String(elevenId || "").trim() || null;
+    const normalizedName = String(elevenName || "").trim() || null;
+
+    updates.elevenlabs_voice_id = normalizedId;
+    updates.elevenlabs_voice_name = normalizedName;
+    updates.voice_id = normalizedId;
+    // Keep the legacy display column synchronized so old list endpoints do not show stale Sarah/Josh/Domi values.
+    updates.voice = normalizedName || normalizedId || null;
+    updates.voice_catalog_id = null;
     if (settings !== undefined)
       updates.voice_settings = normalizeElevenLabsSettings(settings || {});
+  } else if (provider === "openai") {
+    const openAiId = pick(
+      body,
+      "openai_voice_id",
+      "openaiVoiceId",
+      "voice_id",
+      "voiceId",
+      "voice",
+    );
+    const normalizedId =
+      String(
+        openAiId || process.env.OPENAI_TTS_DEFAULT_VOICE || "alloy",
+      ).trim() || "alloy";
+
+    updates.voice_id = normalizedId;
+    updates.voice = normalizedId;
+    updates.elevenlabs_voice_id = null;
+    updates.elevenlabs_voice_name = null;
+    updates.voice_catalog_id = null;
+    updates.voice_settings = normalizeOpenAiSettings(settings || {});
+  } else {
+    const genericVoice = pick(body, "voice", "voice_id", "voiceId");
+    if (genericVoice !== undefined) {
+      updates.voice = String(genericVoice || "").trim() || null;
+      updates.voice_id = updates.voice;
+    }
+    if (settings !== undefined) updates.voice_settings = settings || {};
   }
 
   const passthrough = {
@@ -240,67 +202,38 @@ router.get(
     const db = getSupabase();
     const agent = await loadAgent(db, req.orgId, req.params.agentId);
     if (!agent)
-      return res
-        .status(404)
-        .json({
-          success: false,
-          error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
-        });
-    const provider = normalizeProvider(
-      req.query.provider || agent.voice_provider || "openai",
-      "openai",
-    );
-
-    if (provider === "openai") {
-      const result = listOpenAIVoices({
-        model:
-          req.query.model || req.query.model_id || agent.voice_settings?.model,
+      return res.status(404).json({
+        success: false,
+        error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
       });
-      return res.json({
-        success: true,
-        agentId: agent.id,
-        provider: "openai",
-        current: {
-          voice_provider: agent.voice_provider || "openai",
-          voice_id:
-            agent.voice_id || process.env.OPENAI_TTS_DEFAULT_VOICE || "alloy",
-          openai_voice_id:
-            agent.voice_id || process.env.OPENAI_TTS_DEFAULT_VOICE || "alloy",
-          voice_settings: agent.voice_settings || {},
-        },
-        voices: result.voices,
-        count: result.voices.length,
-        source: result.source,
-        model: result.model,
-      });
-    }
-
-    const source = String(req.query.source || "api").toLowerCase();
-    const result = await listVoiceCatalog({
-      db,
-      provider: "elevenlabs",
-      source,
-      preferApi: source !== "catalog",
-    });
+    const result = await listVoiceCatalog({ db, provider: "elevenlabs" });
     res.json({
       success: true,
       agentId: agent.id,
-      provider: "elevenlabs",
       current: {
         voice_provider: agent.voice_provider || "openai",
+        voice: agent.voice || null,
+        voice_id: agent.voice_id || null,
+        openai_voice_id:
+          agent.voice_provider === "openai"
+            ? agent.voice_id || agent.voice || null
+            : null,
         elevenlabs_voice_id:
-          agent.elevenlabs_voice_id || agent.voice_id || null,
-        elevenlabs_voice_name: agent.elevenlabs_voice_name || null,
+          agent.voice_provider === "elevenlabs"
+            ? agent.elevenlabs_voice_id || agent.voice_id || null
+            : null,
+        elevenlabs_voice_name:
+          agent.voice_provider === "elevenlabs"
+            ? agent.elevenlabs_voice_name || null
+            : null,
         voice_settings: agent.voice_settings || {},
       },
-      voices: result.voices.map(toElevenLabsFrontendVoice),
-      count: result.voices.length,
+      voices: result.voices,
       source: result.source,
       warning: result.warning || undefined,
     });
   }),
 );
-
 router.get(
   "/:agentId/voice-config",
   requireAuth,
@@ -308,25 +241,28 @@ router.get(
     const db = getSupabase();
     const agent = await loadAgent(db, req.orgId, req.params.agentId);
     if (!agent)
-      return res
-        .status(404)
-        .json({
-          success: false,
-          error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
-        });
+      return res.status(404).json({
+        success: false,
+        error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
+      });
     res.json({
       success: true,
       agentId: agent.id,
       voice_provider: agent.voice_provider || "openai",
+      voice: agent.voice || null,
       voice_id: agent.voice_id || null,
       openai_voice_id:
-        (agent.voice_provider || "openai") === "openai"
-          ? agent.voice_id || process.env.OPENAI_TTS_DEFAULT_VOICE || "alloy"
+        agent.voice_provider === "openai"
+          ? agent.voice_id || agent.voice || null
           : null,
       elevenlabs_voice_id:
-        agent.elevenlabs_voice_id ||
-        ((agent.voice_provider || "") === "elevenlabs" ? agent.voice_id : null),
-      elevenlabs_voice_name: agent.elevenlabs_voice_name || null,
+        agent.voice_provider === "elevenlabs"
+          ? agent.elevenlabs_voice_id || agent.voice_id || null
+          : null,
+      elevenlabs_voice_name:
+        agent.voice_provider === "elevenlabs"
+          ? agent.elevenlabs_voice_name || null
+          : null,
       voice_settings: agent.voice_settings || {},
       tone: agent.tone || null,
       speech_style: agent.speech_style || null,
@@ -357,36 +293,37 @@ router.patch(
       .select(AGENT_SELECT)
       .maybeSingle();
     if (error)
-      return res
-        .status(500)
-        .json({
-          success: false,
-          error: {
-            code: error.code || "UPDATE_FAILED",
-            message: error.message || "Failed to update voice config.",
-          },
-        });
+      return res.status(500).json({
+        success: false,
+        error: {
+          code: error.code || "UPDATE_FAILED",
+          message: error.message || "Failed to update voice config.",
+        },
+      });
     if (!data)
-      return res
-        .status(404)
-        .json({
-          success: false,
-          error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
-        });
+      return res.status(404).json({
+        success: false,
+        error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
+      });
     res.json({
       success: true,
       agent: serializeAgent(data, []),
       voiceConfig: {
-        voice_provider: data.voice_provider || "openai",
+        voice_provider: data.voice_provider,
+        voice: data.voice || null,
         voice_id: data.voice_id || null,
         openai_voice_id:
-          (data.voice_provider || "openai") === "openai"
-            ? data.voice_id || null
+          data.voice_provider === "openai"
+            ? data.voice_id || data.voice || null
             : null,
         elevenlabs_voice_id:
-          data.elevenlabs_voice_id ||
-          ((data.voice_provider || "") === "elevenlabs" ? data.voice_id : null),
-        elevenlabs_voice_name: data.elevenlabs_voice_name || null,
+          data.voice_provider === "elevenlabs"
+            ? data.elevenlabs_voice_id || data.voice_id || null
+            : null,
+        elevenlabs_voice_name:
+          data.voice_provider === "elevenlabs"
+            ? data.elevenlabs_voice_name
+            : null,
         voice_settings: data.voice_settings || {},
       },
     });
@@ -404,22 +341,18 @@ async function updateAgentVoice(req, res) {
     .select(AGENT_SELECT)
     .maybeSingle();
   if (error)
-    return res
-      .status(500)
-      .json({
-        success: false,
-        error: {
-          code: error.code || "UPDATE_FAILED",
-          message: error.message || "Failed to update voice.",
-        },
-      });
+    return res.status(500).json({
+      success: false,
+      error: {
+        code: error.code || "UPDATE_FAILED",
+        message: error.message || "Failed to update voice.",
+      },
+    });
   if (!data)
-    return res
-      .status(404)
-      .json({
-        success: false,
-        error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
-      });
+    return res.status(404).json({
+      success: false,
+      error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
+    });
   res.json({ success: true, agent: serializeAgent(data, []) });
 }
 
@@ -443,66 +376,11 @@ router.post(
     const db = getSupabase();
     const agent = await loadAgent(db, req.orgId, req.params.agentId);
     if (!agent)
-      return res
-        .status(404)
-        .json({
-          success: false,
-          error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
-        });
-    const body = req.body || {};
-    const provider = normalizeProvider(
-      body.voice_provider || body.provider || agent.voice_provider || "openai",
-      "openai",
-    );
-    const text =
-      body.text ||
-      agent.greeting ||
-      "Hello, this is a voice test from Agently.";
-
-    if (provider === "openai") {
-      const settings =
-        body.voiceSettings || body.voice_settings || agent.voice_settings || {};
-      const audio = await synthesizeOpenAIPreview({
-        voiceId:
-          body.openai_voice_id ||
-          body.voiceId ||
-          body.voice_id ||
-          body.voice ||
-          agent.voice_id ||
-          process.env.OPENAI_TTS_DEFAULT_VOICE ||
-          "alloy",
-        text: normalizeOpenAIPreviewText(text),
-        model:
-          body.model || body.model_id || settings.model || settings.model_id,
-        responseFormat:
-          body.responseFormat ||
-          body.response_format ||
-          settings.response_format,
-        speed: body.speed || settings.speed,
-        instructions: body.instructions || settings.instructions,
+      return res.status(404).json({
+        success: false,
+        error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
       });
-      res.setHeader("Cache-Control", "no-store");
-      res.setHeader("X-Voice-Provider", "openai");
-      res.setHeader("X-Voice-Id", audio.voiceId);
-      res.setHeader("X-OpenAI-TTS-Model", audio.model);
-      if (wantsJsonAudio(req)) {
-        return res.json({
-          success: true,
-          provider: "openai",
-          voice_id: audio.voiceId,
-          voiceId: audio.voiceId,
-          model: audio.model,
-          responseFormat: audio.responseFormat,
-          mimeType: audio.mimeType || "audio/mpeg",
-          audioBase64: audio.buffer.toString("base64"),
-          size: audio.buffer.length,
-        });
-      }
-      res.setHeader("Content-Type", audio.mimeType || "audio/mpeg");
-      res.setHeader("Content-Length", String(audio.buffer.length));
-      return res.status(200).send(audio.buffer);
-    }
-
+    const body = req.body || {};
     const voiceId =
       body.elevenlabs_voice_id ||
       body.voiceId ||
@@ -510,30 +388,24 @@ router.post(
       agent.elevenlabs_voice_id ||
       agent.voice_id;
     const voice = await resolveVoice({ db, provider: "elevenlabs", voiceId });
+    const text = normalizePreviewText(
+      body.text ||
+        agent.greeting ||
+        "Hello, this is an ElevenLabs voice test from Agently.",
+    );
     const audio = await synthesizeElevenLabsPreview({
       voiceId: voice.voiceId,
-      text: normalizeElevenLabsPreviewText(text),
+      text,
       modelId: body.modelId || body.model_id || voice.modelId,
       outputFormat: body.outputFormat || body.output_format,
       voiceSettings:
         body.voiceSettings || body.voice_settings || agent.voice_settings || {},
     });
+    res.setHeader("Content-Type", audio.mimeType || "audio/mpeg");
+    res.setHeader("Content-Length", String(audio.buffer.length));
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("X-Voice-Provider", "elevenlabs");
     res.setHeader("X-Voice-Id", voice.voiceId);
-    if (wantsJsonAudio(req)) {
-      return res.json({
-        success: true,
-        provider: "elevenlabs",
-        voice_id: voice.voiceId,
-        voiceId: voice.voiceId,
-        mimeType: audio.mimeType || "audio/mpeg",
-        audioBase64: audio.buffer.toString("base64"),
-        size: audio.buffer.length,
-      });
-    }
-    res.setHeader("Content-Type", audio.mimeType || "audio/mpeg");
-    res.setHeader("Content-Length", String(audio.buffer.length));
     res.status(200).send(audio.buffer);
   }),
 );
