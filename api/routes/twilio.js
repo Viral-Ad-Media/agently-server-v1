@@ -1127,11 +1127,19 @@ async function listTenantPhoneNumbersForApi(req) {
   return (data || []).map((row) => ({
     ...row,
     id: row.id,
+    numberId: row.id,
     phoneNumber: row.phone_number,
-    phoneSid: row.phone_sid,
-    accountSid: row.account_sid,
+    // Do not expose Twilio SIDs/account SIDs to tenant UI. Backend routes accept row.id.
+    phone_sid: undefined,
+    phoneSid: undefined,
+    sid: undefined,
+    account_sid: undefined,
+    accountSid: undefined,
     isoCountry: row.iso_country,
-    numberType: row.number_type,
+    numberType:
+      row.number_type && row.number_type !== "unknown"
+        ? row.number_type
+        : undefined,
     assignedVoiceAgentId: row.assigned_voice_agent_id,
     assignedAgent: row.voice_agents || null,
     configurationStatus: row.configuration_status,
@@ -1595,8 +1603,12 @@ function ownedNumberResponse(row, latest = null, agent = null, warning = null) {
   const twilioFound = !warning;
 
   return {
-    sid,
-    phoneSid: sid,
+    id: row.id || row.twilio_number_id || null,
+    numberId: row.id || row.twilio_number_id || null,
+    // Do not expose Twilio provider SIDs to tenant UI. Use id/numberId for actions.
+    sid: undefined,
+    phoneSid: undefined,
+    phone_sid: undefined,
     phoneNumber,
     friendlyName:
       latest?.friendlyName || latest?.friendly_name || agentName || phoneNumber,
@@ -1610,9 +1622,9 @@ function ownedNumberResponse(row, latest = null, agent = null, warning = null) {
     assignedAgent: agentId ? { id: agentId, name: agentName } : null,
     source,
     sourceLabel: numberSourceLabel(source, twilioFound),
-    accountSid:
-      row.account_sid || latest?.accountSid || latest?.account_sid || null,
-    twilioNumberId: row.twilio_number_id || row.id || null,
+    accountSid: undefined,
+    account_sid: undefined,
+    twilioNumberId: row.id || row.twilio_number_id || null,
     overallStatus: row.overall_status || row.configuration_status || null,
     readinessStatus: row.overall_status || row.configuration_status || null,
     warning: warning || undefined,
@@ -1919,145 +1931,15 @@ router.post(
   "/numbers/sync-owned",
   requireAuth,
   requireAdmin,
-  asyncHandler(async (req, res) => {
-    const organizationId = bodyOrg(req);
-    const db = getSupabase();
-    const explicitPhoneNumbers = normalizeStringList(
-      req.body?.phoneNumbers || req.body?.phoneNumber,
-    );
-    const explicitPhoneSids = normalizeStringList(
-      req.body?.phoneSids || req.body?.phoneSid,
-    );
-    const explicitRequested =
-      explicitPhoneNumbers.length > 0 || explicitPhoneSids.length > 0;
-    const includeMasterAccount = !!(
-      req.body?.includeMasterAccount ||
-      req.body?.syncMasterAccount ||
-      req.body?.accountScope === "master"
-    );
-
-    try {
-      const tenantAccount = await ensureTenantTwilioAccount({
-        organizationId,
-        organizationName: req.organization?.name,
-        createIfMissing: false,
-      });
-
-      const accountsToQuery = [];
-      const tenantHasDedicatedSubaccount =
-        tenantAccount?.account_sid &&
-        !tenantAccount.isFallbackMaster &&
-        tenantAccount.account_sid !== masterSid();
-
-      if (tenantHasDedicatedSubaccount && !includeMasterAccount) {
-        accountsToQuery.push({
-          accountSid: tenantAccount.account_sid,
-          twilioAccountId: tenantAccount.id || null,
-          scope: "tenant_subaccount",
-        });
-      } else {
-        if (!isPlatformAdminUser(req)) {
-          return res.status(403).json({
-            error: {
-              code: "PLATFORM_ADMIN_REQUIRED",
-              message:
-                "Master-account number sync requires platform admin permission. Configure a tenant subaccount, or ask a platform admin to sync explicitly selected numbers.",
-            },
-          });
-        }
-        const allowUnrestrictedMasterSync =
-          boolEnv("ALLOW_UNRESTRICTED_MASTER_TWILIO_SYNC", false) ||
-          boolEnv("ALLOW_OWNER_MASTER_TWILIO_SYNC", false);
-        if (!explicitRequested && !allowUnrestrictedMasterSync) {
-          return res.status(400).json({
-            error: {
-              code: "EXPLICIT_MASTER_NUMBER_SELECTION_REQUIRED",
-              message:
-                "For safety, master-account sync requires explicit phoneNumbers or phoneSids. Set ALLOW_UNRESTRICTED_MASTER_TWILIO_SYNC=true only for trusted single-tenant/master-account deployments.",
-            },
-          });
-        }
-        accountsToQuery.push({
-          accountSid: masterSid(),
-          twilioAccountId: null,
-          scope: "master_explicit",
-        });
-        if (tenantHasDedicatedSubaccount && includeMasterAccount) {
-          accountsToQuery.push({
-            accountSid: tenantAccount.account_sid,
-            twilioAccountId: tenantAccount.id || null,
-            scope: "tenant_subaccount",
-          });
-        }
-      }
-
-      const imported = [];
-      const seen = new Set();
-      for (const account of accountsToQuery) {
-        if (!account.accountSid) continue;
-        let numbers = await listIncomingNumbers({
-          accountSid: account.accountSid,
-        });
-        if (account.scope === "master_explicit" && explicitRequested) {
-          numbers = numbers.filter(
-            (n) =>
-              explicitPhoneNumbers.includes(n.phoneNumber) ||
-              explicitPhoneSids.includes(n.sid),
-          );
-        }
-        for (const n of numbers) {
-          if (seen.has(n.sid)) continue;
-          seen.add(n.sid);
-          const saved = await saveNumberRecord(db, {
-            organizationId,
-            twilioAccountId: account.twilioAccountId,
-            phoneNumber: n.phoneNumber,
-            phoneSid: n.sid,
-            accountSid: n.accountSid || account.accountSid,
-            country: n.country,
-            capabilities: n.capabilities,
-            addressRequirements: n.addressRequirements,
-            voiceUrl: n.voiceUrl,
-            voiceFallbackUrl: n.voiceFallbackUrl,
-            statusCallback: n.statusCallback,
-            smsUrl: n.smsUrl,
-            smsFallbackUrl: n.smsFallbackUrl,
-            bundleSid: n.bundleSid,
-            addressSid: n.addressSid,
-            source: "existing_twilio_number",
-            purchaseOrigin: "previously_purchased",
-            configurationStatus: "needs_configuration",
-          });
-          const readiness = await refreshAndPersistReadiness(
-            saved.id,
-            organizationId,
-          );
-          imported.push({ ...saved, readiness, syncScope: account.scope });
-        }
-      }
-
-      await writeAudit(db, {
-        organizationId,
-        userId: req.user?.id,
-        action: "twilio_numbers_synced",
-        entityType: "twilio_phone_number",
-        metadata: {
-          count: imported.length,
-          scopes: accountsToQuery.map((a) => a.scope),
-          explicitPhoneNumbers,
-          explicitPhoneSids,
-        },
-      });
-      res.json({ success: true, numbers: imported });
-    } catch (err) {
-      const mapped = mapTwilioError(
-        err,
-        "Could not sync owned Twilio numbers.",
-      );
-      res
-        .status(err.code === "MIGRATION_REQUIRED" ? 500 : 400)
-        .json({ error: mapped });
-    }
+  asyncHandler(async (_req, res) => {
+    return res.status(410).json({
+      success: false,
+      error: {
+        code: "SYNC_OWNED_DISABLED",
+        message:
+          "Owned-number sync is disabled for tenant safety. Phone Numbers now loads only numbers already purchased/imported for this organization from twilio_phone_numbers.",
+      },
+    });
   }),
 );
 
@@ -3000,12 +2882,14 @@ async function assignNumberToAgentById({ req, res, numberId }) {
   const organizationId = bodyOrg(req);
   const agentId = req.body?.agentId || req.body?.voiceAgentId;
   if (!agentId) {
-    return res.status(400).json({
-      error: {
-        code: "AGENT_REQUIRED",
-        message: "agentId or voiceAgentId is required.",
-      },
-    });
+    return res
+      .status(400)
+      .json({
+        error: {
+          code: "AGENT_REQUIRED",
+          message: "agentId or voiceAgentId is required.",
+        },
+      });
   }
   const db = getSupabase();
   const { data: agent } = await db
@@ -3015,12 +2899,14 @@ async function assignNumberToAgentById({ req, res, numberId }) {
     .eq("organization_id", organizationId)
     .maybeSingle();
   if (!agent)
-    return res.status(404).json({
-      error: {
-        code: "AGENT_NOT_FOUND",
-        message: "Voice agent not found for this organization.",
-      },
-    });
+    return res
+      .status(404)
+      .json({
+        error: {
+          code: "AGENT_NOT_FOUND",
+          message: "Voice agent not found for this organization.",
+        },
+      });
 
   const number = await findTenantNumberByFlexibleId(
     db,
@@ -3028,12 +2914,14 @@ async function assignNumberToAgentById({ req, res, numberId }) {
     numberId,
   );
   if (!number)
-    return res.status(404).json({
-      error: {
-        code: "NUMBER_NOT_FOUND",
-        message: "Phone number not found for this organization.",
-      },
-    });
+    return res
+      .status(404)
+      .json({
+        error: {
+          code: "NUMBER_NOT_FOUND",
+          message: "Phone number not found for this organization.",
+        },
+      });
 
   if (
     number.phone_sid &&
@@ -3047,6 +2935,35 @@ async function assignNumberToAgentById({ req, res, numberId }) {
         err.message,
       );
     }
+  }
+
+  // One agent can have one active phone number. Reassigning an agent to this
+  // number clears any other number currently assigned to that same agent.
+  await db
+    .from("twilio_phone_numbers")
+    .update({
+      assigned_voice_agent_id: null,
+      assigned_agent_status: "unassigned",
+      updated_at: new Date().toISOString(),
+    })
+    .eq("organization_id", organizationId)
+    .eq("assigned_voice_agent_id", agentId)
+    .neq("id", number.id);
+
+  // If this number was assigned to a different agent, clear that old agent mirror.
+  if (
+    number.assigned_voice_agent_id &&
+    number.assigned_voice_agent_id !== agentId
+  ) {
+    await db
+      .from("voice_agents")
+      .update({
+        twilio_phone_number: "",
+        twilio_phone_sid: "",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", number.assigned_voice_agent_id)
+      .eq("organization_id", organizationId);
   }
 
   const readyPatch = applyAutoReadyVoiceNumber(
@@ -3104,12 +3021,14 @@ router.patch(
       req.params.id,
     );
     if (!number)
-      return res.status(404).json({
-        error: {
-          code: "NUMBER_NOT_FOUND",
-          message: "Phone number not found for this organization.",
-        },
-      });
+      return res
+        .status(404)
+        .json({
+          error: {
+            code: "NUMBER_NOT_FOUND",
+            message: "Phone number not found for this organization.",
+          },
+        });
     const allowed = {};
     if (req.body?.assigned_voice_agent_id || req.body?.assignedVoiceAgentId)
       allowed.assigned_voice_agent_id =
@@ -3169,6 +3088,17 @@ router.post(
     const targetAgentId =
       voiceAgentId || req.organization.active_voice_agent_id;
 
+    // One agent can have one active phone number. Keep the DB mirror consistent.
+    await db
+      .from("twilio_phone_numbers")
+      .update({
+        assigned_voice_agent_id: null,
+        assigned_agent_status: "unassigned",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("organization_id", req.orgId)
+      .eq("assigned_voice_agent_id", targetAgentId);
+
     // Update webhooks to point to this server
     await updateNumberWebhooks({ phoneSid });
 
@@ -3181,6 +3111,29 @@ router.post(
       })
       .eq("id", targetAgentId)
       .eq("organization_id", req.orgId);
+
+    const { data: existingNumber } = await db
+      .from("twilio_phone_numbers")
+      .select("*")
+      .eq("organization_id", req.orgId)
+      .eq("phone_sid", phoneSid)
+      .maybeSingle();
+    if (existingNumber?.id) {
+      const readyPatch = applyAutoReadyVoiceNumber(
+        {
+          ...existingNumber,
+          assigned_voice_agent_id: targetAgentId,
+          updated_at: new Date().toISOString(),
+        },
+        existingNumber,
+      );
+      readyPatch.assigned_voice_agent_id = targetAgentId;
+      readyPatch.assigned_agent_status = "ready";
+      await db
+        .from("twilio_phone_numbers")
+        .update(readyPatch)
+        .eq("id", existingNumber.id);
+    }
 
     res.json({ success: true });
   }),
