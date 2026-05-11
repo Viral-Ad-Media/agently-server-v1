@@ -1116,6 +1116,87 @@ router.post(
 // ── PROTECTED: Number Management ─────────────────────────────
 // ─────────────────────────────────────────────────────────────
 
+async function listTenantPhoneNumbersForApi(req) {
+  const db = getSupabase();
+  const { data, error } = await db
+    .from("twilio_phone_numbers")
+    .select("*, voice_agents:assigned_voice_agent_id(id,name)")
+    .eq("organization_id", req.orgId)
+    .order("created_at", { ascending: false });
+  if (error) throw error;
+  return (data || []).map((row) => ({
+    ...row,
+    id: row.id,
+    phoneNumber: row.phone_number,
+    phoneSid: row.phone_sid,
+    accountSid: row.account_sid,
+    isoCountry: row.iso_country,
+    numberType: row.number_type,
+    assignedVoiceAgentId: row.assigned_voice_agent_id,
+    assignedAgent: row.voice_agents || null,
+    configurationStatus: row.configuration_status,
+    overallStatus: row.overall_status,
+    inboundVoiceStatus: row.inbound_voice_status,
+    outboundVoiceStatus: row.outbound_voice_status,
+    inboundSmsStatus: row.inbound_sms_status,
+    outboundSmsStatus: row.outbound_sms_status,
+    regulatoryReadinessStatus: row.regulatory_readiness_status,
+    assignedAgentStatus: row.assigned_agent_status,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }));
+}
+
+// Frontend compatibility: normalized tenant number list.
+router.get(
+  "/numbers",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const numbers = await listTenantPhoneNumbersForApi(req);
+    res.json({ success: true, numbers });
+  }),
+);
+
+// Frontend compatibility: older UI calls /api/twilio/owned-numbers.
+router.get(
+  "/owned-numbers",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const numbers = await listTenantPhoneNumbersForApi(req);
+    res.json({ success: true, numbers });
+  }),
+);
+
+// Frontend compatibility: older UI calls /api/twilio/available-numbers with query params.
+router.get(
+  "/available-numbers",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const country = normalizeCountry(req.query?.country || "US");
+    const type = req.query?.type || req.query?.numberType || "Local";
+    const numbers = await searchAvailableNumbers({
+      country,
+      type:
+        String(type).charAt(0).toUpperCase() +
+          String(type).slice(1).toLowerCase() ===
+        "Tollfree"
+          ? "TollFree"
+          : type,
+      areaCode: req.query?.areaCode,
+      contains: req.query?.contains,
+      limit: parseInt(req.query?.limit || "20", 10),
+    });
+    res.json({ success: true, numbers });
+  }),
+);
+
+// Frontend compatibility: old purchase route name.
+router.post("/purchase-number", requireAuth, requireAdmin, (req, res, next) => {
+  req.url = "/numbers/purchase";
+  router.handle(req, res, next);
+});
+
 // List supported countries
 router.get(
   "/numbers/countries",
@@ -1161,45 +1242,39 @@ function guessCountryFromE164(phone) {
   return "UNKNOWN";
 }
 
-function envBool(name, fallback = false) {
-  const raw = process.env[name];
-  if (raw === undefined || raw === null || raw === "") return fallback;
-  return ["1", "true", "yes", "on"].includes(String(raw).trim().toLowerCase());
-}
-
-function strictNumberReadinessEnabled() {
-  return envBool("OUTBOUND_STRICT_NUMBER_READINESS", false);
-}
-
-function defaultOutboundVoiceCountries(country) {
-  const raw =
-    process.env.TWILIO_LOW_RISK_VOICE_COUNTRIES ||
-    process.env.DEFAULT_OUTBOUND_VOICE_COUNTRIES ||
-    "US";
-  return [
-    ...new Set(
-      [country, ...String(raw).split(",")]
-        .map(normalizeCountry)
-        .filter(Boolean),
-    ),
-  ];
-}
-
-function voiceCountriesForNumber(number, destinationCountry) {
-  return new Set(
-    [
-      ...jsonArray(number?.selected_outbound_voice_countries),
-      normalizeCountry(number?.iso_country),
-      normalizeCountry(destinationCountry),
-      ...defaultOutboundVoiceCountries(number?.iso_country),
-    ]
-      .map(normalizeCountry)
-      .filter(Boolean),
-  );
-}
-
 async function saveNumberRecord(db, payload) {
   const now = new Date().toISOString();
+  const row = {
+    organization_id: payload.organizationId,
+    twilio_account_id: payload.twilioAccountId || null,
+    phone_number: payload.phoneNumber,
+    phone_sid: payload.phoneSid,
+    account_sid: payload.accountSid,
+    iso_country: normalizeCountry(payload.isoCountry || payload.country || ""),
+    number_type: payload.numberType || "unknown",
+    capabilities: payload.capabilities || {},
+    address_requirements: payload.addressRequirements || "none",
+    regulatory_status: payload.regulatoryStatus || "unknown",
+    bundle_sid: payload.bundleSid || null,
+    address_sid: payload.addressSid || null,
+    regulation_sid: payload.regulationSid || null,
+    regulatory_next_action: payload.regulatoryNextAction || null,
+    voice_url: payload.voiceUrl || "",
+    voice_fallback_url: payload.voiceFallbackUrl || "",
+    status_callback_url: payload.statusCallback || "",
+    sms_url: payload.smsUrl || "",
+    sms_fallback_url: payload.smsFallbackUrl || "",
+    assigned_voice_agent_id: payload.agentId || null,
+    source: payload.source || "purchased",
+    purchase_origin: payload.purchaseOrigin || "in_app_purchase",
+    verification_method: payload.verificationMethod || "api_ownership",
+    verification_status: payload.verificationStatus || "verified",
+    selected_outbound_voice_countries:
+      payload.selectedOutboundVoiceCountries || [],
+    selected_sms_countries: payload.selectedSmsCountries || [],
+    configuration_status: payload.configurationStatus || "needs_configuration",
+    updated_at: now,
+  };
 
   const { data: existing } = await db
     .from("twilio_phone_numbers")
@@ -1208,110 +1283,17 @@ async function saveNumberRecord(db, payload) {
     .eq("phone_sid", payload.phoneSid)
     .maybeSingle();
 
-  const capabilities = payload.capabilities || existing?.capabilities || {};
-  const supportsVoice =
-    capabilities.voice === true ||
-    capabilities.voice === "true" ||
-    capabilities.Voice === true ||
-    capabilities.Voice === "true";
-  const incomingSelectedCountries =
-    payload.selectedOutboundVoiceCountries &&
-    Array.isArray(payload.selectedOutboundVoiceCountries) &&
-    payload.selectedOutboundVoiceCountries.length
-      ? payload.selectedOutboundVoiceCountries
-      : null;
-  const existingSelectedCountries = jsonArray(
-    existing?.selected_outbound_voice_countries,
-  );
-  const selectedOutboundVoiceCountries = incomingSelectedCountries
-    ? [
-        ...new Set(
-          incomingSelectedCountries.map(normalizeCountry).filter(Boolean),
-        ),
-      ]
-    : existingSelectedCountries.length
-      ? existingSelectedCountries
-      : supportsVoice
-        ? defaultOutboundVoiceCountries(payload.isoCountry || payload.country)
-        : [];
-  const isSafeSyncImportDowngrade =
-    existing?.id &&
-    payload.source === "existing_twilio_number" &&
-    payload.configurationStatus === "needs_configuration";
-  const assignedAgentId =
-    payload.agentId || existing?.assigned_voice_agent_id || null;
-
-  const row = {
-    organization_id: payload.organizationId,
-    twilio_account_id:
-      payload.twilioAccountId || existing?.twilio_account_id || null,
-    phone_number: payload.phoneNumber || existing?.phone_number,
-    phone_sid: payload.phoneSid || existing?.phone_sid,
-    account_sid: payload.accountSid || existing?.account_sid,
-    iso_country: normalizeCountry(
-      payload.isoCountry || payload.country || existing?.iso_country || "",
-    ),
-    number_type: payload.numberType || existing?.number_type || "unknown",
-    capabilities,
-    address_requirements:
-      payload.addressRequirements || existing?.address_requirements || "none",
-    regulatory_status:
-      payload.regulatoryStatus || existing?.regulatory_status || "unknown",
-    bundle_sid: payload.bundleSid || existing?.bundle_sid || null,
-    address_sid: payload.addressSid || existing?.address_sid || null,
-    regulation_sid: payload.regulationSid || existing?.regulation_sid || null,
-    regulatory_next_action:
-      payload.regulatoryNextAction || existing?.regulatory_next_action || null,
-    voice_url: payload.voiceUrl || existing?.voice_url || "",
-    voice_fallback_url:
-      payload.voiceFallbackUrl || existing?.voice_fallback_url || "",
-    status_callback_url:
-      payload.statusCallback || existing?.status_callback_url || "",
-    sms_url: payload.smsUrl || existing?.sms_url || "",
-    sms_fallback_url:
-      payload.smsFallbackUrl || existing?.sms_fallback_url || "",
-    assigned_voice_agent_id: assignedAgentId,
-    source: payload.source || existing?.source || "purchased",
-    purchase_origin:
-      payload.purchaseOrigin || existing?.purchase_origin || "in_app_purchase",
-    verification_method:
-      payload.verificationMethod ||
-      existing?.verification_method ||
-      "api_ownership",
-    verification_status:
-      payload.verificationStatus || existing?.verification_status || "verified",
-    selected_outbound_voice_countries: selectedOutboundVoiceCountries,
-    selected_sms_countries:
-      payload.selectedSmsCountries ||
-      jsonArray(existing?.selected_sms_countries),
-    configuration_status: isSafeSyncImportDowngrade
-      ? existing?.configuration_status || "configured"
-      : payload.configurationStatus ||
-        existing?.configuration_status ||
-        "needs_configuration",
-    overall_status:
-      payload.overallStatus ||
-      existing?.overall_status ||
-      (supportsVoice ? "ready" : "needs_configuration"),
-    outbound_voice_status:
-      payload.outboundVoiceStatus ||
-      existing?.outbound_voice_status ||
-      (supportsVoice ? "ready" : "not_supported"),
-    inbound_voice_status:
-      payload.inboundVoiceStatus ||
-      existing?.inbound_voice_status ||
-      (supportsVoice ? "ready" : "not_supported"),
-    assigned_agent_status:
-      payload.assignedAgentStatus ||
-      existing?.assigned_agent_status ||
-      (assignedAgentId ? "ready" : "needs_configuration"),
-    updated_at: now,
-  };
+  const readyRow = applyAutoReadyVoiceNumber(row, existing || null);
 
   if (existing?.id) {
+    // Preserve assignment unless a new assignment is explicitly supplied.
+    if (!payload.agentId && existing.assigned_voice_agent_id) {
+      readyRow.assigned_voice_agent_id = existing.assigned_voice_agent_id;
+      readyRow.assigned_agent_status = "ready";
+    }
     const { data, error } = await db
       .from("twilio_phone_numbers")
-      .update(row)
+      .update(readyRow)
       .eq("id", existing.id)
       .select()
       .single();
@@ -1321,7 +1303,7 @@ async function saveNumberRecord(db, payload) {
 
   const { data, error } = await db
     .from("twilio_phone_numbers")
-    .insert({ ...row, created_at: now })
+    .insert({ ...readyRow, created_at: now })
     .select()
     .single();
   if (error) throw error;
@@ -1468,6 +1450,93 @@ function normalizeStringList(value) {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function boolEnv(name, fallback = false) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || raw === "") return fallback;
+  return ["1", "true", "yes", "on"].includes(String(raw).trim().toLowerCase());
+}
+
+function defaultOutboundVoiceCountries() {
+  return normalizeStringList(
+    process.env.DEFAULT_OUTBOUND_VOICE_COUNTRIES ||
+      process.env.TWILIO_LOW_RISK_VOICE_COUNTRIES ||
+      "US",
+  )
+    .map(normalizeCountry)
+    .filter(Boolean);
+}
+
+function capabilitiesSupportVoice(capabilities) {
+  const raw = capabilities || {};
+  return (
+    raw.voice === true ||
+    raw.voice === "true" ||
+    raw.voice === "True" ||
+    raw.voice === "1"
+  );
+}
+
+function shouldAutoReadyVoiceNumber(row) {
+  return (
+    boolEnv("AUTO_READY_LOW_RISK_VOICE_NUMBERS", true) &&
+    capabilitiesSupportVoice(row.capabilities)
+  );
+}
+
+function applyAutoReadyVoiceNumber(row, existing = null) {
+  const next = { ...(row || {}) };
+  const wasReady = [
+    existing?.overall_status,
+    existing?.outbound_voice_status,
+    existing?.configuration_status,
+  ]
+    .map((value) => String(value || "").toLowerCase())
+    .some((value) =>
+      ["ready", "configured", "active", "verified"].includes(value),
+    );
+
+  if (shouldAutoReadyVoiceNumber(next) || wasReady) {
+    const countries = [
+      ...new Set(
+        [
+          ...jsonArray(existing?.selected_outbound_voice_countries),
+          ...jsonArray(next.selected_outbound_voice_countries),
+          ...defaultOutboundVoiceCountries(),
+        ]
+          .map(normalizeCountry)
+          .filter(Boolean),
+      ),
+    ];
+    next.selected_outbound_voice_countries = countries.length
+      ? countries
+      : ["US"];
+    next.configuration_status = "configured";
+    next.overall_status = "ready";
+    next.inbound_voice_status = "ready";
+    next.outbound_voice_status = "ready";
+    next.regulatory_readiness_status =
+      next.regulatory_readiness_status ||
+      existing?.regulatory_readiness_status ||
+      "ready";
+    next.assigned_agent_status = next.assigned_voice_agent_id
+      ? "ready"
+      : existing?.assigned_agent_status || "unassigned";
+    next.last_error = null;
+  }
+
+  // Never downgrade a previously-working number during sync/import.
+  if (wasReady) {
+    next.configuration_status = "configured";
+    next.overall_status = "ready";
+    next.outbound_voice_status = "ready";
+    next.inbound_voice_status =
+      existing?.inbound_voice_status || next.inbound_voice_status || "ready";
+    next.last_error = null;
+  }
+
+  return next;
 }
 
 function numberSourceLabel(source, twilioFound = true) {
@@ -1703,10 +1772,7 @@ router.post(
       null;
     const selectedOutboundVoiceCountries = [
       ...new Set(
-        [
-          ...defaultOutboundVoiceCountries(country),
-          ...(req.body?.selectedOutboundVoiceCountries || []),
-        ]
+        [country, ...(req.body?.selectedOutboundVoiceCountries || [])]
           .map(normalizeCountry)
           .filter(Boolean),
       ),
@@ -1899,12 +1965,15 @@ router.post(
             },
           });
         }
-        if (!explicitRequested) {
+        const allowUnrestrictedMasterSync =
+          boolEnv("ALLOW_UNRESTRICTED_MASTER_TWILIO_SYNC", false) ||
+          boolEnv("ALLOW_OWNER_MASTER_TWILIO_SYNC", false);
+        if (!explicitRequested && !allowUnrestrictedMasterSync) {
           return res.status(400).json({
             error: {
               code: "EXPLICIT_MASTER_NUMBER_SELECTION_REQUIRED",
               message:
-                "For safety, master-account sync requires explicit phoneNumbers or phoneSids. Unrestricted master-account sync is blocked.",
+                "For safety, master-account sync requires explicit phoneNumbers or phoneSids. Set ALLOW_UNRESTRICTED_MASTER_TWILIO_SYNC=true only for trusted single-tenant/master-account deployments.",
             },
           });
         }
@@ -1929,7 +1998,7 @@ router.post(
         let numbers = await listIncomingNumbers({
           accountSid: account.accountSid,
         });
-        if (account.scope === "master_explicit") {
+        if (account.scope === "master_explicit" && explicitRequested) {
           numbers = numbers.filter(
             (n) =>
               explicitPhoneNumbers.includes(n.phoneNumber) ||
@@ -2045,7 +2114,7 @@ router.post(
     const selectedOutboundVoiceCountries = [
       ...new Set(
         [
-          ...defaultOutboundVoiceCountries(number.iso_country),
+          normalizeCountry(number.iso_country),
           ...(req.body?.selectedOutboundVoiceCountries || []),
         ].filter(Boolean),
       ),
@@ -2369,21 +2438,13 @@ router.post(
       organizationId,
     );
     if (readiness.outbound_voice?.status !== "ready") {
-      console.warn("[outbound-call] non-ready outbound voice status", {
-        numberId: number.id,
-        phoneNumber: number.phone_number,
-        status: readiness.outbound_voice?.status,
-        strict: strictNumberReadinessEnabled(),
+      return res.status(400).json({
+        error: {
+          code: "OUTBOUND_VOICE_NOT_READY",
+          message: "This number is not ready for outbound voice calls.",
+          readiness,
+        },
       });
-      if (strictNumberReadinessEnabled()) {
-        return res.status(400).json({
-          error: {
-            code: "OUTBOUND_VOICE_NOT_READY",
-            message: "This number is not ready for outbound voice calls.",
-            readiness,
-          },
-        });
-      }
     }
     if (
       readiness.assigned_agent?.status &&
@@ -2401,7 +2462,14 @@ router.post(
 
     const destinationCountry = guessCountryFromE164(toPhone);
     console.log("[outbound-call] destinationCountry", destinationCountry);
-    const selected = voiceCountriesForNumber(number, destinationCountry);
+    const selected = new Set(
+      [
+        ...jsonArray(number.selected_outbound_voice_countries),
+        normalizeCountry(number.iso_country),
+      ]
+        .map(normalizeCountry)
+        .filter(Boolean),
+    );
     if (!selected.has(destinationCountry) && destinationCountry !== "UNKNOWN") {
       return res.status(400).json({
         error: {
@@ -2912,6 +2980,178 @@ router.get(
   }),
 );
 
+async function findTenantNumberByFlexibleId(db, organizationId, numberId) {
+  const id = String(numberId || "").trim();
+  if (!id) return null;
+  const fields = ["id", "phone_sid", "phone_number"];
+  for (const field of fields) {
+    const { data, error } = await db
+      .from("twilio_phone_numbers")
+      .select("*")
+      .eq("organization_id", organizationId)
+      .eq(field, id)
+      .maybeSingle();
+    if (!error && data) return data;
+  }
+  return null;
+}
+
+async function assignNumberToAgentById({ req, res, numberId }) {
+  const organizationId = bodyOrg(req);
+  const agentId = req.body?.agentId || req.body?.voiceAgentId;
+  if (!agentId) {
+    return res.status(400).json({
+      error: {
+        code: "AGENT_REQUIRED",
+        message: "agentId or voiceAgentId is required.",
+      },
+    });
+  }
+  const db = getSupabase();
+  const { data: agent } = await db
+    .from("voice_agents")
+    .select("id,name")
+    .eq("id", agentId)
+    .eq("organization_id", organizationId)
+    .maybeSingle();
+  if (!agent)
+    return res.status(404).json({
+      error: {
+        code: "AGENT_NOT_FOUND",
+        message: "Voice agent not found for this organization.",
+      },
+    });
+
+  const number = await findTenantNumberByFlexibleId(
+    db,
+    organizationId,
+    numberId,
+  );
+  if (!number)
+    return res.status(404).json({
+      error: {
+        code: "NUMBER_NOT_FOUND",
+        message: "Phone number not found for this organization.",
+      },
+    });
+
+  if (
+    number.phone_sid &&
+    !String(number.phone_sid).startsWith("SMS_VERIFIED_")
+  ) {
+    try {
+      await updateNumberWebhooks({ phoneSid: number.phone_sid });
+    } catch (err) {
+      console.warn(
+        "[twilio/numbers/assign-agent] webhook update failed:",
+        err.message,
+      );
+    }
+  }
+
+  const readyPatch = applyAutoReadyVoiceNumber(
+    {
+      ...number,
+      assigned_voice_agent_id: agentId,
+      updated_at: new Date().toISOString(),
+    },
+    number,
+  );
+  readyPatch.assigned_voice_agent_id = agentId;
+  readyPatch.assigned_agent_status = "ready";
+
+  const { data: updated, error } = await db
+    .from("twilio_phone_numbers")
+    .update(readyPatch)
+    .eq("id", number.id)
+    .eq("organization_id", organizationId)
+    .select("*")
+    .single();
+  if (error) throw error;
+
+  await updateLegacyAgentNumber(db, {
+    organizationId,
+    agentId,
+    phoneNumber: updated.phone_number,
+    phoneSid: updated.phone_sid,
+    source: updated.source || "existing_twilio_number",
+  });
+
+  res.json({ success: true, number: updated, agentId });
+}
+
+// Frontend compatibility: assign by twilio_phone_numbers.id, phone_sid, or phone_number.
+router.post(
+  "/numbers/:id/assign-agent",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) =>
+    assignNumberToAgentById({ req, res, numberId: req.params.id }),
+  ),
+);
+
+// Frontend compatibility: update a tenant number row without reconfiguring Twilio unless explicitly required later.
+router.patch(
+  "/numbers/:id",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const organizationId = bodyOrg(req);
+    const db = getSupabase();
+    const number = await findTenantNumberByFlexibleId(
+      db,
+      organizationId,
+      req.params.id,
+    );
+    if (!number)
+      return res.status(404).json({
+        error: {
+          code: "NUMBER_NOT_FOUND",
+          message: "Phone number not found for this organization.",
+        },
+      });
+    const allowed = {};
+    if (req.body?.assigned_voice_agent_id || req.body?.assignedVoiceAgentId)
+      allowed.assigned_voice_agent_id =
+        req.body.assigned_voice_agent_id || req.body.assignedVoiceAgentId;
+    if (
+      req.body?.selected_outbound_voice_countries ||
+      req.body?.selectedOutboundVoiceCountries
+    )
+      allowed.selected_outbound_voice_countries =
+        req.body.selected_outbound_voice_countries ||
+        req.body.selectedOutboundVoiceCountries;
+    if (req.body?.selected_sms_countries || req.body?.selectedSmsCountries)
+      allowed.selected_sms_countries =
+        req.body.selected_sms_countries || req.body.selectedSmsCountries;
+    if (req.body?.configuration_status || req.body?.configurationStatus)
+      allowed.configuration_status =
+        req.body.configuration_status || req.body.configurationStatus;
+    const patch = applyAutoReadyVoiceNumber(
+      { ...number, ...allowed, updated_at: new Date().toISOString() },
+      number,
+    );
+    const { data, error } = await db
+      .from("twilio_phone_numbers")
+      .update(patch)
+      .eq("id", number.id)
+      .eq("organization_id", organizationId)
+      .select("*")
+      .single();
+    if (error) throw error;
+    if (patch.assigned_voice_agent_id) {
+      await updateLegacyAgentNumber(db, {
+        organizationId,
+        agentId: patch.assigned_voice_agent_id,
+        phoneNumber: data.phone_number,
+        phoneSid: data.phone_sid,
+        source: data.source,
+      });
+    }
+    res.json({ success: true, number: data });
+  }),
+);
+
 // Assign an already-owned number to a voice agent (no purchase)
 router.post(
   "/numbers/assign",
@@ -2952,11 +3192,17 @@ router.delete(
   requireAuth,
   requireAdmin,
   asyncHandler(async (req, res) => {
-    const { sid } = req.params;
-
+    const identifier = String(req.params.sid || "").trim();
+    const organizationId = bodyOrg(req);
     const db = getSupabase();
+    const number = await findTenantNumberByFlexibleId(
+      db,
+      organizationId,
+      identifier,
+    );
+    const phoneSid = number?.phone_sid || identifier;
 
-    // Clear from voice agents first
+    // Clear from voice agents first.
     await db
       .from("voice_agents")
       .update({
@@ -2964,10 +3210,22 @@ router.delete(
         twilio_phone_sid: "",
         updated_at: new Date().toISOString(),
       })
-      .eq("twilio_phone_sid", sid)
-      .eq("organization_id", req.orgId);
+      .eq("twilio_phone_sid", phoneSid)
+      .eq("organization_id", organizationId);
 
-    await releasePhoneNumber(sid);
+    // Release only real Twilio PN/CA SIDs. For DB-only/import rows, remove the tenant row.
+    if (phoneSid && (phoneSid.startsWith("PN") || phoneSid.startsWith("CA"))) {
+      await releasePhoneNumber(phoneSid);
+    }
+
+    if (number?.id) {
+      await db
+        .from("twilio_phone_numbers")
+        .delete()
+        .eq("id", number.id)
+        .eq("organization_id", organizationId);
+    }
+
     res.json({ success: true });
   }),
 );
@@ -3592,23 +3850,22 @@ router.post(
     if (number?.id) {
       const readiness = await refreshAndPersistReadiness(number.id, req.orgId);
       if (readiness.outbound_voice?.status !== "ready") {
-        console.warn("[outbound-call] non-ready outbound voice status", {
-          numberId: number.id,
-          phoneNumber: number.phone_number,
-          status: readiness.outbound_voice?.status,
-          strict: strictNumberReadinessEnabled(),
+        return res.status(400).json({
+          error: {
+            code: "OUTBOUND_VOICE_NOT_READY",
+            message: "This number is not ready for outbound voice calls.",
+            readiness,
+          },
         });
-        if (strictNumberReadinessEnabled()) {
-          return res.status(400).json({
-            error: {
-              code: "OUTBOUND_VOICE_NOT_READY",
-              message: "This number is not ready for outbound voice calls.",
-              readiness,
-            },
-          });
-        }
       }
-      const selected = voiceCountriesForNumber(number, destinationCountry);
+      const selected = new Set(
+        [
+          ...jsonArray(number.selected_outbound_voice_countries),
+          normalizeCountry(number.iso_country),
+        ]
+          .map(normalizeCountry)
+          .filter(Boolean),
+      );
       if (
         !selected.has(destinationCountry) &&
         destinationCountry !== "UNKNOWN"
