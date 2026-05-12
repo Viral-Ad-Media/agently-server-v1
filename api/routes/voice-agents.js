@@ -49,7 +49,7 @@ router.post(
           autoEscalate: true,
           captureAllLeads: true,
         },
-        is_active: false,
+        is_active: true,
       })
       .select()
       .single();
@@ -172,11 +172,13 @@ router.post(
         .status(404)
         .json({ error: { message: "Voice agent not found." } });
 
+    // Selecting an agent should only update the organization default pointer.
+    // It must not deactivate other agents; all voice agents remain callable.
     await db
       .from("voice_agents")
-      .update({ is_active: false })
+      .update({ is_active: true, updated_at: new Date().toISOString() })
+      .eq("id", id)
       .eq("organization_id", req.orgId);
-    await db.from("voice_agents").update({ is_active: true }).eq("id", id);
     await db
       .from("organizations")
       .update({ active_voice_agent_id: id })

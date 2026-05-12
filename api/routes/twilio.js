@@ -2333,11 +2333,9 @@ router.post(
       return res.status(500).json({ error: { message: numberError.message } });
     }
     if (!number) {
-      return res
-        .status(404)
-        .json({
-          error: { message: "Number not found for this organization." },
-        });
+      return res.status(404).json({
+        error: { message: "Number not found for this organization." },
+      });
     }
 
     const { data: agent, error: agentError } = await db
@@ -2416,11 +2414,9 @@ router.patch(
       return res.status(500).json({ error: { message: numberError.message } });
     }
     if (!number) {
-      return res
-        .status(404)
-        .json({
-          error: { message: "Number not found for this organization." },
-        });
+      return res.status(404).json({
+        error: { message: "Number not found for this organization." },
+      });
     }
 
     const now = new Date().toISOString();
