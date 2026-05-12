@@ -1120,6 +1120,44 @@ async function updateScheduleStatus(req, res, status) {
   res.json({ success: true, schedule: serializeSchedule(data) });
 }
 
+
+router.delete(
+  "/schedules/:id",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const scheduleId = req.params.id;
+
+    const { data: schedule, error: findError } = await db
+      .from("lead_outreach_schedules")
+      .select("id")
+      .eq("id", scheduleId)
+      .eq("organization_id", req.orgId)
+      .maybeSingle();
+    if (findError) throw findError;
+    if (!schedule) {
+      return res.status(404).json({ error: { message: "Schedule not found." } });
+    }
+
+    const { error: runsError } = await db
+      .from("lead_outreach_runs")
+      .delete()
+      .eq("schedule_id", scheduleId)
+      .eq("organization_id", req.orgId);
+    if (runsError) throw runsError;
+
+    const { error: deleteError } = await db
+      .from("lead_outreach_schedules")
+      .delete()
+      .eq("id", scheduleId)
+      .eq("organization_id", req.orgId);
+    if (deleteError) throw deleteError;
+
+    res.json({ success: true, deleted: true, scheduleId });
+  }),
+);
+
 router.post(
   "/schedules/:id/pause",
   requireAuth,
