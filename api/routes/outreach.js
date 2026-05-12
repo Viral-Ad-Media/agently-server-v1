@@ -136,6 +136,66 @@ async function refreshScheduleProgress(db, organizationId, scheduleId) {
   return progress;
 }
 
+function deriveScheduleStatusFromRuns(schedule, runs = []) {
+  const raw = String(schedule?.status || "active").toLowerCase();
+  if (
+    [
+      "completed",
+      "complete",
+      "done",
+      "cancelled",
+      "canceled",
+      "failed",
+      "deleted",
+    ].includes(raw)
+  )
+    return raw;
+  if (!runs.length) return raw;
+  const terminal = new Set([
+    "completed",
+    "failed",
+    "cancelled",
+    "canceled",
+    "no-answer",
+    "busy",
+    "skipped",
+  ]);
+  const remaining = runs.filter(
+    (run) => !terminal.has(String(run.status || "").toLowerCase()),
+  ).length;
+  if (remaining > 0) return raw;
+  const failed = runs.filter((run) =>
+    ["failed", "no-answer", "busy"].includes(
+      String(run.status || "").toLowerCase(),
+    ),
+  ).length;
+  if (failed >= runs.length) return "failed";
+  return "completed";
+}
+
+function buildProgressFromRuns(runs = []) {
+  const progress = {
+    totalRuns: runs.length,
+    pending: 0,
+    processing: 0,
+    completed: 0,
+    failed: 0,
+    remaining: 0,
+  };
+  for (const run of runs) {
+    const status = String(run.status || "queued").toLowerCase();
+    if (status === "completed") progress.completed += 1;
+    else if (
+      ["failed", "no-answer", "busy", "cancelled", "canceled"].includes(status)
+    )
+      progress.failed += 1;
+    else if (status === "initiated") progress.processing += 1;
+    else progress.pending += 1;
+  }
+  progress.remaining = progress.pending + progress.processing;
+  return progress;
+}
+
 function scheduleValidationResponse(res, error) {
   const details =
     error?.details && typeof error.details === "object" ? error.details : {};
@@ -964,13 +1024,60 @@ router.get(
       .order("created_at", { ascending: false })
       .range(from, to);
     if (req.query.status) q = q.eq("status", String(req.query.status));
+    else q = q.neq("status", "deleted");
     if (req.query.agentId)
       q = q.eq("voice_agent_id", String(req.query.agentId));
     const { data, error, count } = await q;
     if (error) throw error;
+    const schedules = data || [];
+    const scheduleIds = schedules
+      .map((schedule) => schedule.id)
+      .filter(Boolean);
+    let runsBySchedule = new Map();
+    if (scheduleIds.length) {
+      const { data: runs, error: runsError } = await db
+        .from("lead_outreach_runs")
+        .select("schedule_id,status")
+        .eq("organization_id", req.orgId)
+        .in("schedule_id", scheduleIds);
+      if (runsError) throw runsError;
+      for (const run of runs || []) {
+        const list = runsBySchedule.get(run.schedule_id) || [];
+        list.push(run);
+        runsBySchedule.set(run.schedule_id, list);
+      }
+    }
+    const serialized = schedules.map((schedule) => {
+      const runs = runsBySchedule.get(schedule.id) || [];
+      const derivedStatus = deriveScheduleStatusFromRuns(schedule, runs);
+      const progress = buildProgressFromRuns(runs);
+      if (derivedStatus !== schedule.status && derivedStatus === "completed") {
+        db.from("lead_outreach_schedules")
+          .update({
+            status: "completed",
+            is_active: false,
+            progress,
+            updated_at: nowIso(),
+          })
+          .eq("id", schedule.id)
+          .eq("organization_id", req.orgId)
+          .then(({ error: updateError }) => {
+            if (updateError)
+              console.warn(
+                "[outreach] schedule status update failed",
+                updateError.message,
+              );
+          });
+      }
+      return serializeSchedule({
+        ...schedule,
+        status: derivedStatus,
+        progress: { ...(schedule.progress || {}), ...progress },
+      });
+    });
     res.json({
       success: true,
-      schedules: (data || []).map(serializeSchedule),
+      schedules: serialized,
       page,
       limit,
       total: count || 0,
@@ -1120,6 +1227,51 @@ async function updateScheduleStatus(req, res, status) {
   res.json({ success: true, schedule: serializeSchedule(data) });
 }
 
+async function deleteScheduleForOrg(db, organizationId, scheduleId) {
+  const { data: schedule, error: findError } = await db
+    .from("lead_outreach_schedules")
+    .select("id")
+    .eq("id", scheduleId)
+    .eq("organization_id", organizationId)
+    .maybeSingle();
+  if (findError) throw findError;
+  if (!schedule) return { found: false, hardDeleted: false };
+
+  const { error: runsError } = await db
+    .from("lead_outreach_runs")
+    .delete()
+    .eq("schedule_id", scheduleId)
+    .eq("organization_id", organizationId);
+  if (runsError) throw runsError;
+
+  const { error: deleteError } = await db
+    .from("lead_outreach_schedules")
+    .delete()
+    .eq("id", scheduleId)
+    .eq("organization_id", organizationId);
+
+  if (!deleteError) return { found: true, hardDeleted: true };
+
+  console.warn("[outreach] hard delete failed; marking schedule deleted", {
+    scheduleId,
+    organizationId,
+    error: deleteError.message,
+  });
+
+  const { error: softDeleteError } = await db
+    .from("lead_outreach_schedules")
+    .update({
+      status: "deleted",
+      is_active: false,
+      updated_at: nowIso(),
+      metadata: { deletedAt: nowIso(), hardDeleteError: deleteError.message },
+    })
+    .eq("id", scheduleId)
+    .eq("organization_id", organizationId);
+  if (softDeleteError) throw softDeleteError;
+
+  return { found: true, hardDeleted: false };
+}
 
 router.delete(
   "/schedules/:id",
@@ -1128,33 +1280,18 @@ router.delete(
   asyncHandler(async (req, res) => {
     const db = getSupabase();
     const scheduleId = req.params.id;
-
-    const { data: schedule, error: findError } = await db
-      .from("lead_outreach_schedules")
-      .select("id")
-      .eq("id", scheduleId)
-      .eq("organization_id", req.orgId)
-      .maybeSingle();
-    if (findError) throw findError;
-    if (!schedule) {
-      return res.status(404).json({ error: { message: "Schedule not found." } });
+    const result = await deleteScheduleForOrg(db, req.orgId, scheduleId);
+    if (!result.found) {
+      return res
+        .status(404)
+        .json({ error: { message: "Schedule not found." } });
     }
-
-    const { error: runsError } = await db
-      .from("lead_outreach_runs")
-      .delete()
-      .eq("schedule_id", scheduleId)
-      .eq("organization_id", req.orgId);
-    if (runsError) throw runsError;
-
-    const { error: deleteError } = await db
-      .from("lead_outreach_schedules")
-      .delete()
-      .eq("id", scheduleId)
-      .eq("organization_id", req.orgId);
-    if (deleteError) throw deleteError;
-
-    res.json({ success: true, deleted: true, scheduleId });
+    res.json({
+      success: true,
+      deleted: true,
+      scheduleId,
+      hardDeleted: result.hardDeleted,
+    });
   }),
 );
 
@@ -1254,6 +1391,7 @@ router.get(
       .order("scheduled_for", { ascending: false })
       .range(from, to);
     if (req.query.status) q = q.eq("status", String(req.query.status));
+    else q = q.neq("status", "deleted");
     const { data, error, count } = await q;
     if (error) throw error;
     res.json({
@@ -1279,6 +1417,7 @@ router.get(
       .order("scheduled_for", { ascending: false })
       .range(from, to);
     if (req.query.status) q = q.eq("status", String(req.query.status));
+    else q = q.neq("status", "deleted");
     if (req.query.scheduleId)
       q = q.eq("schedule_id", String(req.query.scheduleId));
     const { data, error, count } = await q;
