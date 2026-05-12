@@ -686,62 +686,6 @@ router.post(
     }
     if (CallSid && CallStatus) {
       try {
-        const normalizedStatus = String(CallStatus || "").toLowerCase();
-        const directionRaw = String(req.body?.Direction || "").toLowerCase();
-        const direction = directionRaw.startsWith("outbound")
-          ? "outbound"
-          : directionRaw.startsWith("inbound")
-            ? "inbound"
-            : undefined;
-        const durationSeconds =
-          Number(CallDuration || req.body?.Duration || 0) || 0;
-        const terminalStatuses = new Set([
-          "completed",
-          "failed",
-          "busy",
-          "no-answer",
-          "canceled",
-          "cancelled",
-        ]);
-        const generalColumnsPatch = {
-          status: CallStatus || undefined,
-          ...(direction ? { direction } : {}),
-          ...(durationSeconds > 0 ? { duration: durationSeconds } : {}),
-          ...(terminalStatuses.has(normalizedStatus)
-            ? {
-                ended_at: new Date().toISOString(),
-                completed_at: new Date().toISOString(),
-              }
-            : {}),
-        };
-        await updateCallRecordMetadataBySid(
-          CallSid,
-          {
-            twilioStatusCallback: {
-              callStatus: CallStatus,
-              direction: req.body?.Direction || "",
-              durationSeconds,
-              answeredBy: AnsweredBy || "",
-              to: To || req.body?.To || "",
-              from: req.body?.From || "",
-              updatedAt: new Date().toISOString(),
-            },
-          },
-          generalColumnsPatch,
-        );
-      } catch (err) {
-        console.warn(
-          "[Twilio call-status] general call record update skipped",
-          {
-            callSid: CallSid,
-            error: err.message || String(err),
-          },
-        );
-      }
-    }
-
-    if (CallSid && CallStatus) {
-      try {
         const db = getSupabase();
         const { data: scheduledRecord } = await db
           .from("call_records")
@@ -2293,6 +2237,228 @@ router.post(
       manualInstructions: buildManualSmsGeoInstructions(countries),
       readiness,
     });
+  }),
+);
+
+// Tenant-scoped phone numbers list for dashboard UI.
+// This endpoint must never list master Twilio account numbers or other tenants' rows.
+router.get(
+  "/numbers",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const organizationId = bodyOrg(req);
+    const db = getSupabase();
+    const { data: rows, error } = await db
+      .from("twilio_phone_numbers")
+      .select("*")
+      .eq("organization_id", organizationId)
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      return res.status(500).json({
+        error: {
+          message: "Could not load this organization's phone numbers.",
+          details: error.message,
+        },
+      });
+    }
+
+    const now = new Date().toISOString();
+    const numbers = [];
+    for (const row of rows || []) {
+      const caps = numberCapabilitiesFrom(row, null);
+      const isUsVoice =
+        caps.voice !== false &&
+        (String(row.iso_country || "").toUpperCase() === "US" ||
+          String(row.phone_number || "").startsWith("+1"));
+
+      if (isUsVoice) {
+        const assignedStatus = row.assigned_voice_agent_id
+          ? "ready"
+          : "needs_assignment";
+        const readyPatch = {
+          configuration_status: "ready",
+          overall_status: "ready",
+          inbound_voice_status: "ready",
+          outbound_voice_status: "ready",
+          regulatory_readiness_status: "verified",
+          assigned_agent_status: assignedStatus,
+          last_error: null,
+          updated_at: now,
+        };
+        numbers.push({ ...row, ...readyPatch, capabilities: caps });
+        await db
+          .from("twilio_phone_numbers")
+          .update(readyPatch)
+          .eq("id", row.id)
+          .eq("organization_id", organizationId);
+      } else {
+        numbers.push({ ...row, capabilities: caps });
+      }
+    }
+
+    res.json({
+      success: true,
+      organizationId,
+      count: numbers.length,
+      numbers,
+    });
+  }),
+);
+
+router.post(
+  "/numbers/:id/assign-agent",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const organizationId = bodyOrg(req);
+    const numberId = req.params.id;
+    const agentId = req.body?.agentId || req.body?.voiceAgentId;
+
+    if (!agentId) {
+      return res
+        .status(400)
+        .json({ error: { message: "agentId is required." } });
+    }
+
+    const db = getSupabase();
+    const { data: number, error: numberError } = await db
+      .from("twilio_phone_numbers")
+      .select("*")
+      .eq("id", numberId)
+      .eq("organization_id", organizationId)
+      .maybeSingle();
+
+    if (numberError) {
+      return res.status(500).json({ error: { message: numberError.message } });
+    }
+    if (!number) {
+      return res.status(404).json({
+        error: { message: "Number not found for this organization." },
+      });
+    }
+
+    const { data: agent, error: agentError } = await db
+      .from("voice_agents")
+      .select("id,name")
+      .eq("id", agentId)
+      .eq("organization_id", organizationId)
+      .maybeSingle();
+
+    if (agentError) {
+      return res.status(500).json({ error: { message: agentError.message } });
+    }
+    if (!agent) {
+      return res
+        .status(404)
+        .json({ error: { message: "Agent not found for this organization." } });
+    }
+
+    const now = new Date().toISOString();
+    const patch = {
+      assigned_voice_agent_id: agentId,
+      configuration_status: "ready",
+      overall_status: "ready",
+      inbound_voice_status: "ready",
+      outbound_voice_status: "ready",
+      regulatory_readiness_status: "verified",
+      assigned_agent_status: "ready",
+      last_error: null,
+      updated_at: now,
+    };
+
+    const { data: updatedNumber, error: updateError } = await db
+      .from("twilio_phone_numbers")
+      .update(patch)
+      .eq("id", number.id)
+      .eq("organization_id", organizationId)
+      .select("*")
+      .single();
+
+    if (updateError) {
+      return res.status(500).json({ error: { message: updateError.message } });
+    }
+
+    await db
+      .from("voice_agents")
+      .update({
+        twilio_phone_number: number.phone_number,
+        twilio_phone_sid: number.phone_sid,
+        is_active: true,
+        updated_at: now,
+      })
+      .eq("id", agentId)
+      .eq("organization_id", organizationId);
+
+    res.json({ success: true, number: updatedNumber });
+  }),
+);
+
+router.patch(
+  "/numbers/:id",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const organizationId = bodyOrg(req);
+    const numberId = req.params.id;
+    const db = getSupabase();
+
+    const { data: number, error: numberError } = await db
+      .from("twilio_phone_numbers")
+      .select("*")
+      .eq("id", numberId)
+      .eq("organization_id", organizationId)
+      .maybeSingle();
+
+    if (numberError) {
+      return res.status(500).json({ error: { message: numberError.message } });
+    }
+    if (!number) {
+      return res.status(404).json({
+        error: { message: "Number not found for this organization." },
+      });
+    }
+
+    const now = new Date().toISOString();
+    const isUnassign =
+      Boolean(req.body?.unassign) ||
+      req.body?.agentId === null ||
+      req.body?.voiceAgentId === null;
+    const patch = isUnassign
+      ? {
+          assigned_voice_agent_id: null,
+          assigned_agent_status: "needs_assignment",
+          updated_at: now,
+        }
+      : {
+          updated_at: now,
+        };
+
+    const { data: updatedNumber, error: updateError } = await db
+      .from("twilio_phone_numbers")
+      .update(patch)
+      .eq("id", number.id)
+      .eq("organization_id", organizationId)
+      .select("*")
+      .single();
+
+    if (updateError) {
+      return res.status(500).json({ error: { message: updateError.message } });
+    }
+
+    if (isUnassign && number.assigned_voice_agent_id) {
+      await db
+        .from("voice_agents")
+        .update({
+          twilio_phone_number: "",
+          twilio_phone_sid: "",
+          updated_at: now,
+        })
+        .eq("id", number.assigned_voice_agent_id)
+        .eq("organization_id", organizationId);
+    }
+
+    res.json({ success: true, number: updatedNumber });
   }),
 );
 
