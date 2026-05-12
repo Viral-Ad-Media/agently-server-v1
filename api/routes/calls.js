@@ -214,27 +214,12 @@ function durationSeconds(row = {}) {
   return 0;
 }
 
-function derivedStatus(row = {}) {
-  const raw = String(row.status || "").toLowerCase();
-  const outcome = String(row.outcome || "").toLowerCase();
-  if (
-    ["failed", "busy", "no-answer", "no_answer", "canceled", "cancelled"].some(
-      (v) => raw.includes(v) || outcome.includes(v),
-    )
-  ) {
-    return raw.includes("cancel") ? "cancelled" : "failed";
-  }
-  if (
-    row.completed_at ||
-    row.ended_at ||
-    durationSeconds(row) > 0 ||
-    raw === "completed"
-  )
-    return "completed";
-  return raw || "queued";
+function isTwilioProtectedUrl(url = "") {
+  return /api\.twilio\.com|twilio\.com\/2010-04-01/i.test(String(url));
 }
 
-function derivedDirection(row = {}, outboundRunIds = new Set()) {
+function derivedDirection(row = {}, outboundRunIds = new Set(), run = null) {
+  if (run) return "outbound";
   const explicit = String(row.direction || "").toLowerCase();
   if (explicit === "outbound" || explicit === "inbound") {
     if (explicit === "inbound" && outboundRunIds.has(row.id)) return "outbound";
@@ -243,7 +228,8 @@ function derivedDirection(row = {}, outboundRunIds = new Set()) {
       explicit === "inbound" &&
       (metadataText.includes("outbound") ||
         metadataText.includes("callpurpose") ||
-        metadataText.includes("schedule"))
+        metadataText.includes("schedule") ||
+        metadataText.includes("directrecipient"))
     )
       return "outbound";
     return explicit;
@@ -253,26 +239,77 @@ function derivedDirection(row = {}, outboundRunIds = new Set()) {
     outboundRunIds.has(row.id) ||
     metadataText.includes("outbound") ||
     metadataText.includes("callpurpose") ||
-    metadataText.includes("schedule")
+    metadataText.includes("schedule") ||
+    metadataText.includes("directrecipient")
   )
     return "outbound";
   return "inbound";
 }
 
-function serializeCallForLogs(row, outboundRunIds = new Set()) {
-  const duration = durationSeconds(row);
-  const direction = derivedDirection(row, outboundRunIds);
-  const status = derivedStatus(row);
+function terminalRunStatus(status = "") {
+  const value = String(status || "").toLowerCase();
+  if (
+    ["completed", "answered", "success", "succeeded"].some((item) =>
+      value.includes(item),
+    )
+  )
+    return "completed";
+  if (
+    ["failed", "busy", "no-answer", "no_answer", "cancelled", "canceled"].some(
+      (item) => value.includes(item),
+    )
+  )
+    return value.includes("cancel") ? "cancelled" : "failed";
+  return "";
+}
+
+function derivedStatus(row = {}, run = null) {
+  const runTerminal = run ? terminalRunStatus(run.status) : "";
+  if (runTerminal) return runTerminal;
+  const raw = String(row.status || "").toLowerCase();
+  const outcome = String(row.outcome || "").toLowerCase();
+  if (
+    [
+      "failed",
+      "busy",
+      "no-answer",
+      "no_answer",
+      "canceled",
+      "cancelled",
+      "error",
+    ].some((v) => raw.includes(v) || outcome.includes(v))
+  ) {
+    return raw.includes("cancel") ? "cancelled" : "failed";
+  }
+  if (
+    row.completed_at ||
+    row.ended_at ||
+    durationSeconds(row) > 0 ||
+    raw === "completed" ||
+    outcome.includes("completed") ||
+    outcome.includes("answered")
+  )
+    return "completed";
+  return raw || "queued";
+}
+
+function serializeCallForLogs(row, outboundRunIds = new Set(), run = null) {
+  const duration = durationSeconds(row) || Number(run?.call_duration || 0) || 0;
+  const direction = derivedDirection(row, outboundRunIds, run);
+  const status = derivedStatus(row, run);
   const isOutbound = direction === "outbound";
   const metadata = asObject(row.metadata);
   const callerName =
     row.caller_name ||
+    run?.target_name ||
     metadata.targetName ||
     metadata.recipient?.name ||
     metadata.directRecipient?.name ||
     "Unknown Caller";
   const callerPhone =
     row.caller_phone ||
+    run?.target_phone ||
+    run?.destination_phone ||
     metadata.targetPhone ||
     metadata.toPhone ||
     metadata.destination_phone ||
@@ -358,6 +395,20 @@ router.get(
     }
 
     let lead = null;
+    const { data: run } = await db
+      .from("lead_outreach_runs")
+      .select(
+        "id, schedule_id, call_record_id, twilio_call_sid, target_name, target_phone, destination_phone, status, call_duration",
+      )
+      .eq("organization_id", req.orgId)
+      .or(
+        `call_record_id.eq.${call.id},twilio_call_sid.eq.${call.twilio_call_sid || call.provider_call_id || "__none__"}`,
+      )
+      .maybeSingle();
+    const outboundIds = new Set(
+      run?.call_record_id ? [run.call_record_id] : [],
+    );
+    const serialized = serializeCallForLogs(call, outboundIds, run || null);
     const leadId =
       call.metadata?.inbound_call_message?.lead_id ||
       call.lead_id ||
@@ -380,15 +431,11 @@ router.get(
         id: call.id,
         organization_id: call.organization_id,
         voice_agent_id: call.voice_agent_id,
-        direction: derivedDirection(call),
-        status: derivedStatus(call),
-        from:
-          call.metadata?.fromNumber ||
-          call.metadata?.twilioFrom ||
-          call.caller_phone ||
-          "",
-        to: call.metadata?.toPhone || call.metadata?.twilioTo || "",
-        duration: durationSeconds(call),
+        direction: serialized.direction,
+        status: serialized.status,
+        from: serialized.from || "",
+        to: serialized.to || "",
+        duration: serialized.duration,
         summary: call.summary || "",
         transcript: call.transcript || [],
         recording_available: Boolean(call.recording_available),
@@ -471,6 +518,14 @@ router.get(
         console.warn("[calls] recording fallback download failed", {
           callId: call.id,
           error: err.message || String(err),
+        });
+      }
+      if (isTwilioProtectedUrl(fallbackUrl)) {
+        return res.status(404).json({
+          error: {
+            message:
+              "Recording is not available for playback yet. Twilio recording exists, but the server could not proxy it with configured credentials.",
+          },
         });
       }
       return res.json({
@@ -561,23 +616,91 @@ router.get(
     const { data, error, count } = await query;
     if (error) throw error;
 
-    const callIds = (data || []).map((row) => row.id).filter(Boolean);
+    const rows = data || [];
+    const callIds = rows.map((row) => row.id).filter(Boolean);
+    const callSids = rows
+      .map((row) => row.twilio_call_sid || row.provider_call_id)
+      .filter(Boolean);
+    const runByCallId = new Map();
+    const runBySid = new Map();
     let outboundRunIds = new Set();
+
     if (callIds.length) {
       const { data: runs, error: runsError } = await db
         .from("lead_outreach_runs")
-        .select("call_record_id")
+        .select(
+          "id, schedule_id, call_record_id, twilio_call_sid, target_name, target_phone, destination_phone, status, call_duration",
+        )
         .eq("organization_id", req.orgId)
         .in("call_record_id", callIds);
-      if (!runsError)
-        outboundRunIds = new Set(
-          (runs || []).map((run) => run.call_record_id).filter(Boolean),
-        );
+      if (!runsError) {
+        (runs || []).forEach((run) => {
+          if (run.call_record_id) {
+            runByCallId.set(run.call_record_id, run);
+            outboundRunIds.add(run.call_record_id);
+          }
+          if (run.twilio_call_sid) runBySid.set(run.twilio_call_sid, run);
+        });
+      }
     }
 
-    let calls = (data || []).map((row) =>
-      serializeCallForLogs(row, outboundRunIds),
-    );
+    if (callSids.length) {
+      const { data: sidRuns, error: sidRunsError } = await db
+        .from("lead_outreach_runs")
+        .select(
+          "id, schedule_id, call_record_id, twilio_call_sid, target_name, target_phone, destination_phone, status, call_duration",
+        )
+        .eq("organization_id", req.orgId)
+        .in("twilio_call_sid", callSids);
+      if (!sidRunsError) {
+        (sidRuns || []).forEach((run) => {
+          if (run.call_record_id) {
+            runByCallId.set(run.call_record_id, run);
+            outboundRunIds.add(run.call_record_id);
+          }
+          if (run.twilio_call_sid) runBySid.set(run.twilio_call_sid, run);
+        });
+      }
+    }
+
+    const reconciliationUpdates = [];
+    let calls = rows.map((row) => {
+      const run =
+        runByCallId.get(row.id) ||
+        runBySid.get(row.twilio_call_sid) ||
+        runBySid.get(row.provider_call_id) ||
+        null;
+      const serialized = serializeCallForLogs(row, outboundRunIds, run);
+      const update = {};
+      if (serialized.direction && serialized.direction !== row.direction)
+        update.direction = serialized.direction;
+      if (serialized.status && serialized.status !== row.status) {
+        update.status = serialized.status;
+        if (serialized.status === "completed" && !row.completed_at)
+          update.completed_at = row.ended_at || new Date().toISOString();
+      }
+      if (
+        serialized.duration > 0 &&
+        Number(row.duration || 0) !== serialized.duration
+      )
+        update.duration = serialized.duration;
+      if (Object.keys(update).length) {
+        update.updated_at = new Date().toISOString();
+        reconciliationUpdates.push(
+          db
+            .from("call_records")
+            .update(update)
+            .eq("id", row.id)
+            .eq("organization_id", req.orgId),
+        );
+      }
+      return serialized;
+    });
+    if (reconciliationUpdates.length) {
+      Promise.allSettled(reconciliationUpdates).catch((err) =>
+        console.warn("[calls] reconciliation failed", err),
+      );
+    }
     if (req.query.direction) {
       const requestedDirection = String(req.query.direction).toLowerCase();
       calls = calls.filter((call) => call.direction === requestedDirection);
