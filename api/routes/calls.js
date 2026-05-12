@@ -134,13 +134,73 @@ router.post(
   }),
 );
 
+function asObject(value) {
+  if (!value) return {};
+  if (typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? parsed
+        : {};
+    } catch (_) {
+      return {};
+    }
+  }
+  return {};
+}
+
+function directRecordingUrl(row = {}) {
+  const metadata = asObject(row.metadata);
+  return (
+    row.recording_public_url ||
+    row.recording_url ||
+    metadata?.recording?.public_url ||
+    metadata?.recording?.recording_url ||
+    metadata?.recording?.url ||
+    ""
+  );
+}
+
+function twilioBasicAuthHeader() {
+  const sid = process.env.TWILIO_ACCOUNT_SID;
+  const token = process.env.TWILIO_AUTH_TOKEN;
+  if (!sid || !token) return "";
+  return "Basic " + Buffer.from(`${sid}:${token}`).toString("base64");
+}
+
+async function fetchRecordingAsBase64(recordingUrl) {
+  if (!recordingUrl) return null;
+  const url = String(recordingUrl).endsWith(".mp3")
+    ? String(recordingUrl)
+    : `${recordingUrl}.mp3`;
+  const headers = {};
+  const auth = twilioBasicAuthHeader();
+  if (auth && /api\.twilio\.com|twilio\.com/i.test(url))
+    headers.Authorization = auth;
+  const response = await fetch(url, { headers });
+  if (!response.ok)
+    throw new Error(`Recording download failed: ${response.status}`);
+  const arrayBuffer = await response.arrayBuffer();
+  return {
+    audioBase64: Buffer.from(arrayBuffer).toString("base64"),
+    mimeType: response.headers.get("content-type") || "audio/mpeg",
+    size: arrayBuffer.byteLength,
+  };
+}
+
 function durationSeconds(row = {}) {
   const direct = Number(
     row.duration || row.duration_seconds || row.recording_duration || 0,
   );
   if (Number.isFinite(direct) && direct > 0) return Math.round(direct);
+  const metadata = asObject(row.metadata);
   const detail = Number(
-    row.metadata?.call_end_details?.duration || row.metadata?.duration || 0,
+    metadata?.call_end_details?.duration ||
+      metadata?.duration ||
+      metadata?.callDuration ||
+      metadata?.durationSeconds ||
+      0,
   );
   if (Number.isFinite(detail) && detail > 0) return Math.round(detail);
   const start = row.started_at || row.answered_at || null;
@@ -178,7 +238,7 @@ function derivedDirection(row = {}, outboundRunIds = new Set()) {
   const explicit = String(row.direction || "").toLowerCase();
   if (explicit === "outbound" || explicit === "inbound") {
     if (explicit === "inbound" && outboundRunIds.has(row.id)) return "outbound";
-    const metadataText = JSON.stringify(row.metadata || {}).toLowerCase();
+    const metadataText = JSON.stringify(asObject(row.metadata)).toLowerCase();
     if (
       explicit === "inbound" &&
       (metadataText.includes("outbound") ||
@@ -188,7 +248,7 @@ function derivedDirection(row = {}, outboundRunIds = new Set()) {
       return "outbound";
     return explicit;
   }
-  const metadataText = JSON.stringify(row.metadata || {}).toLowerCase();
+  const metadataText = JSON.stringify(asObject(row.metadata)).toLowerCase();
   if (
     outboundRunIds.has(row.id) ||
     metadataText.includes("outbound") ||
@@ -204,7 +264,7 @@ function serializeCallForLogs(row, outboundRunIds = new Set()) {
   const direction = derivedDirection(row, outboundRunIds);
   const status = derivedStatus(row);
   const isOutbound = direction === "outbound";
-  const metadata = row.metadata || {};
+  const metadata = asObject(row.metadata);
   const callerName =
     row.caller_name ||
     metadata.targetName ||
@@ -240,18 +300,22 @@ function serializeCallForLogs(row, outboundRunIds = new Set()) {
     transcript: row.transcript || [],
     recording_available: Boolean(
       row.recording_available ||
+      row.recording_sid ||
       row.recording_public_url ||
       row.recording_storage_path ||
-      row.recording_url,
+      row.recording_url ||
+      directRecordingUrl(row),
     ),
     recordingAvailable: Boolean(
       row.recording_available ||
+      row.recording_sid ||
       row.recording_public_url ||
       row.recording_storage_path ||
-      row.recording_url,
+      row.recording_url ||
+      directRecordingUrl(row),
     ),
-    recording_url: row.recording_public_url || row.recording_url || "",
-    recordingUrl: row.recording_public_url || row.recording_url || "",
+    recording_url: directRecordingUrl(row),
+    recordingUrl: directRecordingUrl(row),
     from: isOutbound
       ? metadata.fromNumber ||
         metadata.twilioFrom ||
@@ -356,7 +420,7 @@ router.get(
     const { data: call, error } = await db
       .from("call_records")
       .select(
-        "id, organization_id, recording_available, recording_status, recording_storage_provider, recording_storage_path, recording_mime_type",
+        "id, organization_id, recording_available, recording_status, recording_storage_provider, recording_storage_path, recording_mime_type, recording_url, recording_public_url, metadata",
       )
       .eq("id", id)
       .eq("organization_id", req.orgId)
@@ -365,32 +429,63 @@ router.get(
       return res
         .status(404)
         .json({ error: { message: "Call record not found." } });
-    if (!call.recording_available || !call.recording_storage_path) {
-      return res
-        .status(404)
-        .json({ error: { message: "Recording is not available yet." } });
-    }
     const bucket = process.env.SUPABASE_RECORDINGS_BUCKET || "call-recordings";
     const expiresIn = Number(
       process.env.RECORDING_SIGNED_URL_TTL_SECONDS || 300,
     );
-    const { data, error: signedError } = await db.storage
-      .from(bucket)
-      .createSignedUrl(call.recording_storage_path, expiresIn);
-    if (signedError || !data?.signedUrl) {
-      return res.status(500).json({
-        error: { message: "Failed to create recording playback URL." },
+
+    if (call.recording_storage_path) {
+      const { data, error: signedError } = await db.storage
+        .from(bucket)
+        .createSignedUrl(call.recording_storage_path, expiresIn);
+      if (!signedError && data?.signedUrl) {
+        return res.json({
+          recording: {
+            call_id: call.id,
+            recording_status: call.recording_status,
+            mime_type: call.recording_mime_type || "audio/mpeg",
+            expires_in: expiresIn,
+            signed_url: data.signedUrl,
+          },
+        });
+      }
+    }
+
+    const fallbackUrl = directRecordingUrl(call);
+    if (fallbackUrl) {
+      try {
+        const audio = await fetchRecordingAsBase64(fallbackUrl);
+        if (audio?.audioBase64) {
+          return res.json({
+            recording: {
+              call_id: call.id,
+              recording_status: call.recording_status || "available",
+              mime_type:
+                audio.mimeType || call.recording_mime_type || "audio/mpeg",
+              audioBase64: audio.audioBase64,
+              size: audio.size,
+            },
+          });
+        }
+      } catch (err) {
+        console.warn("[calls] recording fallback download failed", {
+          callId: call.id,
+          error: err.message || String(err),
+        });
+      }
+      return res.json({
+        recording: {
+          call_id: call.id,
+          recording_status: call.recording_status || "available",
+          mime_type: call.recording_mime_type || "audio/mpeg",
+          signed_url: fallbackUrl,
+        },
       });
     }
-    return res.json({
-      recording: {
-        call_id: call.id,
-        recording_status: call.recording_status,
-        mime_type: call.recording_mime_type || "audio/mpeg",
-        expires_in: expiresIn,
-        signed_url: data.signedUrl,
-      },
-    });
+
+    return res
+      .status(404)
+      .json({ error: { message: "Recording is not available yet." } });
   }),
 );
 
