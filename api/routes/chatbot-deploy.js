@@ -69,14 +69,12 @@ router.post(
 
     const apiUrl = (process.env.API_URL || "").replace(/\/$/, "");
     if (!apiUrl) {
-      return res
-        .status(500)
-        .json({
-          error: {
-            message:
-              "API_URL environment variable is not configured on the server.",
-          },
-        });
+      return res.status(500).json({
+        error: {
+          message:
+            "API_URL environment variable is not configured on the server.",
+        },
+      });
     }
 
     const widgetUrl = `${apiUrl}/chatbot-widget/${id}`;

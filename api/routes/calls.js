@@ -134,147 +134,6 @@ router.post(
   }),
 );
 
-
-
-function asObject(value) {
-  if (!value) return {};
-  if (typeof value === "object" && !Array.isArray(value)) return value;
-  if (typeof value === "string") {
-    try {
-      const parsed = JSON.parse(value);
-      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
-    } catch (_) {
-      return {};
-    }
-  }
-  return {};
-}
-
-function directRecordingUrl(row = {}) {
-  const metadata = asObject(row.metadata);
-  return (
-    row.recording_public_url ||
-    row.recording_url ||
-    metadata?.recording?.public_url ||
-    metadata?.recording?.recording_url ||
-    metadata?.recording?.url ||
-    ""
-  );
-}
-
-function isProtectedTwilioRecordingUrl(value) {
-  if (!value) return false;
-  try {
-    const url = new URL(String(value));
-    return /(^|\.)api\.twilio\.com$/i.test(url.hostname) || /(^|\.)twilio\.com$/i.test(url.hostname);
-  } catch (_) {
-    return /api\.twilio\.com|twilio\.com/i.test(String(value));
-  }
-}
-
-function browserSafeRecordingUrl(row = {}) {
-  const url = directRecordingUrl(row);
-  return isProtectedTwilioRecordingUrl(url) ? "" : url;
-}
-
-function twilioBasicAuthHeader() {
-  const sid = process.env.TWILIO_ACCOUNT_SID;
-  const token = process.env.TWILIO_AUTH_TOKEN;
-  if (!sid || !token) return "";
-  return "Basic " + Buffer.from(`${sid}:${token}`).toString("base64");
-}
-
-async function fetchRecordingAsBase64(recordingUrl) {
-  if (!recordingUrl) return null;
-  const url = String(recordingUrl).endsWith(".mp3") ? String(recordingUrl) : `${recordingUrl}.mp3`;
-  const headers = {};
-  const auth = twilioBasicAuthHeader();
-  if (auth && /api\.twilio\.com|twilio\.com/i.test(url)) headers.Authorization = auth;
-  const response = await fetch(url, { headers });
-  if (!response.ok) throw new Error(`Recording download failed: ${response.status}`);
-  const arrayBuffer = await response.arrayBuffer();
-  return {
-    audioBase64: Buffer.from(arrayBuffer).toString("base64"),
-    mimeType: response.headers.get("content-type") || "audio/mpeg",
-    size: arrayBuffer.byteLength,
-  };
-}
-
-function durationSeconds(row = {}) {
-  const direct = Number(row.duration || row.duration_seconds || row.recording_duration || 0);
-  if (Number.isFinite(direct) && direct > 0) return Math.round(direct);
-  const metadata = asObject(row.metadata);
-  const detail = Number(metadata?.call_end_details?.duration || metadata?.duration || metadata?.callDuration || metadata?.durationSeconds || 0);
-  if (Number.isFinite(detail) && detail > 0) return Math.round(detail);
-  const start = row.started_at || row.answered_at || null;
-  const end = row.ended_at || row.completed_at || null;
-  if (start && end) {
-    const seconds = Math.round((new Date(end).getTime() - new Date(start).getTime()) / 1000);
-    if (Number.isFinite(seconds) && seconds > 0) return seconds;
-  }
-  return 0;
-}
-
-function derivedStatus(row = {}) {
-  const raw = String(row.status || '').toLowerCase();
-  const outcome = String(row.outcome || '').toLowerCase();
-  if (['failed', 'busy', 'no-answer', 'no_answer', 'canceled', 'cancelled'].some((v) => raw.includes(v) || outcome.includes(v))) {
-    return raw.includes('cancel') ? 'cancelled' : 'failed';
-  }
-  if (row.completed_at || row.ended_at || durationSeconds(row) > 0 || raw === 'completed') return 'completed';
-  return raw || 'queued';
-}
-
-function derivedDirection(row = {}, outboundRunIds = new Set()) {
-  const explicit = String(row.direction || '').toLowerCase();
-  if (explicit === 'outbound' || explicit === 'inbound') {
-    if (explicit === 'inbound' && outboundRunIds.has(row.id)) return 'outbound';
-    const metadataText = JSON.stringify(asObject(row.metadata)).toLowerCase();
-    if (explicit === 'inbound' && (metadataText.includes('outbound') || metadataText.includes('callpurpose') || metadataText.includes('schedule'))) return 'outbound';
-    return explicit;
-  }
-  const metadataText = JSON.stringify(asObject(row.metadata)).toLowerCase();
-  if (outboundRunIds.has(row.id) || metadataText.includes('outbound') || metadataText.includes('callpurpose') || metadataText.includes('schedule')) return 'outbound';
-  return 'inbound';
-}
-
-function serializeCallForLogs(row, outboundRunIds = new Set()) {
-  const duration = durationSeconds(row);
-  const direction = derivedDirection(row, outboundRunIds);
-  const status = derivedStatus(row);
-  const isOutbound = direction === 'outbound';
-  const metadata = asObject(row.metadata);
-  const callerName = row.caller_name || metadata.targetName || metadata.recipient?.name || metadata.directRecipient?.name || 'Unknown Caller';
-  const callerPhone = row.caller_phone || metadata.targetPhone || metadata.toPhone || metadata.destination_phone || metadata.recipient?.phone || '';
-  return {
-    id: row.id,
-    organization_id: row.organization_id,
-    voice_agent_id: row.voice_agent_id,
-    callerName,
-    caller_name: callerName,
-    callerPhone,
-    caller_phone: callerPhone,
-    direction,
-    status,
-    duration,
-    duration_seconds: duration,
-    timestamp: row.timestamp || row.started_at || row.created_at,
-    created_at: row.created_at,
-    started_at: row.started_at,
-    completed_at: row.completed_at,
-    ended_at: row.ended_at,
-    outcome: row.outcome || (status === 'completed' ? 'Completed' : status),
-    summary: row.summary || '',
-    transcript: row.transcript || [],
-    recording_available: Boolean(row.recording_available || row.recording_sid || row.recording_public_url || row.recording_storage_path || row.recording_url || directRecordingUrl(row)),
-    recordingAvailable: Boolean(row.recording_available || row.recording_sid || row.recording_public_url || row.recording_storage_path || row.recording_url || directRecordingUrl(row)),
-    recording_url: browserSafeRecordingUrl(row),
-    recordingUrl: browserSafeRecordingUrl(row),
-    from: isOutbound ? (metadata.fromNumber || metadata.twilioFrom || row.twilio_phone_number || '') : (metadata.twilioFrom || row.caller_phone || ''),
-    to: isOutbound ? (metadata.toPhone || metadata.destination_phone || row.caller_phone || '') : (metadata.twilioTo || ''),
-  };
-}
-
 function redactCallMetadata(metadata = {}) {
   const safe =
     metadata && typeof metadata === "object" && !Array.isArray(metadata)
@@ -327,15 +186,16 @@ router.get(
         id: call.id,
         organization_id: call.organization_id,
         voice_agent_id: call.voice_agent_id,
-        direction: derivedDirection(call),
-        status: derivedStatus(call),
+        direction: call.direction,
+        status: call.status,
         from:
           call.metadata?.fromNumber ||
           call.metadata?.twilioFrom ||
           call.caller_phone ||
           "",
         to: call.metadata?.toPhone || call.metadata?.twilioTo || "",
-        duration: durationSeconds(call),
+        duration:
+          call.duration || call.metadata?.call_end_details?.duration || null,
         summary: call.summary || "",
         transcript: call.transcript || [],
         recording_available: Boolean(call.recording_available),
@@ -367,7 +227,7 @@ router.get(
     const { data: call, error } = await db
       .from("call_records")
       .select(
-        "id, organization_id, recording_available, recording_status, recording_storage_provider, recording_storage_path, recording_mime_type, recording_url, recording_public_url, metadata",
+        "id, organization_id, recording_available, recording_status, recording_storage_provider, recording_storage_path, recording_mime_type",
       )
       .eq("id", id)
       .eq("organization_id", req.orgId)
@@ -376,72 +236,32 @@ router.get(
       return res
         .status(404)
         .json({ error: { message: "Call record not found." } });
+    if (!call.recording_available || !call.recording_storage_path) {
+      return res
+        .status(404)
+        .json({ error: { message: "Recording is not available yet." } });
+    }
     const bucket = process.env.SUPABASE_RECORDINGS_BUCKET || "call-recordings";
     const expiresIn = Number(
       process.env.RECORDING_SIGNED_URL_TTL_SECONDS || 300,
     );
-
-    if (call.recording_storage_path) {
-      const { data, error: signedError } = await db.storage
-        .from(bucket)
-        .createSignedUrl(call.recording_storage_path, expiresIn);
-      if (!signedError && data?.signedUrl) {
-        return res.json({
-          recording: {
-            call_id: call.id,
-            recording_status: call.recording_status,
-            mime_type: call.recording_mime_type || "audio/mpeg",
-            expires_in: expiresIn,
-            signed_url: data.signedUrl,
-          },
-        });
-      }
-    }
-
-    const fallbackUrl = directRecordingUrl(call);
-    if (fallbackUrl) {
-      try {
-        const audio = await fetchRecordingAsBase64(fallbackUrl);
-        if (audio?.audioBase64) {
-          return res.json({
-            recording: {
-              call_id: call.id,
-              recording_status: call.recording_status || "available",
-              mime_type: audio.mimeType || call.recording_mime_type || "audio/mpeg",
-              audioBase64: audio.audioBase64,
-              size: audio.size,
-            },
-          });
-        }
-      } catch (err) {
-        console.warn("[calls] recording fallback download failed", {
-          callId: call.id,
-          error: err.message || String(err),
-        });
-      }
-      // Do not return protected Twilio API URLs directly to the browser.
-      // Browsers will prompt for Basic Auth if an <audio> tag points at api.twilio.com.
-      // If server-side proxying failed, surface a normal API error instead.
-      if (!isProtectedTwilioRecordingUrl(fallbackUrl)) {
-        return res.json({
-          recording: {
-            call_id: call.id,
-            recording_status: call.recording_status || "available",
-            mime_type: call.recording_mime_type || "audio/mpeg",
-            signed_url: fallbackUrl,
-          },
-        });
-      }
-      return res.status(502).json({
-        error: {
-          message: "Recording exists but could not be proxied yet. Check Twilio credentials on the backend.",
-        },
+    const { data, error: signedError } = await db.storage
+      .from(bucket)
+      .createSignedUrl(call.recording_storage_path, expiresIn);
+    if (signedError || !data?.signedUrl) {
+      return res.status(500).json({
+        error: { message: "Failed to create recording playback URL." },
       });
     }
-
-    return res
-      .status(404)
-      .json({ error: { message: "Recording is not available yet." } });
+    return res.json({
+      recording: {
+        call_id: call.id,
+        recording_status: call.recording_status,
+        mime_type: call.recording_mime_type || "audio/mpeg",
+        expires_in: expiresIn,
+        signed_url: data.signedUrl,
+      },
+    });
   }),
 );
 
@@ -507,65 +327,19 @@ router.get(
     const page = Math.max(1, Number(req.query.page || 1));
     const from = (page - 1) * limit;
     const to = from + limit - 1;
-    let query = db
+    const { data, error, count } = await db
       .from("call_records")
       .select("*", { count: "exact" })
       .eq("organization_id", req.orgId)
       .order("created_at", { ascending: false })
       .range(from, to);
-    if (req.query.status) query = query.eq("status", String(req.query.status));
-    const { data, error, count } = await query;
     if (error) throw error;
-
-    const callIds = (data || []).map((row) => row.id).filter(Boolean);
-    let outboundRunIds = new Set();
-    if (callIds.length) {
-      const { data: runs, error: runsError } = await db
-        .from("lead_outreach_runs")
-        .select("call_record_id")
-        .eq("organization_id", req.orgId)
-        .in("call_record_id", callIds);
-      if (!runsError) outboundRunIds = new Set((runs || []).map((run) => run.call_record_id).filter(Boolean));
-    }
-
-    let calls = (data || []).map((row) => serializeCallForLogs(row, outboundRunIds));
-    if (req.query.direction) {
-      const requestedDirection = String(req.query.direction).toLowerCase();
-      calls = calls.filter((call) => call.direction === requestedDirection);
-    }
-
-    const { data: metricRows, error: metricError } = await db
-      .from("call_records")
-      .select("id,status,outcome,duration,recording_duration,started_at,answered_at,ended_at,completed_at,metadata")
-      .eq("organization_id", req.orgId)
-      .limit(1000);
-    if (metricError) throw metricError;
-    const metrics = (metricRows || []).reduce(
-      (acc, row) => {
-        const status = derivedStatus(row);
-        const duration = durationSeconds(row);
-        acc.totalCalls += 1;
-        if (status === "completed") acc.completed += 1;
-        if (status === "failed" || status === "cancelled") acc.failed += 1;
-        acc.durationSum += duration;
-        return acc;
-      },
-      { totalCalls: 0, completed: 0, failed: 0, durationSum: 0 },
-    );
-    const avgDuration = metrics.totalCalls ? Math.round(metrics.durationSum / metrics.totalCalls) : 0;
-
     res.json({
       success: true,
-      calls,
+      calls: (data || []).map(serializeCall),
       page,
       limit,
       total: count || 0,
-      metrics: {
-        totalCalls: metrics.totalCalls,
-        completed: metrics.completed,
-        failed: metrics.failed,
-        avgDuration,
-      },
     });
   }),
 );
