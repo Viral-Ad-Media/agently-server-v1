@@ -693,8 +693,7 @@ router.post(
           : directionRaw.startsWith("inbound")
             ? "inbound"
             : undefined;
-        const durationSeconds =
-          Number(CallDuration || req.body?.Duration || 0) || 0;
+        const durationSeconds = Number(CallDuration || req.body?.Duration || 0) || 0;
         const terminalStatuses = new Set([
           "completed",
           "failed",
@@ -730,13 +729,10 @@ router.post(
           generalColumnsPatch,
         );
       } catch (err) {
-        console.warn(
-          "[Twilio call-status] general call record update skipped",
-          {
-            callSid: CallSid,
-            error: err.message || String(err),
-          },
-        );
+        console.warn("[Twilio call-status] general call record update skipped", {
+          callSid: CallSid,
+          error: err.message || String(err),
+        });
       }
     }
 
