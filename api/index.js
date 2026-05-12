@@ -160,6 +160,11 @@ safeMount(
   "chatbot-public",
 );
 safeMount("/api/twilio", () => require("./routes/twilio"), "twilio");
+safeMount(
+  "/api/notifications",
+  () => require("./routes/notifications"),
+  "notifications",
+);
 safeMount("/api/voices", () => require("./routes/voices"), "voices");
 safeMount(
   "/api/elevenlabs",
