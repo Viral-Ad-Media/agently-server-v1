@@ -519,8 +519,16 @@ router.get(
       0,
     );
     const totalCallMinutes = Math.round((totalCallSeconds / 60) * 10) / 10;
-    const minuteLimit = Number(org.minute_limit || 500);
-    const callLimit = Number(org.call_limit || 100);
+    const planName = String(
+      org.plan || req.organization?.plan || "Starter",
+    ).toLowerCase();
+    const storedMinuteLimit = Number(
+      org.minute_limit || req.organization?.minute_limit || 500,
+    );
+    const minuteLimit = planName === "starter" ? 500 : storedMinuteLimit || 500;
+    const callLimit = Number(
+      org.call_limit || req.organization?.call_limit || 100,
+    );
 
     const completedCalls = calls.filter((call) => {
       const status = String(call.status || "").toLowerCase();
