@@ -155,6 +155,11 @@ safeMount("/api/calls", () => require("./routes/calls"), "calls");
 safeMount("/api/leads", () => require("./routes/leads"), "leads");
 safeMount("/api/outreach", () => require("./routes/outreach"), "outreach");
 safeMount(
+  "/api/call-schedules",
+  () => require("./routes/call-schedules"),
+  "call-schedules",
+);
+safeMount(
   "/api/chatbot-public",
   () => require("./routes/chatbot-public"),
   "chatbot-public",

@@ -8,6 +8,15 @@ const { serializeLead } = require("../../lib/serializers");
 
 const router = express.Router();
 
+// Lightweight route probe for deployment checks.
+router.get(
+  "/health",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    res.json({ success: true, route: "leads", organizationId: req.orgId });
+  }),
+);
+
 function normalizeTags(tags) {
   if (!Array.isArray(tags)) return [];
   return [
@@ -85,7 +94,11 @@ function cell(row, index) {
 function validUuidOrNull(s) {
   if (!s) return null;
   const v = String(s).trim();
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v) ? v : null;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+    v,
+  )
+    ? v
+    : null;
 }
 
 function parseScheduleWindows(windows) {
@@ -110,6 +123,104 @@ function parseScheduleWindows(windows) {
         window.weekdays.length > 0 && /^\d{2}:\d{2}$/.test(window.time),
     );
 }
+
+// ── GET /api/leads ─────────────────────────────────────────────
+router.get(
+  "/",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const page = Math.max(
+      1,
+      Number.parseInt(String(req.query.page || "1"), 10) || 1,
+    );
+    const limit = Math.min(
+      500,
+      Math.max(1, Number.parseInt(String(req.query.limit || "100"), 10) || 100),
+    );
+    const from = (page - 1) * limit;
+    const to = from + limit - 1;
+    const search = String(req.query.search || "").trim();
+    const status = String(req.query.status || "")
+      .trim()
+      .toLowerCase();
+    const source = String(req.query.source || "")
+      .trim()
+      .toLowerCase();
+    const tag = String(req.query.tag || "").trim();
+
+    let query = db
+      .from("leads")
+      .select("*", { count: "exact" })
+      .eq("organization_id", req.orgId);
+
+    if (status && status !== "all") query = query.eq("status", status);
+    if (source && source !== "all")
+      query = query.ilike("source", `%${source}%`);
+    if (tag) query = query.contains("tags", [tag]);
+    if (search) {
+      const pattern = `%${search.replace(/[%_]/g, "").trim()}%`;
+      query = query.or(
+        `name.ilike.${pattern},phone.ilike.${pattern},email.ilike.${pattern},reason.ilike.${pattern}`,
+      );
+    }
+
+    const { data, error, count } = await query
+      .order("created_at", { ascending: false })
+      .range(from, to);
+
+    if (error) {
+      return res.status(500).json({
+        error: { message: error.message || "Failed to load leads." },
+      });
+    }
+
+    const { data: allLeads, error: metricsError } = await db
+      .from("leads")
+      .select("id,status,source")
+      .eq("organization_id", req.orgId);
+
+    if (metricsError) {
+      return res.status(500).json({
+        error: {
+          message: metricsError.message || "Failed to load lead metrics.",
+        },
+      });
+    }
+
+    const rows = allLeads || [];
+    const total = rows.length;
+    const byStatus = (value) =>
+      rows.filter((lead) => String(lead.status || "new") === value).length;
+    const sourceIncludes = (value) =>
+      rows.filter((lead) =>
+        String(lead.source || "")
+          .toLowerCase()
+          .includes(value),
+      ).length;
+    const closed = byStatus("closed");
+
+    res.json({
+      success: true,
+      organizationId: req.orgId,
+      page,
+      limit,
+      total: count ?? total,
+      leads: (data || []).map(serializeLead),
+      metrics: {
+        total,
+        new: byStatus("new"),
+        contacted: byStatus("contacted"),
+        closed,
+        converted: closed,
+        conversionRate: total ? Math.round((closed / total) * 100) : 0,
+        callLeads: sourceIncludes("call"),
+        chatbotLeads: sourceIncludes("chat"),
+        manualLeads: sourceIncludes("manual"),
+      },
+    });
+  }),
+);
 
 // ── POST /api/leads ────────────────────────────────────────────
 router.post(
