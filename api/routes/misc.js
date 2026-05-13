@@ -50,13 +50,11 @@ router.post(
       .single();
 
     if (existing) {
-      return res
-        .status(409)
-        .json({
-          error: {
-            message: "This user is already a member of your organization.",
-          },
-        });
+      return res.status(409).json({
+        error: {
+          message: "This user is already a member of your organization.",
+        },
+      });
     }
 
     // Create placeholder user
@@ -418,6 +416,204 @@ router.post(
       success: true,
       message:
         "Sales inquiry submitted. Our team will be in touch within 24 hours.",
+    });
+  }),
+);
+
+// ============================================================
+// DASHBOARD METRICS
+// ============================================================
+
+const secondsBetween = (start, end) => {
+  if (!start || !end) return 0;
+  const a = new Date(start).getTime();
+  const b = new Date(end).getTime();
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a) return 0;
+  return Math.round((b - a) / 1000);
+};
+
+const estimateUtf8Bytes = (value) =>
+  Buffer.byteLength(String(value || ""), "utf8");
+
+const normalizeCallDurationSeconds = (call) => {
+  const direct = Number(call.duration || 0);
+  if (Number.isFinite(direct) && direct > 0) return direct;
+
+  const recording = Number(call.recording_duration || 0);
+  if (Number.isFinite(recording) && recording > 0) return recording;
+
+  const metadata =
+    call.metadata && typeof call.metadata === "object" ? call.metadata : {};
+  const nestedDuration = Number(
+    metadata.durationSeconds ||
+      metadata.duration_seconds ||
+      metadata.duration ||
+      (metadata.call_end_details && metadata.call_end_details.duration) ||
+      0,
+  );
+  if (Number.isFinite(nestedDuration) && nestedDuration > 0)
+    return nestedDuration;
+
+  return secondsBetween(
+    call.started_at || call.answered_at,
+    call.ended_at || call.completed_at,
+  );
+};
+
+// ── GET /api/dashboard/metrics ───────────────────────────────
+router.get(
+  "/dashboard/metrics",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+
+    const [
+      orgResult,
+      callsResult,
+      leadsResult,
+      chatMessagesResult,
+      knowledgeResult,
+    ] = await Promise.all([
+      db
+        .from("organizations")
+        .select("usage_calls,usage_minutes,call_limit,minute_limit,plan")
+        .eq("id", req.orgId)
+        .single(),
+      db
+        .from("call_records")
+        .select(
+          "id,duration,recording_duration,status,direction,outcome,started_at,answered_at,ended_at,completed_at,metadata,created_at,voice_agent_id",
+        )
+        .eq("organization_id", req.orgId)
+        .order("created_at", { ascending: false })
+        .limit(5000),
+      db
+        .from("leads")
+        .select("id,status,source,created_at,voice_agent_id")
+        .eq("organization_id", req.orgId)
+        .limit(10000),
+      db
+        .from("chat_messages")
+        .select("id,role,created_at,chatbot_id")
+        .eq("organization_id", req.orgId)
+        .limit(20000),
+      db
+        .from("knowledge_chunks")
+        .select("id,content,source_url,source_title,created_at")
+        .eq("organization_id", req.orgId)
+        .limit(20000),
+    ]);
+
+    const org = orgResult.data || req.organization || {};
+    const calls = Array.isArray(callsResult.data) ? callsResult.data : [];
+    const leads = Array.isArray(leadsResult.data) ? leadsResult.data : [];
+    const chatMessages = Array.isArray(chatMessagesResult.data)
+      ? chatMessagesResult.data
+      : [];
+    const knowledgeChunks = Array.isArray(knowledgeResult.data)
+      ? knowledgeResult.data
+      : [];
+
+    const totalCallSeconds = calls.reduce(
+      (sum, call) => sum + normalizeCallDurationSeconds(call),
+      0,
+    );
+    const totalCallMinutes = Math.round((totalCallSeconds / 60) * 10) / 10;
+    const minuteLimit = Number(org.minute_limit || 500);
+    const callLimit = Number(org.call_limit || 100);
+
+    const completedCalls = calls.filter((call) => {
+      const status = String(call.status || "").toLowerCase();
+      return (
+        status.includes("complete") ||
+        call.completed_at ||
+        call.ended_at ||
+        normalizeCallDurationSeconds(call) > 0
+      );
+    }).length;
+    const failedCalls = calls.filter((call) => {
+      const status = String(call.status || "").toLowerCase();
+      return (
+        status.includes("fail") ||
+        status.includes("busy") ||
+        status.includes("no-answer") ||
+        status.includes("cancel")
+      );
+    }).length;
+
+    const chatbotMessagesAnswered = chatMessages.filter((message) =>
+      ["model", "assistant", "bot"].includes(
+        String(message.role || "").toLowerCase(),
+      ),
+    ).length;
+    const chatbotTotalMessages = chatMessages.length;
+
+    const chatbotLeadsCaptured = leads.filter(
+      (lead) => String(lead.source || "").toLowerCase() === "chatbot",
+    ).length;
+    const callLeadsCaptured = leads.filter((lead) => {
+      const source = String(lead.source || "").toLowerCase();
+      return source === "call" || source === "voice" || source === "outbound";
+    }).length;
+    const convertedLeads = leads.filter((lead) => {
+      const status = String(lead.status || "").toLowerCase();
+      return status === "closed" || status === "converted" || status === "won";
+    }).length;
+
+    const estimatedStorageBytes = knowledgeChunks.reduce((sum, chunk) => {
+      return (
+        sum +
+        estimateUtf8Bytes(chunk.content) +
+        estimateUtf8Bytes(chunk.source_url) +
+        estimateUtf8Bytes(chunk.source_title)
+      );
+    }, 0);
+
+    const estimatedStorageLabel =
+      estimatedStorageBytes < 1024 * 1024
+        ? `${Math.max(0, Math.round(estimatedStorageBytes / 1024))} KB`
+        : `${(estimatedStorageBytes / (1024 * 1024)).toFixed(1)} MB`;
+
+    res.json({
+      success: true,
+      organizationId: req.orgId,
+      metrics: {
+        calls: {
+          total: calls.length,
+          completed: completedCalls,
+          failed: failedCalls,
+        },
+        usage: {
+          totalCallSeconds,
+          totalCallMinutes,
+          minuteLimit,
+          remainingMinutes: Math.max(0, minuteLimit - totalCallMinutes),
+          usagePercent: minuteLimit
+            ? Math.min(100, (totalCallMinutes / minuteLimit) * 100)
+            : 0,
+          callsUsed: Number(org.usage_calls || calls.length || 0),
+          callLimit,
+        },
+        chatbot: {
+          messagesAnswered: chatbotMessagesAnswered,
+          totalMessages: chatbotTotalMessages,
+          leadsCaptured: chatbotLeadsCaptured,
+        },
+        leads: {
+          totalCaptured: leads.length,
+          chatbotLeadsCaptured,
+          callLeadsCaptured,
+          converted: convertedLeads,
+          conversionRate: leads.length
+            ? Math.round((convertedLeads / leads.length) * 1000) / 10
+            : 0,
+        },
+        knowledge: {
+          chunks: knowledgeChunks.length,
+          estimatedStorageBytes,
+          estimatedStorageLabel,
+        },
+      },
     });
   }),
 );
