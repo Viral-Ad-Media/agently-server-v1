@@ -17,6 +17,99 @@ const router = express.Router();
 // TEAM
 // ============================================================
 
+// ── GET /api/team/members ───────────────────────────────────
+router.get(
+  "/team/members",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const { data: members = [], error } = await db
+      .from("users")
+      .select("id,name,email,role,avatar,created_at,updated_at")
+      .eq("organization_id", req.orgId)
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      return res
+        .status(500)
+        .json({ error: { message: "Unable to load team members." } });
+    }
+
+    const serialized = members.map(serializeUser);
+    res.json({
+      success: true,
+      organizationId: req.orgId,
+      members: serialized,
+      metrics: {
+        total: serialized.length,
+        owners: serialized.filter((member) => member.role === "Owner").length,
+        admins: serialized.filter((member) => member.role === "Admin").length,
+        viewers: serialized.filter((member) => member.role === "Viewer").length,
+      },
+    });
+  }),
+);
+
+// ── PATCH /api/team/members/:id/role ─────────────────────────
+router.patch(
+  "/team/members/:id/role",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const { role } = req.body;
+
+    if (!["Admin", "Viewer"].includes(role)) {
+      return res
+        .status(400)
+        .json({ error: { message: "Role must be Admin or Viewer." } });
+    }
+
+    if (id === req.user.id && req.user.role !== "Owner") {
+      return res
+        .status(400)
+        .json({ error: { message: "You cannot change your own role." } });
+    }
+
+    const db = getSupabase();
+    const { data: target } = await db
+      .from("users")
+      .select("id,role")
+      .eq("id", id)
+      .eq("organization_id", req.orgId)
+      .single();
+
+    if (!target) {
+      return res
+        .status(404)
+        .json({ error: { message: "Team member not found." } });
+    }
+
+    if (target.role === "Owner") {
+      return res
+        .status(403)
+        .json({ error: { message: "Owner role cannot be changed." } });
+    }
+
+    const { data: member, error } = await db
+      .from("users")
+      .update({ role, updated_at: new Date().toISOString() })
+      .eq("id", id)
+      .eq("organization_id", req.orgId)
+      .select()
+      .single();
+
+    if (error) {
+      return res
+        .status(500)
+        .json({ error: { message: "Unable to update member role." } });
+    }
+
+    res.json({ success: true, member: serializeUser(member) });
+  }),
+);
+
 // ── POST /api/team/invitations ───────────────────────────────
 router.post(
   "/team/invitations",
@@ -156,6 +249,73 @@ router.delete(
 // BILLING
 // ============================================================
 
+// ── GET /api/billing/summary ─────────────────────────────────
+router.get(
+  "/billing/summary",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const { data: org } = await db
+      .from("organizations")
+      .select(
+        "plan,subscription_status,subscription_period_end,usage_calls,usage_minutes,call_limit,minute_limit",
+      )
+      .eq("id", req.orgId)
+      .single();
+
+    const { data: invoices = [] } = await db
+      .from("invoices")
+      .select("id,amount,status,pdf_url,date,created_at")
+      .eq("organization_id", req.orgId)
+      .order("date", { ascending: false });
+
+    const serializedInvoices = invoices.map((invoice) => ({
+      id: invoice.id,
+      amount: Number(invoice.amount || 0),
+      status: invoice.status || "Paid",
+      pdfUrl: invoice.pdf_url || "",
+      date: invoice.date || invoice.created_at,
+    }));
+
+    const paidAmount = serializedInvoices
+      .filter((invoice) => invoice.status === "Paid")
+      .reduce((sum, invoice) => sum + Number(invoice.amount || 0), 0);
+    const pendingAmount = serializedInvoices
+      .filter((invoice) => invoice.status !== "Paid")
+      .reduce((sum, invoice) => sum + Number(invoice.amount || 0), 0);
+
+    const plan = org?.plan || req.organization?.plan || "Starter";
+    const minuteLimit =
+      plan === "Starter" ? 500 : Number(org?.minute_limit || 2500);
+    const callLimit = plan === "Starter" ? 100 : Number(org?.call_limit || 500);
+
+    res.json({
+      success: true,
+      organizationId: req.orgId,
+      plan,
+      status:
+        org?.subscription_status ||
+        req.organization?.subscription_status ||
+        "trialing",
+      currentPeriodEnd:
+        org?.subscription_period_end ||
+        req.organization?.subscription_period_end,
+      usage: {
+        calls: Number(org?.usage_calls || 0),
+        minutes: Number(org?.usage_minutes || 0),
+        callLimit,
+        minuteLimit,
+      },
+      invoices: serializedInvoices,
+      totals: {
+        paidAmount,
+        pendingAmount,
+        invoiceCount: serializedInvoices.length,
+      },
+    });
+  }),
+);
+
 // ── PATCH /api/billing/plan ──────────────────────────────────
 router.patch(
   "/billing/plan",
@@ -284,6 +444,28 @@ For questions, contact billing@agently.ai
 // ============================================================
 // SETTINGS
 // ============================================================
+
+// ── GET /api/settings ────────────────────────────────────────
+router.get(
+  "/settings",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const { data: org } = await db
+      .from("organizations")
+      .select("timezone,phone_number")
+      .eq("id", req.orgId)
+      .single();
+
+    res.json({
+      timezone: org?.timezone || req.organization?.timezone || "Africa/Lagos",
+      phoneNumber: org?.phone_number || req.organization?.phone_number || "",
+      twilio: {
+        webhookBaseUrl: process.env.API_URL || "",
+      },
+    });
+  }),
+);
 
 // ── PATCH /api/settings ──────────────────────────────────────
 router.patch(
@@ -416,212 +598,6 @@ router.post(
       success: true,
       message:
         "Sales inquiry submitted. Our team will be in touch within 24 hours.",
-    });
-  }),
-);
-
-// ============================================================
-// DASHBOARD METRICS
-// ============================================================
-
-const secondsBetween = (start, end) => {
-  if (!start || !end) return 0;
-  const a = new Date(start).getTime();
-  const b = new Date(end).getTime();
-  if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a) return 0;
-  return Math.round((b - a) / 1000);
-};
-
-const estimateUtf8Bytes = (value) =>
-  Buffer.byteLength(String(value || ""), "utf8");
-
-const normalizeCallDurationSeconds = (call) => {
-  const direct = Number(call.duration || 0);
-  if (Number.isFinite(direct) && direct > 0) return direct;
-
-  const recording = Number(call.recording_duration || 0);
-  if (Number.isFinite(recording) && recording > 0) return recording;
-
-  const metadata =
-    call.metadata && typeof call.metadata === "object" ? call.metadata : {};
-  const nestedDuration = Number(
-    metadata.durationSeconds ||
-      metadata.duration_seconds ||
-      metadata.duration ||
-      (metadata.call_end_details && metadata.call_end_details.duration) ||
-      0,
-  );
-  if (Number.isFinite(nestedDuration) && nestedDuration > 0)
-    return nestedDuration;
-
-  return secondsBetween(
-    call.started_at || call.answered_at,
-    call.ended_at || call.completed_at,
-  );
-};
-
-// ── GET /api/dashboard/metrics ───────────────────────────────
-router.get(
-  "/dashboard/metrics",
-  requireAuth,
-  asyncHandler(async (req, res) => {
-    const db = getSupabase();
-
-    const [
-      orgResult,
-      callsResult,
-      leadsResult,
-      chatMessagesResult,
-      knowledgeResult,
-    ] = await Promise.all([
-      db
-        .from("organizations")
-        .select("usage_calls,usage_minutes,call_limit,minute_limit,plan")
-        .eq("id", req.orgId)
-        .single(),
-      db
-        .from("call_records")
-        .select(
-          "id,duration,recording_duration,status,direction,outcome,started_at,answered_at,ended_at,completed_at,metadata,created_at,voice_agent_id",
-        )
-        .eq("organization_id", req.orgId)
-        .order("created_at", { ascending: false })
-        .limit(5000),
-      db
-        .from("leads")
-        .select("id,status,source,created_at,voice_agent_id")
-        .eq("organization_id", req.orgId)
-        .limit(10000),
-      db
-        .from("chat_messages")
-        .select("id,role,created_at,chatbot_id")
-        .eq("organization_id", req.orgId)
-        .limit(20000),
-      db
-        .from("knowledge_chunks")
-        .select("id,content,source_url,source_title,created_at")
-        .eq("organization_id", req.orgId)
-        .limit(20000),
-    ]);
-
-    const org = orgResult.data || req.organization || {};
-    const calls = Array.isArray(callsResult.data) ? callsResult.data : [];
-    const leads = Array.isArray(leadsResult.data) ? leadsResult.data : [];
-    const chatMessages = Array.isArray(chatMessagesResult.data)
-      ? chatMessagesResult.data
-      : [];
-    const knowledgeChunks = Array.isArray(knowledgeResult.data)
-      ? knowledgeResult.data
-      : [];
-
-    const totalCallSeconds = calls.reduce(
-      (sum, call) => sum + normalizeCallDurationSeconds(call),
-      0,
-    );
-    const totalCallMinutes = Math.round((totalCallSeconds / 60) * 10) / 10;
-    const planName = String(
-      org.plan || req.organization?.plan || "Starter",
-    ).toLowerCase();
-    const storedMinuteLimit = Number(
-      org.minute_limit || req.organization?.minute_limit || 500,
-    );
-    const minuteLimit = planName === "starter" ? 500 : storedMinuteLimit || 500;
-    const callLimit = Number(
-      org.call_limit || req.organization?.call_limit || 100,
-    );
-
-    const completedCalls = calls.filter((call) => {
-      const status = String(call.status || "").toLowerCase();
-      return (
-        status.includes("complete") ||
-        call.completed_at ||
-        call.ended_at ||
-        normalizeCallDurationSeconds(call) > 0
-      );
-    }).length;
-    const failedCalls = calls.filter((call) => {
-      const status = String(call.status || "").toLowerCase();
-      return (
-        status.includes("fail") ||
-        status.includes("busy") ||
-        status.includes("no-answer") ||
-        status.includes("cancel")
-      );
-    }).length;
-
-    const chatbotMessagesAnswered = chatMessages.filter((message) =>
-      ["model", "assistant", "bot"].includes(
-        String(message.role || "").toLowerCase(),
-      ),
-    ).length;
-    const chatbotTotalMessages = chatMessages.length;
-
-    const chatbotLeadsCaptured = leads.filter(
-      (lead) => String(lead.source || "").toLowerCase() === "chatbot",
-    ).length;
-    const callLeadsCaptured = leads.filter((lead) => {
-      const source = String(lead.source || "").toLowerCase();
-      return source === "call" || source === "voice" || source === "outbound";
-    }).length;
-    const convertedLeads = leads.filter((lead) => {
-      const status = String(lead.status || "").toLowerCase();
-      return status === "closed" || status === "converted" || status === "won";
-    }).length;
-
-    const estimatedStorageBytes = knowledgeChunks.reduce((sum, chunk) => {
-      return (
-        sum +
-        estimateUtf8Bytes(chunk.content) +
-        estimateUtf8Bytes(chunk.source_url) +
-        estimateUtf8Bytes(chunk.source_title)
-      );
-    }, 0);
-
-    const estimatedStorageLabel =
-      estimatedStorageBytes < 1024 * 1024
-        ? `${Math.max(0, Math.round(estimatedStorageBytes / 1024))} KB`
-        : `${(estimatedStorageBytes / (1024 * 1024)).toFixed(1)} MB`;
-
-    res.json({
-      success: true,
-      organizationId: req.orgId,
-      metrics: {
-        calls: {
-          total: calls.length,
-          completed: completedCalls,
-          failed: failedCalls,
-        },
-        usage: {
-          totalCallSeconds,
-          totalCallMinutes,
-          minuteLimit,
-          remainingMinutes: Math.max(0, minuteLimit - totalCallMinutes),
-          usagePercent: minuteLimit
-            ? Math.min(100, (totalCallMinutes / minuteLimit) * 100)
-            : 0,
-          callsUsed: Number(org.usage_calls || calls.length || 0),
-          callLimit,
-        },
-        chatbot: {
-          messagesAnswered: chatbotMessagesAnswered,
-          totalMessages: chatbotTotalMessages,
-          leadsCaptured: chatbotLeadsCaptured,
-        },
-        leads: {
-          totalCaptured: leads.length,
-          chatbotLeadsCaptured,
-          callLeadsCaptured,
-          converted: convertedLeads,
-          conversionRate: leads.length
-            ? Math.round((convertedLeads / leads.length) * 1000) / 10
-            : 0,
-        },
-        knowledge: {
-          chunks: knowledgeChunks.length,
-          estimatedStorageBytes,
-          estimatedStorageLabel,
-        },
-      },
     });
   }),
 );
