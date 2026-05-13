@@ -53,8 +53,52 @@ function parseJsonish(value, fallback) {
   return value;
 }
 
+function metadataOf(row) {
+  const parsed = parseJsonish(row && row.metadata, {});
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? parsed
+    : {};
+}
+
 function notificationKey(item) {
   return `${item.type}:${item.entity_type}:${item.entity_id}`;
+}
+
+function hasTruthyFlag(metadata, keys) {
+  return keys.some((key) => {
+    const value = metadata[key];
+    return value === true || value === "true" || value === 1 || value === "1";
+  });
+}
+
+function getFirstText(metadata, keys) {
+  for (const key of keys) {
+    const value = metadata[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const nested = value;
+      for (const nestedKey of [
+        "message",
+        "text",
+        "summary",
+        "body",
+        "reason",
+      ]) {
+        if (typeof nested[nestedKey] === "string" && nested[nestedKey].trim())
+          return nested[nestedKey].trim();
+      }
+    }
+  }
+  return "";
+}
+
+function getCallDisplay(call) {
+  const caller = asString(
+    call.caller_name || call.caller_phone,
+    "Unknown caller",
+  );
+  const phone = asString(call.caller_phone);
+  return phone ? `${caller} · ${phone}` : caller;
 }
 
 function buildCallNotification(call) {
@@ -69,11 +113,6 @@ function buildCallNotification(call) {
 
   if (!failed && !completed) return null;
 
-  const caller = asString(
-    call.caller_name || call.caller_phone,
-    "Unknown caller",
-  );
-  const phone = asString(call.caller_phone);
   const createdAt =
     call.completed_at ||
     call.ended_at ||
@@ -81,29 +120,10 @@ function buildCallNotification(call) {
     call.created_at ||
     new Date().toISOString();
 
-  if (failed) {
-    return {
-      type: "call_failed",
-      title: "Call failed",
-      body: truncate(phone ? `${caller} · ${phone}` : caller),
-      entity_type: "call",
-      entity_id: call.id,
-      voice_agent_id: call.voice_agent_id || null,
-      call_record_id: call.id,
-      metadata: {
-        derived: true,
-        source: "call_records",
-        status: call.status || "failed",
-        direction: call.direction || "",
-      },
-      created_at: createdAt,
-    };
-  }
-
   return {
-    type: "call_completed",
-    title: "Call completed",
-    body: truncate(phone ? `${caller} · ${phone}` : caller),
+    type: failed ? "call_failed" : "call_completed",
+    title: failed ? "Call failed" : "Call completed",
+    body: truncate(getCallDisplay(call), 120),
     entity_type: "call",
     entity_id: call.id,
     voice_agent_id: call.voice_agent_id || null,
@@ -111,11 +131,87 @@ function buildCallNotification(call) {
     metadata: {
       derived: true,
       source: "call_records",
-      status: call.status || "completed",
+      status: call.status || (failed ? "failed" : "completed"),
       direction: call.direction || "",
       duration: Number(call.duration || 0),
     },
     created_at: createdAt,
+  };
+}
+
+function buildCallbackNotification(call) {
+  const metadata = metadataOf(call);
+  const requested = hasTruthyFlag(metadata, [
+    "callbackRequested",
+    "callback_requested",
+    "requestedCallback",
+    "requested_callback",
+    "lead_requested_follow_up",
+    "followUpRequested",
+    "follow_up_requested",
+  ]);
+  const reason = getFirstText(metadata, [
+    "callbackRequest",
+    "callback_request",
+    "followUpRequest",
+    "follow_up_request",
+    "callbackReason",
+    "callback_reason",
+  ]);
+  if (!requested && !reason) return null;
+  return {
+    type: "lead_requested_follow_up",
+    title: "Callback requested",
+    body: truncate(reason || getCallDisplay(call), 140),
+    entity_type: "call",
+    entity_id: call.id,
+    voice_agent_id: call.voice_agent_id || null,
+    call_record_id: call.id,
+    metadata: {
+      derived: true,
+      source: "call_records.metadata",
+      notificationGroup: "callback",
+    },
+    created_at:
+      call.completed_at ||
+      call.ended_at ||
+      call.timestamp ||
+      call.created_at ||
+      new Date().toISOString(),
+  };
+}
+
+function buildMessageNotification(call) {
+  const metadata = metadataOf(call);
+  const message = getFirstText(metadata, [
+    "capturedMessage",
+    "captured_message",
+    "messageCaptured",
+    "message_captured",
+    "callerMessage",
+    "caller_message",
+    "message",
+  ]);
+  if (!message) return null;
+  return {
+    type: "message_captured",
+    title: "Message captured",
+    body: truncate(message, 160),
+    entity_type: "call",
+    entity_id: call.id,
+    voice_agent_id: call.voice_agent_id || null,
+    call_record_id: call.id,
+    metadata: {
+      derived: true,
+      source: "call_records.metadata",
+      notificationGroup: "message",
+    },
+    created_at:
+      call.completed_at ||
+      call.ended_at ||
+      call.timestamp ||
+      call.created_at ||
+      new Date().toISOString(),
   };
 }
 
@@ -130,12 +226,9 @@ function buildScheduleNotification(schedule) {
     ? directRecipients.length
     : 0;
   const name = asString(schedule.name, "Scheduled call");
-  const purpose = asString(
-    schedule.call_purpose || schedule.custom_instructions,
-  );
   const body = recipientCount
-    ? `${recipientCount} recipient${recipientCount === 1 ? "" : "s"}${purpose ? ` · ${truncate(purpose, 80)}` : ""}`
-    : truncate(purpose || name, 120);
+    ? `${recipientCount} recipient${recipientCount === 1 ? "" : "s"}`
+    : truncate(name, 120);
 
   return {
     type: failed ? "schedule_failed" : "schedule_completed",
@@ -156,29 +249,64 @@ function buildScheduleNotification(schedule) {
   };
 }
 
-function buildUnansweredQuestionNotification(question) {
-  const resolved =
-    question.is_resolved === true ||
-    normalizeStatus(question.status) === "resolved";
-  if (resolved) return null;
-  return {
-    type: "unanswered_question_captured",
-    title: "Unanswered question captured",
-    body: truncate(
-      question.question ||
-        "A caller asked a question the agent could not answer.",
-    ),
-    entity_type: "unanswered_question",
-    entity_id: question.id,
-    voice_agent_id: question.voice_agent_id || null,
-    call_record_id: question.call_record_id || null,
-    metadata: {
-      derived: true,
-      source: "unanswered_questions",
-      status: question.status || "unresolved",
-    },
-    created_at: question.created_at || new Date().toISOString(),
-  };
+function groupUnansweredQuestions(questions) {
+  const grouped = new Map();
+  for (const question of questions || []) {
+    const resolved =
+      question.is_resolved === true ||
+      normalizeStatus(question.status) === "resolved";
+    if (resolved) continue;
+    const callId = question.call_record_id || question.id;
+    const key = question.call_record_id
+      ? `call:${question.call_record_id}`
+      : `question:${question.id}`;
+    const existing = grouped.get(key) || {
+      entity_type: question.call_record_id ? "call" : "unanswered_question",
+      entity_id: callId,
+      call_record_id: question.call_record_id || null,
+      voice_agent_id: question.voice_agent_id || null,
+      questions: [],
+      created_at: question.created_at || new Date().toISOString(),
+    };
+    existing.questions.push(
+      asString(
+        question.question ||
+          "A caller asked a question the agent could not answer.",
+      ),
+    );
+    if (
+      new Date(question.created_at || 0).getTime() >
+      new Date(existing.created_at || 0).getTime()
+    ) {
+      existing.created_at = question.created_at;
+    }
+    grouped.set(key, existing);
+  }
+  return Array.from(grouped.values()).map((group) => {
+    const count = group.questions.length;
+    const first =
+      group.questions[0] ||
+      "A caller asked a question the agent could not answer.";
+    return {
+      type: "unanswered_question_captured",
+      title:
+        count > 1
+          ? `${count} unanswered questions`
+          : "Unanswered question captured",
+      body: truncate(first, 160),
+      entity_type: group.entity_type,
+      entity_id: group.entity_id,
+      voice_agent_id: group.voice_agent_id || null,
+      call_record_id: group.call_record_id || null,
+      metadata: {
+        derived: true,
+        source: "unanswered_questions",
+        notificationGroup: "unanswered_questions",
+        count,
+      },
+      created_at: group.created_at || new Date().toISOString(),
+    };
+  });
 }
 
 async function ensureDerivedNotifications(db, orgId, userId) {
@@ -187,15 +315,15 @@ async function ensureDerivedNotifications(db, orgId, userId) {
       db
         .from("call_records")
         .select(
-          "id, voice_agent_id, caller_name, caller_phone, direction, status, duration, timestamp, created_at, completed_at, ended_at",
+          "id, voice_agent_id, caller_name, caller_phone, direction, status, duration, timestamp, created_at, completed_at, ended_at, metadata",
         )
         .eq("organization_id", orgId)
         .order("created_at", { ascending: false })
-        .limit(30),
+        .limit(40),
       db
         .from("lead_outreach_schedules")
         .select(
-          "id, voice_agent_id, name, status, schedule_type, call_purpose, custom_instructions, direct_recipients, created_at, updated_at",
+          "id, voice_agent_id, name, status, schedule_type, direct_recipients, created_at, updated_at",
         )
         .eq("organization_id", orgId)
         .order("created_at", { ascending: false })
@@ -207,14 +335,18 @@ async function ensureDerivedNotifications(db, orgId, userId) {
         )
         .eq("organization_id", orgId)
         .order("created_at", { ascending: false })
-        .limit(30),
+        .limit(80),
     ]);
 
     const candidates = [];
     if (!callsResult.error) {
       for (const call of callsResult.data || []) {
-        const item = buildCallNotification(call);
-        if (item) candidates.push(item);
+        const items = [
+          buildCallNotification(call),
+          buildCallbackNotification(call),
+          buildMessageNotification(call),
+        ].filter(Boolean);
+        candidates.push(...items);
       }
     }
     if (!schedulesResult.error) {
@@ -224,10 +356,7 @@ async function ensureDerivedNotifications(db, orgId, userId) {
       }
     }
     if (!questionsResult.error) {
-      for (const question of questionsResult.data || []) {
-        const item = buildUnansweredQuestionNotification(question);
-        if (item) candidates.push(item);
-      }
+      candidates.push(...groupUnansweredQuestions(questionsResult.data || []));
     }
 
     if (!candidates.length) return;
@@ -355,6 +484,50 @@ router.get(
   }),
 );
 
+router.post(
+  "/bulk",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const ids = Array.isArray(req.body && req.body.notificationIds)
+      ? req.body.notificationIds
+          .map((id) => asString(id).trim())
+          .filter(Boolean)
+      : [];
+    const action = normalizeStatus(req.body && req.body.action);
+    if (!ids.length)
+      return res
+        .status(400)
+        .json({ error: { message: "No notifications selected." } });
+    if (!["read", "unread", "delete"].includes(action))
+      return res
+        .status(400)
+        .json({ error: { message: "Unsupported bulk action." } });
+
+    if (action === "delete") {
+      const { error } = await db
+        .from("tenant_notifications")
+        .delete()
+        .eq("organization_id", req.orgId)
+        .in("id", ids);
+      if (error) throw error;
+      return res.json({ success: true, action, notificationIds: ids });
+    }
+
+    const patch =
+      action === "read"
+        ? { is_read: true, read_at: new Date().toISOString() }
+        : { is_read: false, read_at: null };
+    const { error } = await db
+      .from("tenant_notifications")
+      .update(patch)
+      .eq("organization_id", req.orgId)
+      .in("id", ids);
+    if (error) throw error;
+    res.json({ success: true, action, notificationIds: ids });
+  }),
+);
+
 router.patch(
   "/:notificationId/read",
   requireAuth,
@@ -363,6 +536,27 @@ router.patch(
     const { data, error } = await db
       .from("tenant_notifications")
       .update({ is_read: true, read_at: new Date().toISOString() })
+      .eq("id", req.params.notificationId)
+      .eq("organization_id", req.orgId)
+      .select("*")
+      .maybeSingle();
+    if (error) throw error;
+    if (!data)
+      return res
+        .status(404)
+        .json({ error: { message: "Notification not found." } });
+    res.json({ success: true, notification: data });
+  }),
+);
+
+router.patch(
+  "/:notificationId/unread",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const { data, error } = await db
+      .from("tenant_notifications")
+      .update({ is_read: false, read_at: null })
       .eq("id", req.params.notificationId)
       .eq("organization_id", req.orgId)
       .select("*")
