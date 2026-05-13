@@ -4,6 +4,7 @@ const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
 const { requireAuth } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
+const { sendUnreadNotificationsDigestEmail } = require("../../lib/email");
 
 const router = express.Router();
 
@@ -400,6 +401,54 @@ async function ensureDerivedNotifications(db, orgId, userId) {
   }
 }
 
+async function maybeSendUnreadThresholdEmail(db, req, metrics) {
+  const threshold = Number(process.env.NOTIFICATION_EMAIL_THRESHOLD || 20);
+  if (!metrics || Number(metrics.unread || 0) < threshold) return;
+
+  const now = Date.now();
+  const latest = await db
+    .from("tenant_notifications")
+    .select("id,created_at,metadata")
+    .eq("organization_id", req.orgId)
+    .eq("type", "notification_digest_sent")
+    .order("created_at", { ascending: false })
+    .limit(1);
+
+  const last = latest.data && latest.data[0];
+  if (last && now - new Date(last.created_at).getTime() < 24 * 60 * 60 * 1000)
+    return;
+
+  try {
+    await sendUnreadNotificationsDigestEmail(
+      req.user.email,
+      req.user.name,
+      req.organization.name,
+      metrics.unread,
+    );
+    await db.from("tenant_notifications").insert({
+      organization_id: req.orgId,
+      user_id: req.user.id,
+      type: "notification_digest_sent",
+      title: "Unread notifications email sent",
+      body: `An email reminder was sent because ${metrics.unread} notifications are unread.`,
+      entity_type: "notification_digest",
+      entity_id: req.orgId,
+      is_read: true,
+      read_at: new Date().toISOString(),
+      metadata: {
+        threshold,
+        unreadCount: metrics.unread,
+        sentTo: req.user.email,
+      },
+    });
+  } catch (error) {
+    console.warn(
+      "[notifications] unread threshold email failed:",
+      error && error.message ? error.message : error,
+    );
+  }
+}
+
 async function getNotificationMetrics(db, orgId) {
   const [totalResult, unreadResult, latestResult] = await Promise.all([
     db
@@ -459,6 +508,7 @@ router.get(
     if (error) throw error;
 
     const metrics = await getNotificationMetrics(db, req.orgId);
+    await maybeSendUnreadThresholdEmail(db, req, metrics);
 
     res.json({
       success: true,
@@ -480,6 +530,7 @@ router.get(
     const db = getSupabase();
     await ensureDerivedNotifications(db, req.orgId, req.user && req.user.id);
     const metrics = await getNotificationMetrics(db, req.orgId);
+    await maybeSendUnreadThresholdEmail(db, req, metrics);
     res.json({ success: true, unreadCount: metrics.unread, metrics });
   }),
 );

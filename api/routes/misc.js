@@ -9,7 +9,11 @@ const {
 } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 const { serializeUser } = require("../../lib/serializers");
-const { sendTeamInviteEmail, sendContactEmail } = require("../../lib/email");
+const {
+  sendTeamInviteEmail,
+  sendContactEmail,
+  sendOrganizationDeletionRequestEmail,
+} = require("../../lib/email");
 
 const router = express.Router();
 
@@ -598,6 +602,154 @@ router.post(
       success: true,
       message:
         "Sales inquiry submitted. Our team will be in touch within 24 hours.",
+    });
+  }),
+);
+
+// ============================================================
+// ORGANIZATION DELETION REQUEST
+// ============================================================
+
+router.post(
+  "/organization/delete-request",
+  requireAuth,
+  requireOwner,
+  asyncHandler(async (req, res) => {
+    const { organizationName, acknowledgeNoRefund } = req.body || {};
+    const expectedName =
+      req.organization && req.organization.name ? req.organization.name : "";
+
+    if (!organizationName || organizationName.trim() !== expectedName) {
+      return res.status(400).json({
+        error: {
+          message: "Enter your organization name exactly to confirm deletion.",
+        },
+      });
+    }
+
+    if (acknowledgeNoRefund !== true) {
+      return res.status(400).json({
+        error: {
+          message:
+            "You must acknowledge that paid and ongoing subscriptions are not refunded upon deletion.",
+        },
+      });
+    }
+
+    const db = getSupabase();
+    const requestedAt = new Date();
+    const scheduledDeletionAt = new Date(
+      requestedAt.getTime() + 30 * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    const currentLimits =
+      req.organization &&
+      req.organization.outbound_call_limits &&
+      typeof req.organization.outbound_call_limits === "object"
+        ? req.organization.outbound_call_limits
+        : {};
+    const deletionMeta = {
+      ...(currentLimits || {}),
+      organization_deletion: {
+        requested: true,
+        requested_at: requestedAt.toISOString(),
+        scheduled_deletion_at: scheduledDeletionAt,
+        requested_by_user_id: req.user.id,
+        requested_by_email: req.user.email,
+        status: "pending_manual_deletion",
+      },
+    };
+
+    const { error } = await db
+      .from("organizations")
+      .update({
+        outbound_call_limits: deletionMeta,
+        subscription_status: "canceled",
+        updated_at: requestedAt.toISOString(),
+      })
+      .eq("id", req.orgId);
+
+    if (error) {
+      return res
+        .status(500)
+        .json({ error: { message: "Unable to submit deletion request." } });
+    }
+
+    await db
+      .from("tenant_notifications")
+      .insert({
+        organization_id: req.orgId,
+        user_id: req.user.id,
+        type: "organization_deletion_requested",
+        title: "Organization deletion requested",
+        body: `${expectedName} requested deletion. Scheduled within 30 days.`,
+        entity_type: "organization",
+        entity_id: req.orgId,
+        is_read: false,
+        metadata: deletionMeta.organization_deletion,
+      })
+      .then(
+        () => null,
+        () => null,
+      );
+
+    await db
+      .from("contact_submissions")
+      .insert({
+        name: req.user.name,
+        email: req.user.email,
+        subject: "Organization deletion request",
+        message: `Organization deletion requested for ${expectedName} (${req.orgId}). Requested by ${req.user.name} <${req.user.email}>. Scheduled deletion by ${scheduledDeletionAt}.`,
+        type: "contact",
+        company_name: expectedName,
+      })
+      .then(
+        () => null,
+        () => null,
+      );
+
+    try {
+      await sendContactEmail({
+        name: req.user.name,
+        email: req.user.email,
+        subject: "Organization deletion request",
+        message: `Organization deletion requested for ${expectedName} (${req.orgId}).\nRequested by: ${req.user.name} <${req.user.email}>\nScheduled deletion by: ${scheduledDeletionAt}\nPaid subscriptions are not refunded.`,
+        companyName: expectedName,
+      });
+    } catch (mailError) {
+      console.warn(
+        "[organization deletion] owner notification email failed:",
+        mailError.message,
+      );
+    }
+
+    try {
+      await sendOrganizationDeletionRequestEmail(
+        req.user.email,
+        req.user.name,
+        expectedName,
+        scheduledDeletionAt,
+      );
+    } catch (mailError) {
+      console.warn(
+        "[organization deletion] user confirmation email failed:",
+        mailError.message,
+      );
+    }
+
+    await db
+      .from("sessions")
+      .delete()
+      .eq("user_id", req.user.id)
+      .then(
+        () => null,
+        () => null,
+      );
+
+    res.json({
+      success: true,
+      deletionRequested: true,
+      scheduledDeletionAt,
+      accessDisabled: true,
     });
   }),
 );

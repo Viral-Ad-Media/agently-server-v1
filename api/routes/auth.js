@@ -12,6 +12,26 @@ const { asyncHandler } = require("../../middleware/error");
 
 const router = express.Router();
 
+function isOrganizationDeletionRequested(org) {
+  const deletion =
+    org &&
+    org.outbound_call_limits &&
+    typeof org.outbound_call_limits === "object"
+      ? org.outbound_call_limits.organization_deletion
+      : null;
+  return deletion && deletion.requested === true;
+}
+
+async function getUserOrganization(db, organizationId) {
+  if (!organizationId) return null;
+  const { data: org } = await db
+    .from("organizations")
+    .select("id,name,outbound_call_limits")
+    .eq("id", organizationId)
+    .single();
+  return org || null;
+}
+
 // ─────────────────────────────────────────────────────────────
 // POST /api/auth/login
 // Body: { email: string, password: string }
@@ -48,6 +68,16 @@ router.post(
       return res
         .status(401)
         .json({ error: { message: "Invalid email or password." } });
+    }
+
+    const org = await getUserOrganization(db, user.organization_id);
+    if (isOrganizationDeletionRequested(org)) {
+      return res.status(403).json({
+        error: {
+          message:
+            "This organization is pending deletion. Access has been disabled while the deletion request is processed.",
+        },
+      });
     }
 
     const token = signToken({ userId: user.id, orgId: user.organization_id });
@@ -307,6 +337,16 @@ router.post(
       return res
         .status(500)
         .json({ error: { message: "Failed to resolve user account." } });
+    }
+
+    const org = await getUserOrganization(db, user.organization_id);
+    if (isOrganizationDeletionRequested(org)) {
+      return res.status(403).json({
+        error: {
+          message:
+            "This organization is pending deletion. Access has been disabled while the deletion request is processed.",
+        },
+      });
     }
 
     const authToken = signToken({
