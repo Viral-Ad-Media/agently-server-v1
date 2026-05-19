@@ -16,22 +16,64 @@ const app = express();
 // confusing CORS error on top of the real problem.
 // ═══════════════════════════════════════════════════════════════
 
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+const DEFAULT_ALLOWED_ORIGINS = [
+  "https://agently-frontend-v1.vercel.app",
+  "https://agently-v1.vercel.app",
+  "http://localhost:3000",
+  "http://localhost:5173",
+];
+
+function splitEnvList(value) {
+  return String(value || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function normalizeOrigin(value) {
+  const raw = String(value || "")
+    .trim()
+    .replace(/\/+$/, "");
+  if (!raw) return "";
+
+  try {
+    return new URL(raw).origin;
+  } catch (_) {
+    return raw;
+  }
+}
+
+function collectAllowedOrigins() {
+  return Array.from(
+    new Set(
+      [
+        ...DEFAULT_ALLOWED_ORIGINS,
+        ...splitEnvList(process.env.ALLOWED_ORIGINS),
+        ...splitEnvList(process.env.APP_URL),
+        ...splitEnvList(process.env.FRONTEND_URL),
+        ...splitEnvList(process.env.PUBLIC_FRONTEND_URL),
+        ...splitEnvList(process.env.VITE_APP_URL),
+      ]
+        .map(normalizeOrigin)
+        .filter(Boolean),
+    ),
+  );
+}
+
+const ALLOWED_ORIGINS = collectAllowedOrigins();
 
 function isOriginAllowed(origin) {
-  if (!origin) return true; // server-to-server / curl
+  const normalizedOrigin = normalizeOrigin(origin);
+  if (!normalizedOrigin) return true; // server-to-server / curl
   if (process.env.NODE_ENV !== "production") return true; // dev: allow all
-  if (ALLOWED_ORIGINS.length === 0) return true; // no list configured: allow all
-  return ALLOWED_ORIGINS.includes(origin);
+  if (ALLOWED_ORIGINS.length === 0) return true; // preserve existing fallback behavior
+  return ALLOWED_ORIGINS.includes(normalizedOrigin);
 }
 
 function setCorsHeaders(req, res) {
   const origin = req.headers.origin;
   if (!origin || !isOriginAllowed(origin)) return;
-  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Access-Control-Allow-Origin", normalizeOrigin(origin));
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader(
