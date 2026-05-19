@@ -358,6 +358,8 @@ function buildRealtimeTwiml({
   direction,
   callerPhone,
   recipientPhone,
+  recipientName,
+  targetName,
   leadId,
   callPurpose,
   customInstructions,
@@ -375,6 +377,8 @@ function buildRealtimeTwiml({
     direction: direction || "inbound",
     callerPhone: callerPhone || "",
     recipientPhone: recipientPhone || callerPhone || "",
+    recipientName: recipientName || targetName || "",
+    targetName: targetName || recipientName || "",
     leadId: leadId || "",
     callPurpose: callPurpose || "",
     customInstructions: customInstructions || "",
@@ -545,8 +549,20 @@ router.post(
     const scheduleId = req.query?.scheduleId || req.body?.scheduleId || "";
     const scheduleRunId =
       req.query?.scheduleRunId || req.body?.scheduleRunId || "";
-    const recipientPhone =
+    let recipientPhone =
       req.query?.recipientPhone || req.body?.recipientPhone || toPhone;
+    let recipientName = String(
+      req.query?.recipientName ||
+        req.body?.recipientName ||
+        req.query?.targetName ||
+        req.body?.targetName ||
+        req.query?.customerName ||
+        req.body?.customerName ||
+        "",
+    ).trim();
+    let targetName = String(
+      req.query?.targetName || req.body?.targetName || recipientName || "",
+    ).trim();
 
     const db = getSupabase();
     let agent = null;
@@ -559,6 +575,27 @@ router.post(
       agent = data || null;
     }
     if (!agent) agent = await lookupAgentByPhone(fromPhone);
+
+    if (scheduleRunId && (!recipientName || !recipientPhone)) {
+      try {
+        const { data: run } = await db
+          .from("lead_outreach_runs")
+          .select("target_name,target_phone,destination_phone,outcome_metadata")
+          .eq("id", scheduleRunId)
+          .maybeSingle();
+        recipientName =
+          recipientName ||
+          String(run?.target_name || run?.outcome_metadata?.recipientName || "").trim();
+        targetName = targetName || recipientName;
+        recipientPhone =
+          recipientPhone || run?.destination_phone || run?.target_phone || toPhone;
+      } catch (err) {
+        console.warn("[outbound-twiml] schedule run recipient lookup skipped", {
+          scheduleRunId,
+          error: err.message || String(err),
+        });
+      }
+    }
 
     if (!agent) {
       res.setHeader("Content-Type", "text/xml");
@@ -580,6 +617,8 @@ router.post(
           twilioTo: toPhone,
           twilioFrom: fromPhone,
           leadId: leadId || null,
+          recipientName: recipientName || null,
+          targetName: targetName || recipientName || null,
           callPurpose: callPurpose || null,
           customInstructions: customInstructions || null,
         },
@@ -599,6 +638,8 @@ router.post(
       direction: "outbound",
       callerPhone: fromPhone,
       recipientPhone,
+      recipientName,
+      targetName,
       leadId,
       callPurpose,
       customInstructions,
@@ -2352,6 +2393,13 @@ router.post(
     );
     const agentId = req.body?.agentId || req.body?.voiceAgentId || null;
     const leadId = req.body?.leadId || null;
+    const recipientName = String(
+      req.body?.recipientName ||
+        req.body?.targetName ||
+        req.body?.customerName ||
+        "Outbound Lead",
+    ).trim();
+    const targetName = String(req.body?.targetName || recipientName || "").trim();
     const customInstructions = String(
       req.body?.customInstructions || "",
     ).trim();
@@ -2515,7 +2563,7 @@ router.post(
     const record = await createCallRecord({
       organizationId,
       voiceAgentId: agent.id,
-      callerName: req.body?.customerName || "Outbound Lead",
+      callerName: recipientName || "Outbound Lead",
       callerPhone: toPhone,
       leadId,
       direction: "outbound",
@@ -2526,6 +2574,8 @@ router.post(
         fromNumber: number.phone_number,
         toPhone,
         leadId,
+        recipientName,
+        targetName,
         callPurpose,
         customInstructions,
         callPurposeWarning: callPurposeWarning || null,
@@ -2539,6 +2589,8 @@ router.post(
       callRecordId: record.id,
       direction: "outbound",
       recipientPhone: toPhone,
+      recipientName,
+      targetName,
       callerPhone: number.phone_number,
       leadId,
       callPurpose,
@@ -2550,6 +2602,8 @@ router.post(
       callRecordId: record.id,
       direction: "outbound",
       recipientPhone: toPhone,
+      recipientName,
+      targetName,
       callerPhone: number.phone_number,
       leadId,
       callPurpose,
@@ -3959,7 +4013,14 @@ router.post(
   requireAdmin,
   asyncHandler(async (req, res) => {
     const toPhone = normalizePhone(req.body?.toPhone || req.body?.to || "");
-    const customerName = req.body?.customerName || "Outbound Lead";
+    const recipientName = String(
+      req.body?.recipientName ||
+        req.body?.targetName ||
+        req.body?.customerName ||
+        "Outbound Lead",
+    ).trim();
+    const targetName = String(req.body?.targetName || recipientName || "").trim();
+    const customerName = recipientName || "Outbound Lead";
     const voiceAgentId = req.body?.voiceAgentId || req.body?.agentId || null;
     const leadId = req.body?.leadId || null;
     const customInstructions = String(
@@ -4078,6 +4139,8 @@ router.post(
       metadata: {
         initiatedBy: req.user?.id || null,
         leadId,
+        recipientName,
+        targetName,
         callPurpose,
         customInstructions,
         callPurposeWarning: callPurposeWarning || null,
@@ -4091,6 +4154,8 @@ router.post(
       callRecordId: record.id,
       direction: "outbound",
       recipientPhone: toPhone,
+      recipientName,
+      targetName,
       callerPhone: agent.twilio_phone_number,
       leadId,
       callPurpose,
@@ -4102,6 +4167,8 @@ router.post(
       callRecordId: record.id,
       direction: "outbound",
       recipientPhone: toPhone,
+      recipientName,
+      targetName,
       callerPhone: agent.twilio_phone_number,
       leadId,
       callPurpose,
