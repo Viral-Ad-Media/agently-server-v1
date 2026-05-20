@@ -3,11 +3,29 @@
 const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
 const { requireAuth } = require("../../middleware/auth");
+const twilioRoutes = require("./twilio");
 const { asyncHandler } = require("../../middleware/error");
 const { generateCallSummary } = require("../../lib/openai");
 const { serializeCall, serializeLead } = require("../../lib/serializers");
 
 const router = express.Router();
+
+function forwardToTwilioRoute(targetUrl) {
+  return (req, res, next) => {
+    const originalUrl = req.url;
+    req.url = targetUrl;
+    twilioRoutes.handle(req, res, (err) => {
+      req.url = originalUrl;
+      if (err) return next(err);
+      if (!res.headersSent) return next();
+    });
+  };
+}
+
+// Compatibility alias used by the dashboard Call Now flow.
+// The full outbound implementation lives in the Twilio router at
+// POST /api/twilio/calls/outbound, but the frontend calls /api/calls/outbound.
+router.post("/outbound", forwardToTwilioRoute("/calls/outbound"));
 
 // ── POST /api/calls/simulate ─────────────────────────────────
 router.post(

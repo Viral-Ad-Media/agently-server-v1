@@ -88,11 +88,17 @@ const router = express.Router();
 const API_URL = () => (process.env.API_URL || "").trim().replace(/\/+$/, "");
 
 /** WebSocket base URL — defaults to API_URL but can be overridden for separate WS server */
+function normalizeWebSocketBase(value) {
+  const base = String(value || "")
+    .trim()
+    .replace(/\/+$/, "");
+  if (!base) return "";
+  return base.replace(/^https:\/\//i, "wss://").replace(/^http:\/\//i, "ws://");
+}
+
 const WS_URL = () => {
   const explicit = (process.env.TWILIO_WS_URL || "").trim().replace(/\/+$/, "");
-  if (explicit) return explicit;
-  // Derive from API_URL: https://x.vercel.app → wss://x.vercel.app
-  return API_URL().replace(/^https?:\/\//, "wss://");
+  return normalizeWebSocketBase(explicit || API_URL());
 };
 
 function callRecordingEnabled() {
@@ -344,10 +350,16 @@ function hangupTwiml(
 function mediaStreamUrl(params) {
   const wsBase = WS_URL();
   const url = new URL("/api/twilio/media-stream", wsBase);
-  Object.entries(params || {}).forEach(([key, value]) => {
-    if (value === undefined || value === null || value === "") return;
-    url.searchParams.set(key, String(value));
-  });
+  const includeQueryParams =
+    String(process.env.TWILIO_STREAM_QUERY_PARAMS || "false")
+      .trim()
+      .toLowerCase() === "true";
+  if (includeQueryParams) {
+    Object.entries(params || {}).forEach(([key, value]) => {
+      if (value === undefined || value === null || value === "") return;
+      url.searchParams.set(key, String(value));
+    });
+  }
   return url.toString();
 }
 
@@ -521,147 +533,148 @@ router.post("/voice-inbound", handleInboundVoice);
 router.get("/voice-inbound", handleInboundVoice);
 router.post("/incoming-call", handleInboundVoice);
 router.get("/incoming-call", handleInboundVoice);
+router.post("/voice", handleInboundVoice);
+router.get("/voice", handleInboundVoice);
+router.post("/inbound", handleInboundVoice);
+router.get("/inbound", handleInboundVoice);
+router.post("/inbound-call", handleInboundVoice);
+router.get("/inbound-call", handleInboundVoice);
 
 // ─────────────────────────────────────────────────────────────
 // ── PUBLIC: Outbound TwiML ───────────────────────────────────
 // Twilio fetches this when we initiate an outbound call.
 // The call SID + orgId + agentId are passed as query params.
 // ─────────────────────────────────────────────────────────────
-router.post(
-  "/outbound-twiml",
-  asyncHandler(async (req, res) => {
-    const callSid = req.body?.CallSid || req.query?.CallSid || "";
-    const toPhone = req.body?.To || req.query?.To || "";
-    const fromPhone = req.body?.From || req.query?.From || "";
-    const agentId = req.query?.agentId || req.body?.agentId || "";
-    const callRecordIdFromQuery =
-      req.query?.callRecordId || req.body?.callRecordId || "";
-    const leadId = req.query?.leadId || req.body?.leadId || "";
-    const callPurpose = req.query?.callPurpose || req.body?.callPurpose || "";
-    const customInstructions =
-      req.query?.customInstructions || req.body?.customInstructions || "";
-    const voiceProviderOverride =
-      req.query?.voiceProviderOverride || req.body?.voiceProviderOverride || "";
-    const voiceProviderFallbackReason =
-      req.query?.voiceProviderFallbackReason ||
-      req.body?.voiceProviderFallbackReason ||
-      "";
-    const scheduleId = req.query?.scheduleId || req.body?.scheduleId || "";
-    const scheduleRunId =
-      req.query?.scheduleRunId || req.body?.scheduleRunId || "";
-    let recipientPhone =
-      req.query?.recipientPhone || req.body?.recipientPhone || toPhone;
-    let recipientName = String(
-      req.query?.recipientName ||
-        req.body?.recipientName ||
-        req.query?.targetName ||
-        req.body?.targetName ||
-        req.query?.customerName ||
-        req.body?.customerName ||
-        "",
-    ).trim();
-    let targetName = String(
-      req.query?.targetName || req.body?.targetName || recipientName || "",
-    ).trim();
+async function handleOutboundTwiMl(req, res) {
+  const callSid = req.body?.CallSid || req.query?.CallSid || "";
+  const toPhone = req.body?.To || req.query?.To || "";
+  const fromPhone = req.body?.From || req.query?.From || "";
+  const agentId = req.query?.agentId || req.body?.agentId || "";
+  const callRecordIdFromQuery =
+    req.query?.callRecordId || req.body?.callRecordId || "";
+  const leadId = req.query?.leadId || req.body?.leadId || "";
+  const callPurpose = req.query?.callPurpose || req.body?.callPurpose || "";
+  const customInstructions =
+    req.query?.customInstructions || req.body?.customInstructions || "";
+  const voiceProviderOverride =
+    req.query?.voiceProviderOverride || req.body?.voiceProviderOverride || "";
+  const voiceProviderFallbackReason =
+    req.query?.voiceProviderFallbackReason ||
+    req.body?.voiceProviderFallbackReason ||
+    "";
+  const scheduleId = req.query?.scheduleId || req.body?.scheduleId || "";
+  const scheduleRunId =
+    req.query?.scheduleRunId || req.body?.scheduleRunId || "";
+  let recipientPhone =
+    req.query?.recipientPhone || req.body?.recipientPhone || toPhone;
+  let recipientName = String(
+    req.query?.recipientName ||
+      req.body?.recipientName ||
+      req.query?.targetName ||
+      req.body?.targetName ||
+      req.query?.customerName ||
+      req.body?.customerName ||
+      "",
+  ).trim();
+  let targetName = String(
+    req.query?.targetName || req.body?.targetName || recipientName || "",
+  ).trim();
 
-    const db = getSupabase();
-    let agent = null;
-    if (agentId) {
-      const { data } = await db
-        .from("voice_agents")
-        .select("*")
-        .eq("id", agentId)
+  const db = getSupabase();
+  let agent = null;
+  if (agentId) {
+    const { data } = await db
+      .from("voice_agents")
+      .select("*")
+      .eq("id", agentId)
+      .maybeSingle();
+    agent = data || null;
+  }
+  if (!agent) agent = await lookupAgentByPhone(fromPhone);
+
+  if (scheduleRunId && (!recipientName || !recipientPhone)) {
+    try {
+      const { data: run } = await db
+        .from("lead_outreach_runs")
+        .select("target_name,target_phone,destination_phone,outcome_metadata")
+        .eq("id", scheduleRunId)
         .maybeSingle();
-      agent = data || null;
-    }
-    if (!agent) agent = await lookupAgentByPhone(fromPhone);
-
-    if (scheduleRunId && (!recipientName || !recipientPhone)) {
-      try {
-        const { data: run } = await db
-          .from("lead_outreach_runs")
-          .select("target_name,target_phone,destination_phone,outcome_metadata")
-          .eq("id", scheduleRunId)
-          .maybeSingle();
-        recipientName =
-          recipientName ||
-          String(run?.target_name || run?.outcome_metadata?.recipientName || "").trim();
-        targetName = targetName || recipientName;
-        recipientPhone =
-          recipientPhone || run?.destination_phone || run?.target_phone || toPhone;
-      } catch (err) {
-        console.warn("[outbound-twiml] schedule run recipient lookup skipped", {
-          scheduleRunId,
-          error: err.message || String(err),
-        });
-      }
-    }
-
-    if (!agent) {
-      res.setHeader("Content-Type", "text/xml");
-      return res.send(
-        `<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>`,
-      );
-    }
-
-    let callRecordId = callRecordIdFromQuery;
-    if (!callRecordId) {
-      const record = await createCallRecord({
-        organizationId: agent.organization_id,
-        voiceAgentId: agent.id,
-        callerPhone: toPhone,
-        direction: "outbound",
-        status: "queued",
-        twilioCallSid: callSid,
-        metadata: {
-          twilioTo: toPhone,
-          twilioFrom: fromPhone,
-          leadId: leadId || null,
-          recipientName: recipientName || null,
-          targetName: targetName || recipientName || null,
-          callPurpose: callPurpose || null,
-          customInstructions: customInstructions || null,
-        },
-      });
-      callRecordId = record.id;
-    } else if (callSid) {
-      await updateCallRecordById(callRecordId, {
-        twilio_call_sid: callSid,
-        status: "in-progress",
+      recipientName =
+        recipientName ||
+        String(
+          run?.target_name || run?.outcome_metadata?.recipientName || "",
+        ).trim();
+      targetName = targetName || recipientName;
+      recipientPhone =
+        recipientPhone ||
+        run?.destination_phone ||
+        run?.target_phone ||
+        toPhone;
+    } catch (err) {
+      console.warn("[outbound-twiml] schedule run recipient lookup skipped", {
+        scheduleRunId,
+        error: err.message || String(err),
       });
     }
+  }
 
-    const twiml = buildRealtimeTwiml({
-      agent,
-      callRecordId,
-      callSid,
-      direction: "outbound",
-      callerPhone: fromPhone,
-      recipientPhone,
-      recipientName,
-      targetName,
-      leadId,
-      callPurpose,
-      customInstructions,
-      voiceProviderOverride,
-      voiceProviderFallbackReason,
-      scheduleId,
-      scheduleRunId,
-    });
+  if (!agent) {
     res.setHeader("Content-Type", "text/xml");
-    res.send(twiml);
-  }),
-);
-
-router.get(
-  "/outbound-twiml",
-  asyncHandler(async (req, res) => {
-    res.setHeader("Content-Type", "text/xml");
-    res.send(
+    return res.send(
       `<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>`,
     );
-  }),
-);
+  }
+
+  let callRecordId = callRecordIdFromQuery;
+  if (!callRecordId) {
+    const record = await createCallRecord({
+      organizationId: agent.organization_id,
+      voiceAgentId: agent.id,
+      callerPhone: toPhone,
+      direction: "outbound",
+      status: "queued",
+      twilioCallSid: callSid,
+      metadata: {
+        twilioTo: toPhone,
+        twilioFrom: fromPhone,
+        leadId: leadId || null,
+        recipientName: recipientName || null,
+        targetName: targetName || recipientName || null,
+        callPurpose: callPurpose || null,
+        customInstructions: customInstructions || null,
+      },
+    });
+    callRecordId = record.id;
+  } else if (callSid) {
+    await updateCallRecordById(callRecordId, {
+      twilio_call_sid: callSid,
+      status: "in-progress",
+    });
+  }
+
+  const twiml = buildRealtimeTwiml({
+    agent,
+    callRecordId,
+    callSid,
+    direction: "outbound",
+    callerPhone: fromPhone,
+    recipientPhone,
+    recipientName,
+    targetName,
+    leadId,
+    callPurpose,
+    customInstructions,
+    voiceProviderOverride,
+    voiceProviderFallbackReason,
+    scheduleId,
+    scheduleRunId,
+  });
+  res.setHeader("Content-Type", "text/xml");
+  res.send(twiml);
+}
+
+router.post("/outbound-twiml", asyncHandler(handleOutboundTwiMl));
+router.get("/outbound-twiml", asyncHandler(handleOutboundTwiMl));
 
 function normalizeTwilioCallOutcome(callStatus, answeredBy, duration) {
   const status = String(callStatus || "").toLowerCase();
@@ -2399,7 +2412,9 @@ router.post(
         req.body?.customerName ||
         "Outbound Lead",
     ).trim();
-    const targetName = String(req.body?.targetName || recipientName || "").trim();
+    const targetName = String(
+      req.body?.targetName || recipientName || "",
+    ).trim();
     const customInstructions = String(
       req.body?.customInstructions || "",
     ).trim();
@@ -4019,7 +4034,9 @@ router.post(
         req.body?.customerName ||
         "Outbound Lead",
     ).trim();
-    const targetName = String(req.body?.targetName || recipientName || "").trim();
+    const targetName = String(
+      req.body?.targetName || recipientName || "",
+    ).trim();
     const customerName = recipientName || "Outbound Lead";
     const voiceAgentId = req.body?.voiceAgentId || req.body?.agentId || null;
     const leadId = req.body?.leadId || null;
