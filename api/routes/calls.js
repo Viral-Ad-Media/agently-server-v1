@@ -180,6 +180,58 @@ function directRecordingUrl(row = {}) {
   );
 }
 
+function speakerForTranscriptRole(role) {
+  const value = String(role || "")
+    .trim()
+    .toLowerCase();
+  if (["caller", "user", "human", "recipient", "customer"].includes(value))
+    return "Caller";
+  if (["assistant", "agent", "bot", "ai"].includes(value)) return "Agent";
+  if (value === "transcription") return "Transcription";
+  return "Unknown";
+}
+
+function normalizeTranscriptLine(line = {}) {
+  if (typeof line === "string") {
+    const [speakerPart, ...rest] = line.split(":");
+    const text = rest.length ? rest.join(":").trim() : line.trim();
+    const speaker = rest.length ? speakerPart.trim() : "Unknown";
+    if (!text) return null;
+    return {
+      role: speaker.toLowerCase() || "unknown",
+      speaker: speaker || "Unknown",
+      text,
+      ts: new Date().toISOString(),
+      at: new Date().toISOString(),
+    };
+  }
+  const role =
+    String(line?.role || line?.speaker || "unknown").trim() || "unknown";
+  const text = String(
+    line?.text || line?.transcript || line?.content || "",
+  ).trim();
+  if (!text) return null;
+  return {
+    role: role.toLowerCase(),
+    speaker: line?.speaker || speakerForTranscriptRole(role),
+    text,
+    ts: line?.ts || line?.at || new Date().toISOString(),
+    at: line?.at || line?.ts || new Date().toISOString(),
+  };
+}
+
+function normalizeTranscript(transcript) {
+  if (typeof transcript === "string") {
+    return transcript
+      .split(/\n+/)
+      .map((line) => normalizeTranscriptLine(line))
+      .filter(Boolean);
+  }
+  return (Array.isArray(transcript) ? transcript : [])
+    .map((line) => normalizeTranscriptLine(line))
+    .filter(Boolean);
+}
+
 function twilioBasicAuthHeader() {
   const sid = process.env.TWILIO_ACCOUNT_SID;
   const token = process.env.TWILIO_AUTH_TOKEN;
@@ -352,7 +404,7 @@ function serializeCallForLogs(row, outboundRunIds = new Set(), run = null) {
     ended_at: row.ended_at,
     outcome: row.outcome || (status === "completed" ? "Completed" : status),
     summary: row.summary || "",
-    transcript: row.transcript || [],
+    transcript: normalizeTranscript(row.transcript),
     recording_available: Boolean(
       row.recording_available ||
       row.recording_sid ||
@@ -455,7 +507,7 @@ router.get(
         to: serialized.to || "",
         duration: serialized.duration,
         summary: call.summary || "",
-        transcript: call.transcript || [],
+        transcript: normalizeTranscript(call.transcript),
         recording_available: Boolean(call.recording_available),
         recording_status: call.recording_status || null,
         recording_sid: call.recording_sid || null,
@@ -783,7 +835,7 @@ router.get(
     res.json({
       success: true,
       callId: call.id,
-      messages: call.transcript || [],
+      messages: normalizeTranscript(call.transcript),
     });
   }),
 );
@@ -807,7 +859,7 @@ router.get(
     res.json({
       success: true,
       callId: call.id,
-      transcript: call.transcript || [],
+      transcript: normalizeTranscript(call.transcript),
       summary: call.summary || "",
       outcome: call.outcome || "",
     });
