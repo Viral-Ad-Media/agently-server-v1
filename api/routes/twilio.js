@@ -1055,16 +1055,11 @@ router.post(
     try {
       if (callRecord?.id && RecordingSid && RecordingUrl) {
         const downloaded = await downloadTwilioRecordingMp3(RecordingUrl);
-        columnsPatch = {
-          ...columnsPatch,
-          recording_mime_type: downloaded.mimeType,
-          recording_file_size: downloaded.buffer.length,
-        };
 
-        // Transcription must not depend on Supabase recording storage.
-        // If the storage bucket is missing or upload fails, we can still use
-        // the Twilio recording bytes we already downloaded to create the call
-        // transcript for audit immediately after call completion.
+        // Transcription must not depend on recording archive/storage success.
+        // Twilio already provides a downloadable recording URL; use it first so
+        // transcripts can still be created even when the Supabase bucket is
+        // missing or storage upload fails.
         try {
           const tx = await transcribeRecordingWithOpenAI({
             buffer: downloaded.buffer,
@@ -1125,6 +1120,8 @@ router.post(
               ...columnsPatch,
               recording_storage_provider: upload.provider,
               recording_storage_path: upload.storagePath,
+              recording_mime_type: downloaded.mimeType,
+              recording_file_size: downloaded.buffer.length,
               recording_archived_at: new Date().toISOString(),
             };
             metadataPatch.recording = {
@@ -1138,18 +1135,20 @@ router.post(
               storagePath: upload.storagePath,
             });
           }
-        } catch (uploadErr) {
-          columnsPatch.recording_error = uploadErr.message || String(uploadErr);
+        } catch (archiveErr) {
+          const archiveError = archiveErr.message || String(archiveErr);
+          columnsPatch.recording_error = archiveError;
+          columnsPatch.recording_available = Boolean(recordingUrl);
           metadataPatch.recording = {
-            ...metadataPatch.recording,
-            storage_error: columnsPatch.recording_error,
+            ...(metadataPatch.recording || {}),
+            archive_error: archiveError,
           };
           console.warn(
             "[recording] archive failed; transcript path preserved",
             {
               callSid: CallSid,
               recordingSid: RecordingSid,
-              error: columnsPatch.recording_error,
+              error: archiveError,
             },
           );
         }
