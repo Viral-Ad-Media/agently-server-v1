@@ -59,7 +59,10 @@ const {
   finalizeUsage,
 } = require("../../lib/call-records");
 const { mapTwilioError } = require("../../lib/twilio-errors");
-const { checkOpenAIRealtimeProvider } = require("../../lib/ai-provider-health");
+const {
+  checkOpenAIRealtimeProvider,
+  preflightEnforced,
+} = require("../../lib/ai-provider-health");
 const {
   ensureTenantTwilioAccount,
   searchAvailableRecommendedNumbers,
@@ -2572,7 +2575,17 @@ router.post(
 
     const aiProvider = await checkOpenAIRealtimeProvider();
     if (!aiProvider.success) {
-      return res.status(503).json(aiProvider);
+      console.warn("[outbound-call] AI provider preflight failed", {
+        reason: aiProvider?.error?.reason,
+        provider: aiProvider?.error?.provider,
+        enforced: preflightEnforced(),
+      });
+      if (preflightEnforced()) {
+        return res.status(503).json(aiProvider);
+      }
+      // Do not block call creation on a health-check failure by default.
+      // The live WS server can still connect to OpenAI/ElevenLabs at call time,
+      // and blocking here caused false 503s after provider/network migrations.
     }
 
     const record = await createCallRecord({
@@ -4142,7 +4155,17 @@ router.post(
 
     const aiProvider = await checkOpenAIRealtimeProvider();
     if (!aiProvider.success) {
-      return res.status(503).json(aiProvider);
+      console.warn("[outbound-call] AI provider preflight failed", {
+        reason: aiProvider?.error?.reason,
+        provider: aiProvider?.error?.provider,
+        enforced: preflightEnforced(),
+      });
+      if (preflightEnforced()) {
+        return res.status(503).json(aiProvider);
+      }
+      // Do not block call creation on a health-check failure by default.
+      // The live WS server can still connect to OpenAI/ElevenLabs at call time,
+      // and blocking here caused false 503s after provider/network migrations.
     }
 
     const record = await createCallRecord({
