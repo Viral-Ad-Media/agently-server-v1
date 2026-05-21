@@ -400,6 +400,7 @@ function buildRealtimeTwiml({
     leadId: leadId || "",
     callPurpose: callPurpose || "",
     customInstructions: customInstructions || "",
+    language: agent.language || process.env.DEFAULT_CALL_LANGUAGE || "en",
     agentName: voiceBehavior.cleanAgentNameForSpeech(
       agent.name || agent.agent_name || "",
     ),
