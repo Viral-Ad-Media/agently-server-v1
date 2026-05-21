@@ -682,8 +682,8 @@ router.get(
         .json({ error: { message: "Call record not found." } });
     }
 
-    const transcriptLines = (call.transcript || [])
-      .map((l) => `${l.speaker}: ${l.text}`)
+    const transcriptLines = normalizeTranscript(call.transcript)
+      .map((l) => `${l.speaker || l.role || "Unknown"}: ${l.text}`)
       .join("\n");
 
     const report = `AGENTLY CALL REPORT
