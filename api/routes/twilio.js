@@ -338,6 +338,15 @@ function safeXmlText(value) {
     .replace(/'/g, "&apos;");
 }
 
+function firstNonEmpty(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null && String(value).trim() !== "") {
+      return String(value).trim();
+    }
+  }
+  return "";
+}
+
 function hangupTwiml(
   message = "Sorry, this number is not currently configured. Goodbye.",
 ) {
@@ -366,6 +375,7 @@ function mediaStreamUrl(params) {
 
 function buildRealtimeTwiml({
   agent,
+  organizationName,
   callRecordId,
   callSid,
   direction,
@@ -384,7 +394,34 @@ function buildRealtimeTwiml({
   const streamParams = {
     orgId: agent.organization_id,
     organizationId: agent.organization_id,
+    organizationName: firstNonEmpty(
+      organizationName,
+      agent.organization_name,
+      agent.business_name,
+    ),
     agentId: agent.id,
+    agentName: firstNonEmpty(agent.name, agent.agent_name),
+    voiceProfile: firstNonEmpty(agent.voice, agent.voice_profile),
+    voiceProviderHint: firstNonEmpty(agent.voice_provider, agent.voiceProvider),
+    openAiVoice: firstNonEmpty(
+      agent.openai_voice,
+      agent.openAiVoice,
+      agent.voice,
+    ),
+    elevenLabsVoiceId: firstNonEmpty(
+      agent.elevenlabs_voice_id,
+      agent.elevenLabsVoiceId,
+      agent.voice_id,
+    ),
+    elevenLabsVoiceName: firstNonEmpty(
+      agent.elevenlabs_voice_name,
+      agent.elevenLabsVoiceName,
+    ),
+    elevenLabsModel: firstNonEmpty(
+      agent.elevenlabs_model,
+      agent.elevenLabsModel,
+      process.env.ELEVENLABS_DEFAULT_MODEL,
+    ),
     callRecordId,
     callSid: callSid || "",
     direction: direction || "inbound",
@@ -398,6 +435,20 @@ function buildRealtimeTwiml({
     ),
     leadId: leadId || "",
     callPurpose: callPurpose || "",
+    greetingMessage:
+      direction === "outbound"
+        ? voiceBehavior.buildOutboundGreeting({
+            recipientName: recipientName || targetName || "",
+            agentName: firstNonEmpty(agent.name, agent.agent_name),
+            organizationName: firstNonEmpty(
+              organizationName,
+              agent.organization_name,
+              agent.business_name,
+              agent.company_name,
+            ),
+            callPurpose: callPurpose || "follow up briefly",
+          })
+        : "",
     customInstructions: customInstructions || "",
     voiceProviderOverride: voiceProviderOverride || "",
     voiceProviderFallbackReason: voiceProviderFallbackReason || "",
@@ -513,8 +564,14 @@ async function handleInboundVoice(req, res) {
       metadata: { twilioTo: toPhone, twilioFrom: fromPhone },
     });
 
+    const organizationName = await loadOrganizationName(
+      db,
+      agent.organization_id,
+    );
+
     const twiml = buildRealtimeTwiml({
       agent,
+      organizationName,
       callRecordId: record.id,
       callSid,
       direction: "inbound",
@@ -544,6 +601,24 @@ router.post("/inbound", handleInboundVoice);
 router.get("/inbound", handleInboundVoice);
 router.post("/inbound-call", handleInboundVoice);
 router.get("/inbound-call", handleInboundVoice);
+
+async function loadOrganizationName(db, organizationId) {
+  if (!db || !organizationId) return "";
+  try {
+    const { data } = await db
+      .from("organizations")
+      .select("name,business_name,company_name")
+      .eq("id", organizationId)
+      .maybeSingle();
+    return firstNonEmpty(data?.name, data?.business_name, data?.company_name);
+  } catch (err) {
+    console.warn("[twilio] organization name lookup skipped", {
+      organizationId,
+      error: err.message || String(err),
+    });
+    return "";
+  }
+}
 
 // ─────────────────────────────────────────────────────────────
 // ── PUBLIC: Outbound TwiML ───────────────────────────────────
@@ -630,6 +705,11 @@ async function handleOutboundTwiMl(req, res) {
     );
   }
 
+  const organizationName = await loadOrganizationName(
+    db,
+    agent.organization_id,
+  );
+
   let callRecordId = callRecordIdFromQuery;
   if (!callRecordId) {
     const record = await createCallRecord({
@@ -659,6 +739,7 @@ async function handleOutboundTwiMl(req, res) {
 
   const twiml = buildRealtimeTwiml({
     agent,
+    organizationName,
     callRecordId,
     callSid,
     direction: "outbound",
@@ -4323,8 +4404,14 @@ router.post(
       metadata: { source: "twilio-voice-sdk" },
     });
 
+    const organizationName = await loadOrganizationName(
+      db,
+      agent.organization_id,
+    );
+
     const twiml = buildRealtimeTwiml({
       agent,
+      organizationName,
       callRecordId: record.id,
       callSid,
       direction: "web",
