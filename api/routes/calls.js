@@ -232,35 +232,51 @@ function normalizeTranscript(transcript) {
     .filter(Boolean);
 }
 
-function extractCallMessageMetadata(metadata = {}) {
+function normalizeActionableCallMessages(metadata = {}) {
   const meta = metadata && typeof metadata === "object" ? metadata : {};
-  const inbound = meta.inbound_call_message || null;
-  const outbound = meta.outbound_call_message || null;
-  const message =
-    outbound?.message ||
-    inbound?.message ||
-    meta.message ||
-    meta.message_captured ||
-    meta.captured_message ||
-    meta.caller_message ||
-    meta.message_for_team ||
-    "";
-  return {
-    message: String(message || ""),
-    inboundCallMessage: inbound,
-    outboundCallMessage: outbound,
-    callbackTime:
-      outbound?.callback_time ||
-      inbound?.callback_time ||
-      meta.callback_time ||
-      "",
-    callbackRequested: Boolean(
-      meta.callback_requested ||
-      outbound?.callback_time ||
-      inbound?.callback_time,
-    ),
-    messageCaptureStatus: meta.message_capture_status || "",
+  const intelligence = meta.call_intelligence || {};
+  const fields = intelligence.collected_fields || meta.collected_fields || {};
+  const out = [];
+  const add = (type, text, extra = {}) => {
+    const value = String(text || "").trim();
+    if (!value) return;
+    if (out.some((item) => item.text === value && item.type === type)) return;
+    out.push({
+      type,
+      text: value,
+      status: extra.status || "new",
+      createdAt:
+        extra.createdAt ||
+        meta.call_end_details?.ended_at ||
+        new Date().toISOString(),
+      ...extra,
+    });
   };
+
+  add("message_for_team", fields.message_for_team || meta.message_for_team);
+  add("callback_request", fields.callback_time || meta.callback_time);
+  add("unanswered_question", fields.unanswered_question);
+  if (
+    fields.opt_out ||
+    /opt_out|not_interested/i.test(String(intelligence.outcome || ""))
+  ) {
+    add(
+      "opt_out",
+      "Recipient requested no further outreach or indicated they are not interested.",
+    );
+  }
+  if (Array.isArray(meta.messages)) {
+    for (const item of meta.messages)
+      add(item.type || "message", item.text || item.message || item.note, item);
+  }
+  if (meta.message_capture && typeof meta.message_capture === "object") {
+    add(
+      "message_for_team",
+      meta.message_capture.message || meta.message_capture.note,
+      meta.message_capture,
+    );
+  }
+  return out;
 }
 
 function twilioBasicAuthHeader() {
@@ -863,17 +879,13 @@ router.get(
       return res
         .status(404)
         .json({ error: { message: "Call record not found." } });
-    const messageMeta = extractCallMessageMetadata(call.metadata);
+    const actionableMessages = normalizeActionableCallMessages(call.metadata);
     res.json({
       success: true,
       callId: call.id,
-      messages: normalizeTranscript(call.transcript),
-      capturedMessage: messageMeta.message,
-      callbackTime: messageMeta.callbackTime,
-      callbackRequested: messageMeta.callbackRequested,
-      messageCaptureStatus: messageMeta.messageCaptureStatus,
-      inboundCallMessage: messageMeta.inboundCallMessage,
-      outboundCallMessage: messageMeta.outboundCallMessage,
+      messages: actionableMessages,
+      actionableMessages,
+      transcript: normalizeTranscript(call.transcript),
     });
   }),
 );
@@ -886,9 +898,7 @@ router.get(
     const db = getSupabase();
     const { data: call, error } = await db
       .from("call_records")
-      .select(
-        "id,transcript,summary,outcome,status,metadata,updated_at,completed_at,ended_at",
-      )
+      .select("id,transcript,summary,outcome")
       .eq("id", req.params.id)
       .eq("organization_id", req.orgId)
       .maybeSingle();
@@ -896,19 +906,12 @@ router.get(
       return res
         .status(404)
         .json({ error: { message: "Call record not found." } });
-    const messageMeta = extractCallMessageMetadata(call.metadata);
     res.json({
       success: true,
       callId: call.id,
       transcript: normalizeTranscript(call.transcript),
       summary: call.summary || "",
       outcome: call.outcome || "",
-      status: call.status || "",
-      completedAt: call.completed_at || call.ended_at || call.updated_at || "",
-      capturedMessage: messageMeta.message,
-      callbackTime: messageMeta.callbackTime,
-      callbackRequested: messageMeta.callbackRequested,
-      messageCaptureStatus: messageMeta.messageCaptureStatus,
     });
   }),
 );
