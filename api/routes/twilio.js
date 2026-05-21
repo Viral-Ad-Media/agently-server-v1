@@ -60,6 +60,7 @@ const {
 } = require("../../lib/call-records");
 const { mapTwilioError } = require("../../lib/twilio-errors");
 const { checkOpenAIRealtimeProvider } = require("../../lib/ai-provider-health");
+const voiceBehavior = require("../../lib/voice-behavior");
 const {
   ensureTenantTwilioAccount,
   searchAvailableRecommendedNumbers,
@@ -389,8 +390,12 @@ function buildRealtimeTwiml({
     direction: direction || "inbound",
     callerPhone: callerPhone || "",
     recipientPhone: recipientPhone || callerPhone || "",
-    recipientName: recipientName || targetName || "",
-    targetName: targetName || recipientName || "",
+    recipientName: voiceBehavior.cleanRecipientNameForSpeech(
+      recipientName || targetName || "",
+    ),
+    targetName: voiceBehavior.cleanRecipientNameForSpeech(
+      targetName || recipientName || "",
+    ),
     leadId: leadId || "",
     callPurpose: callPurpose || "",
     customInstructions: customInstructions || "",
@@ -1050,10 +1055,16 @@ router.post(
     try {
       if (callRecord?.id && RecordingSid && RecordingUrl) {
         const downloaded = await downloadTwilioRecordingMp3(RecordingUrl);
+        columnsPatch = {
+          ...columnsPatch,
+          recording_mime_type: downloaded.mimeType,
+          recording_file_size: downloaded.buffer.length,
+        };
 
-        // Transcribe from the Twilio recording independently of Supabase storage.
-        // This gives the tenant an audit transcript even if the storage bucket is
-        // missing or recording archival fails.
+        // Transcription must not depend on Supabase recording storage.
+        // If the storage bucket is missing or upload fails, we can still use
+        // the Twilio recording bytes we already downloaded to create the call
+        // transcript for audit immediately after call completion.
         try {
           const tx = await transcribeRecordingWithOpenAI({
             buffer: downloaded.buffer,
@@ -1074,7 +1085,7 @@ router.post(
           };
           if (tx.text) {
             const existingTranscript = transcriptToText(callRecord.transcript);
-            if (!existingTranscript)
+            if (!existingTranscript) {
               columnsPatch.transcript = [
                 {
                   role: "transcription",
@@ -1082,6 +1093,7 @@ router.post(
                   ts: new Date().toISOString(),
                 },
               ];
+            }
             if (!callRecord.summary)
               columnsPatch.summary = makeShortSummary(tx.text);
           }
@@ -1113,8 +1125,6 @@ router.post(
               ...columnsPatch,
               recording_storage_provider: upload.provider,
               recording_storage_path: upload.storagePath,
-              recording_mime_type: downloaded.mimeType,
-              recording_file_size: downloaded.buffer.length,
               recording_archived_at: new Date().toISOString(),
             };
             metadataPatch.recording = {
@@ -1132,7 +1142,7 @@ router.post(
           columnsPatch.recording_error = uploadErr.message || String(uploadErr);
           metadataPatch.recording = {
             ...metadataPatch.recording,
-            error: columnsPatch.recording_error,
+            storage_error: columnsPatch.recording_error,
           };
           console.warn(
             "[recording] archive failed; transcript path preserved",
@@ -2424,15 +2434,15 @@ router.post(
     );
     const agentId = req.body?.agentId || req.body?.voiceAgentId || null;
     const leadId = req.body?.leadId || null;
-    const recipientName = String(
+    const recipientName = voiceBehavior.cleanRecipientNameForSpeech(
       req.body?.recipientName ||
         req.body?.targetName ||
         req.body?.customerName ||
-        "Outbound Lead",
-    ).trim();
-    const targetName = String(
+        "",
+    );
+    const targetName = voiceBehavior.cleanRecipientNameForSpeech(
       req.body?.targetName || recipientName || "",
-    ).trim();
+    );
     const customInstructions = String(
       req.body?.customInstructions || "",
     ).trim();
@@ -2590,13 +2600,25 @@ router.post(
 
     const aiProvider = await checkOpenAIRealtimeProvider();
     if (!aiProvider.success) {
-      return res.status(503).json(aiProvider);
+      console.warn(
+        "[outbound-call] AI provider preflight warning; continuing",
+        {
+          reason: aiProvider?.error?.reason || "unknown",
+        },
+      );
+      if (
+        String(
+          process.env.AI_PROVIDER_PREFLIGHT_ENFORCE || "false",
+        ).toLowerCase() === "true"
+      ) {
+        return res.status(503).json(aiProvider);
+      }
     }
 
     const record = await createCallRecord({
       organizationId,
       voiceAgentId: agent.id,
-      callerName: recipientName || "Outbound Lead",
+      callerName: recipientName || "Outbound Recipient",
       callerPhone: toPhone,
       leadId,
       direction: "outbound",
@@ -4046,16 +4068,16 @@ router.post(
   requireAdmin,
   asyncHandler(async (req, res) => {
     const toPhone = normalizePhone(req.body?.toPhone || req.body?.to || "");
-    const recipientName = String(
+    const recipientName = voiceBehavior.cleanRecipientNameForSpeech(
       req.body?.recipientName ||
         req.body?.targetName ||
         req.body?.customerName ||
-        "Outbound Lead",
-    ).trim();
-    const targetName = String(
+        "",
+    );
+    const targetName = voiceBehavior.cleanRecipientNameForSpeech(
       req.body?.targetName || recipientName || "",
-    ).trim();
-    const customerName = recipientName || "Outbound Lead";
+    );
+    const customerName = recipientName || "Outbound Recipient";
     const voiceAgentId = req.body?.voiceAgentId || req.body?.agentId || null;
     const leadId = req.body?.leadId || null;
     const customInstructions = String(
@@ -4160,7 +4182,19 @@ router.post(
 
     const aiProvider = await checkOpenAIRealtimeProvider();
     if (!aiProvider.success) {
-      return res.status(503).json(aiProvider);
+      console.warn(
+        "[outbound-call] AI provider preflight warning; continuing",
+        {
+          reason: aiProvider?.error?.reason || "unknown",
+        },
+      );
+      if (
+        String(
+          process.env.AI_PROVIDER_PREFLIGHT_ENFORCE || "false",
+        ).toLowerCase() === "true"
+      ) {
+        return res.status(503).json(aiProvider);
+      }
     }
 
     const record = await createCallRecord({
