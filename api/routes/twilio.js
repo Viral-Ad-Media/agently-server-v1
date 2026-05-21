@@ -59,10 +59,8 @@ const {
   finalizeUsage,
 } = require("../../lib/call-records");
 const { mapTwilioError } = require("../../lib/twilio-errors");
-const {
-  checkOpenAIRealtimeProvider,
-  preflightEnforced,
-} = require("../../lib/ai-provider-health");
+const { checkOpenAIRealtimeProvider } = require("../../lib/ai-provider-health");
+const voiceBehavior = require("../../lib/voice-behavior");
 const {
   ensureTenantTwilioAccount,
   searchAvailableRecommendedNumbers,
@@ -392,8 +390,12 @@ function buildRealtimeTwiml({
     direction: direction || "inbound",
     callerPhone: callerPhone || "",
     recipientPhone: recipientPhone || callerPhone || "",
-    recipientName: recipientName || targetName || "",
-    targetName: targetName || recipientName || "",
+    recipientName: voiceBehavior.cleanRecipientNameForSpeech(
+      recipientName || targetName || "",
+    ),
+    targetName: voiceBehavior.cleanRecipientNameForSpeech(
+      targetName || recipientName || "",
+    ),
     leadId: leadId || "",
     callPurpose: callPurpose || "",
     customInstructions: customInstructions || "",
@@ -2409,15 +2411,15 @@ router.post(
     );
     const agentId = req.body?.agentId || req.body?.voiceAgentId || null;
     const leadId = req.body?.leadId || null;
-    const recipientName = String(
+    const recipientName = voiceBehavior.cleanRecipientNameForSpeech(
       req.body?.recipientName ||
         req.body?.targetName ||
         req.body?.customerName ||
-        "Outbound Lead",
-    ).trim();
-    const targetName = String(
+        "",
+    );
+    const targetName = voiceBehavior.cleanRecipientNameForSpeech(
       req.body?.targetName || recipientName || "",
-    ).trim();
+    );
     const customInstructions = String(
       req.body?.customInstructions || "",
     ).trim();
@@ -2575,23 +2577,25 @@ router.post(
 
     const aiProvider = await checkOpenAIRealtimeProvider();
     if (!aiProvider.success) {
-      console.warn("[outbound-call] AI provider preflight failed", {
-        reason: aiProvider?.error?.reason,
-        provider: aiProvider?.error?.provider,
-        enforced: preflightEnforced(),
-      });
-      if (preflightEnforced()) {
+      console.warn(
+        "[outbound-call] AI provider preflight warning; continuing",
+        {
+          reason: aiProvider?.error?.reason || "unknown",
+        },
+      );
+      if (
+        String(
+          process.env.AI_PROVIDER_PREFLIGHT_ENFORCE || "false",
+        ).toLowerCase() === "true"
+      ) {
         return res.status(503).json(aiProvider);
       }
-      // Do not block call creation on a health-check failure by default.
-      // The live WS server can still connect to OpenAI/ElevenLabs at call time,
-      // and blocking here caused false 503s after provider/network migrations.
     }
 
     const record = await createCallRecord({
       organizationId,
       voiceAgentId: agent.id,
-      callerName: recipientName || "Outbound Lead",
+      callerName: recipientName || "Outbound Recipient",
       callerPhone: toPhone,
       leadId,
       direction: "outbound",
@@ -4041,16 +4045,16 @@ router.post(
   requireAdmin,
   asyncHandler(async (req, res) => {
     const toPhone = normalizePhone(req.body?.toPhone || req.body?.to || "");
-    const recipientName = String(
+    const recipientName = voiceBehavior.cleanRecipientNameForSpeech(
       req.body?.recipientName ||
         req.body?.targetName ||
         req.body?.customerName ||
-        "Outbound Lead",
-    ).trim();
-    const targetName = String(
+        "",
+    );
+    const targetName = voiceBehavior.cleanRecipientNameForSpeech(
       req.body?.targetName || recipientName || "",
-    ).trim();
-    const customerName = recipientName || "Outbound Lead";
+    );
+    const customerName = recipientName || "Outbound Recipient";
     const voiceAgentId = req.body?.voiceAgentId || req.body?.agentId || null;
     const leadId = req.body?.leadId || null;
     const customInstructions = String(
@@ -4155,17 +4159,19 @@ router.post(
 
     const aiProvider = await checkOpenAIRealtimeProvider();
     if (!aiProvider.success) {
-      console.warn("[outbound-call] AI provider preflight failed", {
-        reason: aiProvider?.error?.reason,
-        provider: aiProvider?.error?.provider,
-        enforced: preflightEnforced(),
-      });
-      if (preflightEnforced()) {
+      console.warn(
+        "[outbound-call] AI provider preflight warning; continuing",
+        {
+          reason: aiProvider?.error?.reason || "unknown",
+        },
+      );
+      if (
+        String(
+          process.env.AI_PROVIDER_PREFLIGHT_ENFORCE || "false",
+        ).toLowerCase() === "true"
+      ) {
         return res.status(503).json(aiProvider);
       }
-      // Do not block call creation on a health-check failure by default.
-      // The live WS server can still connect to OpenAI/ElevenLabs at call time,
-      // and blocking here caused false 503s after provider/network migrations.
     }
 
     const record = await createCallRecord({

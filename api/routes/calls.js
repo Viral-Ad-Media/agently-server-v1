@@ -232,6 +232,37 @@ function normalizeTranscript(transcript) {
     .filter(Boolean);
 }
 
+function extractCallMessageMetadata(metadata = {}) {
+  const meta = metadata && typeof metadata === "object" ? metadata : {};
+  const inbound = meta.inbound_call_message || null;
+  const outbound = meta.outbound_call_message || null;
+  const message =
+    outbound?.message ||
+    inbound?.message ||
+    meta.message ||
+    meta.message_captured ||
+    meta.captured_message ||
+    meta.caller_message ||
+    meta.message_for_team ||
+    "";
+  return {
+    message: String(message || ""),
+    inboundCallMessage: inbound,
+    outboundCallMessage: outbound,
+    callbackTime:
+      outbound?.callback_time ||
+      inbound?.callback_time ||
+      meta.callback_time ||
+      "",
+    callbackRequested: Boolean(
+      meta.callback_requested ||
+      outbound?.callback_time ||
+      inbound?.callback_time,
+    ),
+    messageCaptureStatus: meta.message_capture_status || "",
+  };
+}
+
 function twilioBasicAuthHeader() {
   const sid = process.env.TWILIO_ACCOUNT_SID;
   const token = process.env.TWILIO_AUTH_TOKEN;
@@ -824,7 +855,7 @@ router.get(
     const db = getSupabase();
     const { data: call, error } = await db
       .from("call_records")
-      .select("id,transcript")
+      .select("id,transcript,metadata")
       .eq("id", req.params.id)
       .eq("organization_id", req.orgId)
       .maybeSingle();
@@ -832,10 +863,17 @@ router.get(
       return res
         .status(404)
         .json({ error: { message: "Call record not found." } });
+    const messageMeta = extractCallMessageMetadata(call.metadata);
     res.json({
       success: true,
       callId: call.id,
       messages: normalizeTranscript(call.transcript),
+      capturedMessage: messageMeta.message,
+      callbackTime: messageMeta.callbackTime,
+      callbackRequested: messageMeta.callbackRequested,
+      messageCaptureStatus: messageMeta.messageCaptureStatus,
+      inboundCallMessage: messageMeta.inboundCallMessage,
+      outboundCallMessage: messageMeta.outboundCallMessage,
     });
   }),
 );
@@ -848,7 +886,9 @@ router.get(
     const db = getSupabase();
     const { data: call, error } = await db
       .from("call_records")
-      .select("id,transcript,summary,outcome")
+      .select(
+        "id,transcript,summary,outcome,status,metadata,updated_at,completed_at,ended_at",
+      )
       .eq("id", req.params.id)
       .eq("organization_id", req.orgId)
       .maybeSingle();
@@ -856,12 +896,19 @@ router.get(
       return res
         .status(404)
         .json({ error: { message: "Call record not found." } });
+    const messageMeta = extractCallMessageMetadata(call.metadata);
     res.json({
       success: true,
       callId: call.id,
       transcript: normalizeTranscript(call.transcript),
       summary: call.summary || "",
       outcome: call.outcome || "",
+      status: call.status || "",
+      completedAt: call.completed_at || call.ended_at || call.updated_at || "",
+      capturedMessage: messageMeta.message,
+      callbackTime: messageMeta.callbackTime,
+      callbackRequested: messageMeta.callbackRequested,
+      messageCaptureStatus: messageMeta.messageCaptureStatus,
     });
   }),
 );
