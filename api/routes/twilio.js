@@ -60,7 +60,6 @@ const {
 } = require("../../lib/call-records");
 const { mapTwilioError } = require("../../lib/twilio-errors");
 const { checkOpenAIRealtimeProvider } = require("../../lib/ai-provider-health");
-const voiceBehavior = require("../../lib/voice-behavior");
 const {
   ensureTenantTwilioAccount,
   searchAvailableRecommendedNumbers,
@@ -390,12 +389,8 @@ function buildRealtimeTwiml({
     direction: direction || "inbound",
     callerPhone: callerPhone || "",
     recipientPhone: recipientPhone || callerPhone || "",
-    recipientName: voiceBehavior.cleanRecipientNameForSpeech(
-      recipientName || targetName || "",
-    ),
-    targetName: voiceBehavior.cleanRecipientNameForSpeech(
-      targetName || recipientName || "",
-    ),
+    recipientName: recipientName || targetName || "",
+    targetName: targetName || recipientName || "",
     leadId: leadId || "",
     callPurpose: callPurpose || "",
     customInstructions: customInstructions || "",
@@ -1055,80 +1050,98 @@ router.post(
     try {
       if (callRecord?.id && RecordingSid && RecordingUrl) {
         const downloaded = await downloadTwilioRecordingMp3(RecordingUrl);
-        const upload = await uploadRecordingToSupabase({
-          callRecord,
-          recordingSid: RecordingSid,
-          buffer: downloaded.buffer,
-          mimeType: downloaded.mimeType,
-        });
-        if (!upload?.skipped) {
-          columnsPatch = {
-            ...columnsPatch,
-            recording_storage_provider: upload.provider,
-            recording_storage_path: upload.storagePath,
-            recording_mime_type: downloaded.mimeType,
-            recording_file_size: downloaded.buffer.length,
-            recording_archived_at: new Date().toISOString(),
-          };
-          metadataPatch.recording = {
-            ...metadataPatch.recording,
-            storage_provider: upload.provider,
-            storage_path: upload.storagePath,
-          };
-          console.log("[recording] archived to Supabase", {
-            callSid: CallSid,
-            recordingSid: RecordingSid,
-            storagePath: upload.storagePath,
-          });
 
-          try {
-            const tx = await transcribeRecordingWithOpenAI({
-              buffer: downloaded.buffer,
-              filename: `${RecordingSid}.mp3`,
-            });
-            columnsPatch.transcription_provider = "openai";
-            columnsPatch.transcription_status =
-              tx.status || (tx.skipped ? "skipped" : "completed");
-            metadataPatch.transcription = {
-              provider: "openai",
-              model:
-                tx.model ||
-                process.env.OPENAI_TRANSCRIPTION_MODEL ||
-                "gpt-4o-mini-transcribe",
-              status: tx.status || "unknown",
-              completed_at: new Date().toISOString(),
-              skipped: Boolean(tx.skipped),
+        // Transcribe from the Twilio recording independently of Supabase storage.
+        // This gives the tenant an audit transcript even if the storage bucket is
+        // missing or recording archival fails.
+        try {
+          const tx = await transcribeRecordingWithOpenAI({
+            buffer: downloaded.buffer,
+            filename: `${RecordingSid}.mp3`,
+          });
+          columnsPatch.transcription_provider = "openai";
+          columnsPatch.transcription_status =
+            tx.status || (tx.skipped ? "skipped" : "completed");
+          metadataPatch.transcription = {
+            provider: "openai",
+            model:
+              tx.model ||
+              process.env.OPENAI_TRANSCRIPTION_MODEL ||
+              "gpt-4o-mini-transcribe",
+            status: tx.status || "unknown",
+            completed_at: new Date().toISOString(),
+            skipped: Boolean(tx.skipped),
+          };
+          if (tx.text) {
+            const existingTranscript = transcriptToText(callRecord.transcript);
+            if (!existingTranscript)
+              columnsPatch.transcript = [
+                {
+                  role: "transcription",
+                  text: tx.text,
+                  ts: new Date().toISOString(),
+                },
+              ];
+            if (!callRecord.summary)
+              columnsPatch.summary = makeShortSummary(tx.text);
+          }
+        } catch (txErr) {
+          columnsPatch.transcription_provider = "openai";
+          columnsPatch.transcription_status = "failed";
+          columnsPatch.transcription_error = txErr.message || String(txErr);
+          metadataPatch.transcription = {
+            provider: "openai",
+            status: "failed",
+            error: columnsPatch.transcription_error,
+            completed_at: new Date().toISOString(),
+          };
+          console.warn("[recording] transcription failed", {
+            callSid: CallSid,
+            error: columnsPatch.transcription_error,
+          });
+        }
+
+        try {
+          const upload = await uploadRecordingToSupabase({
+            callRecord,
+            recordingSid: RecordingSid,
+            buffer: downloaded.buffer,
+            mimeType: downloaded.mimeType,
+          });
+          if (!upload?.skipped) {
+            columnsPatch = {
+              ...columnsPatch,
+              recording_storage_provider: upload.provider,
+              recording_storage_path: upload.storagePath,
+              recording_mime_type: downloaded.mimeType,
+              recording_file_size: downloaded.buffer.length,
+              recording_archived_at: new Date().toISOString(),
             };
-            if (tx.text) {
-              const existingTranscript = transcriptToText(
-                callRecord.transcript,
-              );
-              if (!existingTranscript)
-                columnsPatch.transcript = [
-                  {
-                    role: "transcription",
-                    text: tx.text,
-                    ts: new Date().toISOString(),
-                  },
-                ];
-              if (!callRecord.summary)
-                columnsPatch.summary = makeShortSummary(tx.text);
-            }
-          } catch (txErr) {
-            columnsPatch.transcription_provider = "openai";
-            columnsPatch.transcription_status = "failed";
-            columnsPatch.transcription_error = txErr.message || String(txErr);
-            metadataPatch.transcription = {
-              provider: "openai",
-              status: "failed",
-              error: columnsPatch.transcription_error,
-              completed_at: new Date().toISOString(),
+            metadataPatch.recording = {
+              ...metadataPatch.recording,
+              storage_provider: upload.provider,
+              storage_path: upload.storagePath,
             };
-            console.warn("[recording] transcription failed", {
+            console.log("[recording] archived to Supabase", {
               callSid: CallSid,
-              error: columnsPatch.transcription_error,
+              recordingSid: RecordingSid,
+              storagePath: upload.storagePath,
             });
           }
+        } catch (uploadErr) {
+          columnsPatch.recording_error = uploadErr.message || String(uploadErr);
+          metadataPatch.recording = {
+            ...metadataPatch.recording,
+            error: columnsPatch.recording_error,
+          };
+          console.warn(
+            "[recording] archive failed; transcript path preserved",
+            {
+              callSid: CallSid,
+              recordingSid: RecordingSid,
+              error: columnsPatch.recording_error,
+            },
+          );
         }
       }
       await updateCallRecordMetadataBySid(CallSid, metadataPatch, columnsPatch);
@@ -2411,15 +2424,15 @@ router.post(
     );
     const agentId = req.body?.agentId || req.body?.voiceAgentId || null;
     const leadId = req.body?.leadId || null;
-    const recipientName = voiceBehavior.cleanRecipientNameForSpeech(
+    const recipientName = String(
       req.body?.recipientName ||
         req.body?.targetName ||
         req.body?.customerName ||
-        "",
-    );
-    const targetName = voiceBehavior.cleanRecipientNameForSpeech(
+        "Outbound Lead",
+    ).trim();
+    const targetName = String(
       req.body?.targetName || recipientName || "",
-    );
+    ).trim();
     const customInstructions = String(
       req.body?.customInstructions || "",
     ).trim();
@@ -2577,25 +2590,13 @@ router.post(
 
     const aiProvider = await checkOpenAIRealtimeProvider();
     if (!aiProvider.success) {
-      console.warn(
-        "[outbound-call] AI provider preflight warning; continuing",
-        {
-          reason: aiProvider?.error?.reason || "unknown",
-        },
-      );
-      if (
-        String(
-          process.env.AI_PROVIDER_PREFLIGHT_ENFORCE || "false",
-        ).toLowerCase() === "true"
-      ) {
-        return res.status(503).json(aiProvider);
-      }
+      return res.status(503).json(aiProvider);
     }
 
     const record = await createCallRecord({
       organizationId,
       voiceAgentId: agent.id,
-      callerName: recipientName || "Outbound Recipient",
+      callerName: recipientName || "Outbound Lead",
       callerPhone: toPhone,
       leadId,
       direction: "outbound",
@@ -4045,16 +4046,16 @@ router.post(
   requireAdmin,
   asyncHandler(async (req, res) => {
     const toPhone = normalizePhone(req.body?.toPhone || req.body?.to || "");
-    const recipientName = voiceBehavior.cleanRecipientNameForSpeech(
+    const recipientName = String(
       req.body?.recipientName ||
         req.body?.targetName ||
         req.body?.customerName ||
-        "",
-    );
-    const targetName = voiceBehavior.cleanRecipientNameForSpeech(
+        "Outbound Lead",
+    ).trim();
+    const targetName = String(
       req.body?.targetName || recipientName || "",
-    );
-    const customerName = recipientName || "Outbound Recipient";
+    ).trim();
+    const customerName = recipientName || "Outbound Lead";
     const voiceAgentId = req.body?.voiceAgentId || req.body?.agentId || null;
     const leadId = req.body?.leadId || null;
     const customInstructions = String(
@@ -4159,19 +4160,7 @@ router.post(
 
     const aiProvider = await checkOpenAIRealtimeProvider();
     if (!aiProvider.success) {
-      console.warn(
-        "[outbound-call] AI provider preflight warning; continuing",
-        {
-          reason: aiProvider?.error?.reason || "unknown",
-        },
-      );
-      if (
-        String(
-          process.env.AI_PROVIDER_PREFLIGHT_ENFORCE || "false",
-        ).toLowerCase() === "true"
-      ) {
-        return res.status(503).json(aiProvider);
-      }
+      return res.status(503).json(aiProvider);
     }
 
     const record = await createCallRecord({
