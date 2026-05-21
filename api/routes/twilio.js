@@ -338,15 +338,6 @@ function safeXmlText(value) {
     .replace(/'/g, "&apos;");
 }
 
-function firstNonEmpty(...values) {
-  for (const value of values) {
-    if (value !== undefined && value !== null && String(value).trim() !== "") {
-      return String(value).trim();
-    }
-  }
-  return "";
-}
-
 function hangupTwiml(
   message = "Sorry, this number is not currently configured. Goodbye.",
 ) {
@@ -375,7 +366,7 @@ function mediaStreamUrl(params) {
 
 function buildRealtimeTwiml({
   agent,
-  organizationName,
+  organization = null,
   callRecordId,
   callSid,
   direction,
@@ -394,34 +385,7 @@ function buildRealtimeTwiml({
   const streamParams = {
     orgId: agent.organization_id,
     organizationId: agent.organization_id,
-    organizationName: firstNonEmpty(
-      organizationName,
-      agent.organization_name,
-      agent.business_name,
-    ),
     agentId: agent.id,
-    agentName: firstNonEmpty(agent.name, agent.agent_name),
-    voiceProfile: firstNonEmpty(agent.voice, agent.voice_profile),
-    voiceProviderHint: firstNonEmpty(agent.voice_provider, agent.voiceProvider),
-    openAiVoice: firstNonEmpty(
-      agent.openai_voice,
-      agent.openAiVoice,
-      agent.voice,
-    ),
-    elevenLabsVoiceId: firstNonEmpty(
-      agent.elevenlabs_voice_id,
-      agent.elevenLabsVoiceId,
-      agent.voice_id,
-    ),
-    elevenLabsVoiceName: firstNonEmpty(
-      agent.elevenlabs_voice_name,
-      agent.elevenLabsVoiceName,
-    ),
-    elevenLabsModel: firstNonEmpty(
-      agent.elevenlabs_model,
-      agent.elevenLabsModel,
-      process.env.ELEVENLABS_DEFAULT_MODEL,
-    ),
     callRecordId,
     callSid: callSid || "",
     direction: direction || "inbound",
@@ -435,21 +399,22 @@ function buildRealtimeTwiml({
     ),
     leadId: leadId || "",
     callPurpose: callPurpose || "",
-    greetingMessage:
-      direction === "outbound"
-        ? voiceBehavior.buildOutboundGreeting({
-            recipientName: recipientName || targetName || "",
-            agentName: firstNonEmpty(agent.name, agent.agent_name),
-            organizationName: firstNonEmpty(
-              organizationName,
-              agent.organization_name,
-              agent.business_name,
-              agent.company_name,
-            ),
-            callPurpose: callPurpose || "follow up briefly",
-          })
-        : "",
     customInstructions: customInstructions || "",
+    agentName: voiceBehavior.cleanAgentNameForSpeech(
+      agent.name || agent.agent_name || "",
+    ),
+    organizationName: voiceBehavior.cleanOrganizationNameForSpeech(
+      organization?.name ||
+        organization?.business_name ||
+        organization?.company_name ||
+        "",
+    ),
+    voiceProviderHint: agent.voice_provider || "",
+    openAiVoice:
+      agent.openai_voice || agent.openai_voice_id || agent.voice || "",
+    elevenLabsVoiceId: agent.elevenlabs_voice_id || agent.voice_id || "",
+    elevenLabsVoiceName: agent.elevenlabs_voice_name || "",
+    voiceProfile: agent.voice || "",
     voiceProviderOverride: voiceProviderOverride || "",
     voiceProviderFallbackReason: voiceProviderFallbackReason || "",
     scheduleId: scheduleId || "",
@@ -564,14 +529,8 @@ async function handleInboundVoice(req, res) {
       metadata: { twilioTo: toPhone, twilioFrom: fromPhone },
     });
 
-    const organizationName = await loadOrganizationName(
-      db,
-      agent.organization_id,
-    );
-
     const twiml = buildRealtimeTwiml({
       agent,
-      organizationName,
       callRecordId: record.id,
       callSid,
       direction: "inbound",
@@ -601,24 +560,6 @@ router.post("/inbound", handleInboundVoice);
 router.get("/inbound", handleInboundVoice);
 router.post("/inbound-call", handleInboundVoice);
 router.get("/inbound-call", handleInboundVoice);
-
-async function loadOrganizationName(db, organizationId) {
-  if (!db || !organizationId) return "";
-  try {
-    const { data } = await db
-      .from("organizations")
-      .select("name,business_name,company_name")
-      .eq("id", organizationId)
-      .maybeSingle();
-    return firstNonEmpty(data?.name, data?.business_name, data?.company_name);
-  } catch (err) {
-    console.warn("[twilio] organization name lookup skipped", {
-      organizationId,
-      error: err.message || String(err),
-    });
-    return "";
-  }
-}
 
 // ─────────────────────────────────────────────────────────────
 // ── PUBLIC: Outbound TwiML ───────────────────────────────────
@@ -672,6 +613,23 @@ async function handleOutboundTwiMl(req, res) {
   }
   if (!agent) agent = await lookupAgentByPhone(fromPhone);
 
+  let organization = null;
+  if (agent?.organization_id) {
+    try {
+      const { data } = await db
+        .from("organizations")
+        .select("id,name,business_name,company_name,timezone,business_hours")
+        .eq("id", agent.organization_id)
+        .maybeSingle();
+      organization = data || null;
+    } catch (err) {
+      console.warn("[outbound-twiml] organization lookup skipped", {
+        organizationId: agent.organization_id,
+        error: err.message || String(err),
+      });
+    }
+  }
+
   if (scheduleRunId && (!recipientName || !recipientPhone)) {
     try {
       const { data: run } = await db
@@ -705,11 +663,6 @@ async function handleOutboundTwiMl(req, res) {
     );
   }
 
-  const organizationName = await loadOrganizationName(
-    db,
-    agent.organization_id,
-  );
-
   let callRecordId = callRecordIdFromQuery;
   if (!callRecordId) {
     const record = await createCallRecord({
@@ -739,7 +692,7 @@ async function handleOutboundTwiMl(req, res) {
 
   const twiml = buildRealtimeTwiml({
     agent,
-    organizationName,
+    organization,
     callRecordId,
     callSid,
     direction: "outbound",
@@ -1136,102 +1089,80 @@ router.post(
     try {
       if (callRecord?.id && RecordingSid && RecordingUrl) {
         const downloaded = await downloadTwilioRecordingMp3(RecordingUrl);
-
-        // Transcription must not depend on recording archive/storage success.
-        // Twilio already provides a downloadable recording URL; use it first so
-        // transcripts can still be created even when the Supabase bucket is
-        // missing or storage upload fails.
-        try {
-          const tx = await transcribeRecordingWithOpenAI({
-            buffer: downloaded.buffer,
-            filename: `${RecordingSid}.mp3`,
-          });
-          columnsPatch.transcription_provider = "openai";
-          columnsPatch.transcription_status =
-            tx.status || (tx.skipped ? "skipped" : "completed");
-          metadataPatch.transcription = {
-            provider: "openai",
-            model:
-              tx.model ||
-              process.env.OPENAI_TRANSCRIPTION_MODEL ||
-              "gpt-4o-mini-transcribe",
-            status: tx.status || "unknown",
-            completed_at: new Date().toISOString(),
-            skipped: Boolean(tx.skipped),
+        const upload = await uploadRecordingToSupabase({
+          callRecord,
+          recordingSid: RecordingSid,
+          buffer: downloaded.buffer,
+          mimeType: downloaded.mimeType,
+        });
+        if (!upload?.skipped) {
+          columnsPatch = {
+            ...columnsPatch,
+            recording_storage_provider: upload.provider,
+            recording_storage_path: upload.storagePath,
+            recording_mime_type: downloaded.mimeType,
+            recording_file_size: downloaded.buffer.length,
+            recording_archived_at: new Date().toISOString(),
           };
-          if (tx.text) {
-            const existingTranscript = transcriptToText(callRecord.transcript);
-            if (!existingTranscript) {
-              columnsPatch.transcript = [
-                {
-                  role: "transcription",
-                  text: tx.text,
-                  ts: new Date().toISOString(),
-                },
-              ];
-            }
-            if (!callRecord.summary)
-              columnsPatch.summary = makeShortSummary(tx.text);
-          }
-        } catch (txErr) {
-          columnsPatch.transcription_provider = "openai";
-          columnsPatch.transcription_status = "failed";
-          columnsPatch.transcription_error = txErr.message || String(txErr);
-          metadataPatch.transcription = {
-            provider: "openai",
-            status: "failed",
-            error: columnsPatch.transcription_error,
-            completed_at: new Date().toISOString(),
+          metadataPatch.recording = {
+            ...metadataPatch.recording,
+            storage_provider: upload.provider,
+            storage_path: upload.storagePath,
           };
-          console.warn("[recording] transcription failed", {
+          console.log("[recording] archived to Supabase", {
             callSid: CallSid,
-            error: columnsPatch.transcription_error,
-          });
-        }
-
-        try {
-          const upload = await uploadRecordingToSupabase({
-            callRecord,
             recordingSid: RecordingSid,
-            buffer: downloaded.buffer,
-            mimeType: downloaded.mimeType,
+            storagePath: upload.storagePath,
           });
-          if (!upload?.skipped) {
-            columnsPatch = {
-              ...columnsPatch,
-              recording_storage_provider: upload.provider,
-              recording_storage_path: upload.storagePath,
-              recording_mime_type: downloaded.mimeType,
-              recording_file_size: downloaded.buffer.length,
-              recording_archived_at: new Date().toISOString(),
+
+          try {
+            const tx = await transcribeRecordingWithOpenAI({
+              buffer: downloaded.buffer,
+              filename: `${RecordingSid}.mp3`,
+            });
+            columnsPatch.transcription_provider = "openai";
+            columnsPatch.transcription_status =
+              tx.status || (tx.skipped ? "skipped" : "completed");
+            metadataPatch.transcription = {
+              provider: "openai",
+              model:
+                tx.model ||
+                process.env.OPENAI_TRANSCRIPTION_MODEL ||
+                "gpt-4o-mini-transcribe",
+              status: tx.status || "unknown",
+              completed_at: new Date().toISOString(),
+              skipped: Boolean(tx.skipped),
             };
-            metadataPatch.recording = {
-              ...metadataPatch.recording,
-              storage_provider: upload.provider,
-              storage_path: upload.storagePath,
+            if (tx.text) {
+              const existingTranscript = transcriptToText(
+                callRecord.transcript,
+              );
+              if (!existingTranscript)
+                columnsPatch.transcript = [
+                  {
+                    role: "transcription",
+                    text: tx.text,
+                    ts: new Date().toISOString(),
+                  },
+                ];
+              if (!callRecord.summary)
+                columnsPatch.summary = makeShortSummary(tx.text);
+            }
+          } catch (txErr) {
+            columnsPatch.transcription_provider = "openai";
+            columnsPatch.transcription_status = "failed";
+            columnsPatch.transcription_error = txErr.message || String(txErr);
+            metadataPatch.transcription = {
+              provider: "openai",
+              status: "failed",
+              error: columnsPatch.transcription_error,
+              completed_at: new Date().toISOString(),
             };
-            console.log("[recording] archived to Supabase", {
+            console.warn("[recording] transcription failed", {
               callSid: CallSid,
-              recordingSid: RecordingSid,
-              storagePath: upload.storagePath,
+              error: columnsPatch.transcription_error,
             });
           }
-        } catch (archiveErr) {
-          const archiveError = archiveErr.message || String(archiveErr);
-          columnsPatch.recording_error = archiveError;
-          columnsPatch.recording_available = Boolean(recordingUrl);
-          metadataPatch.recording = {
-            ...(metadataPatch.recording || {}),
-            archive_error: archiveError,
-          };
-          console.warn(
-            "[recording] archive failed; transcript path preserved",
-            {
-              callSid: CallSid,
-              recordingSid: RecordingSid,
-              error: archiveError,
-            },
-          );
         }
       }
       await updateCallRecordMetadataBySid(CallSid, metadataPatch, columnsPatch);
@@ -4404,14 +4335,8 @@ router.post(
       metadata: { source: "twilio-voice-sdk" },
     });
 
-    const organizationName = await loadOrganizationName(
-      db,
-      agent.organization_id,
-    );
-
     const twiml = buildRealtimeTwiml({
       agent,
-      organizationName,
       callRecordId: record.id,
       callSid,
       direction: "web",
