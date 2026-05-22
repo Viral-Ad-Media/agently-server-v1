@@ -657,6 +657,24 @@ async function handleOutboundTwiMl(req, res) {
     }
   }
 
+  if (leadId && !recipientName) {
+    try {
+      const { data: lead } = await db
+        .from("leads")
+        .select("name,phone,email")
+        .eq("id", leadId)
+        .maybeSingle();
+      recipientName = String(lead?.name || "").trim();
+      targetName = targetName || recipientName;
+      recipientPhone = recipientPhone || lead?.phone || toPhone;
+    } catch (err) {
+      console.warn("[outbound-twiml] lead recipient lookup skipped", {
+        leadId,
+        error: err.message || String(err),
+      });
+    }
+  }
+
   if (!agent) {
     res.setHeader("Content-Type", "text/xml");
     return res.send(
@@ -2446,13 +2464,13 @@ router.post(
     );
     const agentId = req.body?.agentId || req.body?.voiceAgentId || null;
     const leadId = req.body?.leadId || null;
-    const recipientName = voiceBehavior.cleanRecipientNameForSpeech(
+    let recipientName = voiceBehavior.cleanRecipientNameForSpeech(
       req.body?.recipientName ||
         req.body?.targetName ||
         req.body?.customerName ||
         "",
     );
-    const targetName = voiceBehavior.cleanRecipientNameForSpeech(
+    let targetName = voiceBehavior.cleanRecipientNameForSpeech(
       req.body?.targetName || recipientName || "",
     );
     const customInstructions = String(
@@ -2601,6 +2619,30 @@ router.post(
           message: "Organization context could not be loaded.",
         },
       });
+
+    if (leadId && !recipientName) {
+      try {
+        const { data: lead } = await db
+          .from("leads")
+          .select("name,phone,email")
+          .eq("id", leadId)
+          .eq("organization_id", organizationId)
+          .maybeSingle();
+        recipientName = voiceBehavior.cleanRecipientNameForSpeech(
+          lead?.name || "",
+        );
+        targetName = targetName || recipientName;
+        console.log("[outbound-call] recipient name resolved from lead", {
+          leadId,
+          hasRecipientName: Boolean(recipientName),
+        });
+      } catch (err) {
+        console.warn("[outbound-call] lead recipient lookup skipped", {
+          leadId,
+          error: err.message || String(err),
+        });
+      }
+    }
 
     console.log("[outbound-call] validation passed", {
       organizationId,
@@ -4080,13 +4122,13 @@ router.post(
   requireAdmin,
   asyncHandler(async (req, res) => {
     const toPhone = normalizePhone(req.body?.toPhone || req.body?.to || "");
-    const recipientName = voiceBehavior.cleanRecipientNameForSpeech(
+    let recipientName = voiceBehavior.cleanRecipientNameForSpeech(
       req.body?.recipientName ||
         req.body?.targetName ||
         req.body?.customerName ||
         "",
     );
-    const targetName = voiceBehavior.cleanRecipientNameForSpeech(
+    let targetName = voiceBehavior.cleanRecipientNameForSpeech(
       req.body?.targetName || recipientName || "",
     );
     const customerName = recipientName || "Outbound Recipient";
