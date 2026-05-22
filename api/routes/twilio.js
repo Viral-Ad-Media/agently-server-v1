@@ -384,6 +384,9 @@ function buildRealtimeTwiml({
   precomputedOpeningGreeting = "",
   precomputedNormalizedPurpose = "",
 }) {
+  const normalizedPurpose =
+    precomputedNormalizedPurpose ||
+    voiceBehavior.humanizeOutboundPurposeForSpeech(callPurpose || "", 220);
   const openingGreeting =
     String(precomputedOpeningGreeting || "").trim() ||
     preparedOpeningGreetingForCall({
@@ -394,6 +397,16 @@ function buildRealtimeTwiml({
       targetName,
       callPurpose,
     });
+  console.log("[context-audit] purpose intent", {
+    raw_call_purpose: String(callPurpose || "").slice(0, 240),
+    normalized_call_purpose: normalizedPurpose,
+    product_intent_explicit:
+      voiceBehavior.purposeExplicitlyMentionsProducts?.(callPurpose || "") ||
+      false,
+    webinar_intent_explicit:
+      voiceBehavior.purposeExplicitlyMentionsWebinar?.(callPurpose || "") ||
+      false,
+  });
   console.log("[outbound-call] opening greeting prepared before answer", {
     callSid: callSid || "",
     agentId: agent?.id || "",
@@ -421,9 +434,7 @@ function buildRealtimeTwiml({
     customInstructions: customInstructions || "",
     openingGreeting,
     greetingMessage: openingGreeting,
-    normalizedPurpose:
-      precomputedNormalizedPurpose ||
-      voiceBehavior.humanizeOutboundPurposeForSpeech(callPurpose || "", 220),
+    normalizedPurpose,
     language: agent.language || process.env.DEFAULT_CALL_LANGUAGE || "en",
     agentName: voiceBehavior.cleanAgentNameForSpeech(
       agent.name || agent.agent_name || "",
@@ -2780,6 +2791,16 @@ router.post(
       callPurpose || "",
       220,
     );
+    console.log("[context-audit] purpose intent", {
+      raw_call_purpose: String(callPurpose || "").slice(0, 240),
+      normalized_call_purpose: normalizedPurpose,
+      product_intent_explicit:
+        voiceBehavior.purposeExplicitlyMentionsProducts?.(callPurpose || "") ||
+        false,
+      webinar_intent_explicit:
+        voiceBehavior.purposeExplicitlyMentionsWebinar?.(callPurpose || "") ||
+        false,
+    });
     console.log("[outbound-call] opening greeting prepared before answer", {
       callRecordId: record.id,
       agentId: agent.id,
