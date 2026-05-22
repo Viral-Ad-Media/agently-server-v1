@@ -301,6 +301,28 @@ router.patch(
   asyncHandler(async (req, res) => {
     const db = getSupabase();
     const updates = buildVoiceUpdates(req.body || {});
+    console.log("[voice-config] save request", {
+      agentId: req.params.agentId,
+      provider:
+        updates.voice_provider ||
+        req.body?.voice_provider ||
+        req.body?.voiceProvider ||
+        "",
+      selectedName:
+        updates.elevenlabs_voice_name ||
+        updates.voice ||
+        req.body?.elevenlabs_voice_name ||
+        req.body?.voiceName ||
+        req.body?.voice ||
+        "",
+      selectedVoiceId:
+        updates.elevenlabs_voice_id ||
+        updates.voice_id ||
+        req.body?.elevenlabs_voice_id ||
+        req.body?.voiceId ||
+        req.body?.voice_id ||
+        "",
+    });
     const { data, error } = await db
       .from("voice_agents")
       .update(updates)
@@ -321,6 +343,14 @@ router.patch(
         success: false,
         error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
       });
+    console.log("[voice-config] db after save", {
+      agentId: data.id,
+      voice_provider: data.voice_provider || "",
+      elevenlabs_voice_id: data.elevenlabs_voice_id || "",
+      elevenlabs_voice_name: data.elevenlabs_voice_name || "",
+      voice_id: data.voice_id || "",
+      voice: data.voice || "",
+    });
     res.json({
       success: true,
       agent: serializeAgent(data, []),
@@ -349,6 +379,28 @@ router.patch(
 async function updateAgentVoice(req, res) {
   const db = getSupabase();
   const updates = buildVoiceUpdates(req.body || {});
+  console.log("[voice-config] save request", {
+    agentId: req.params.agentId,
+    provider:
+      updates.voice_provider ||
+      req.body?.voice_provider ||
+      req.body?.voiceProvider ||
+      "",
+    selectedName:
+      updates.elevenlabs_voice_name ||
+      updates.voice ||
+      req.body?.elevenlabs_voice_name ||
+      req.body?.voiceName ||
+      req.body?.voice ||
+      "",
+    selectedVoiceId:
+      updates.elevenlabs_voice_id ||
+      updates.voice_id ||
+      req.body?.elevenlabs_voice_id ||
+      req.body?.voiceId ||
+      req.body?.voice_id ||
+      "",
+  });
   const { data, error } = await db
     .from("voice_agents")
     .update(updates)
@@ -369,6 +421,14 @@ async function updateAgentVoice(req, res) {
       success: false,
       error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
     });
+  console.log("[voice-config] db after save", {
+    agentId: data.id,
+    voice_provider: data.voice_provider || "",
+    elevenlabs_voice_id: data.elevenlabs_voice_id || "",
+    elevenlabs_voice_name: data.elevenlabs_voice_name || "",
+    voice_id: data.voice_id || "",
+    voice: data.voice || "",
+  });
   res.json({ success: true, agent: serializeAgent(data, []) });
 }
 

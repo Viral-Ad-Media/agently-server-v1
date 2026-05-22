@@ -414,6 +414,15 @@ function buildRealtimeTwiml({
     hasRecipientName: Boolean(recipientName || targetName),
     greetingChars: openingGreeting.length,
   });
+  console.log("[outbound-call] agent voice row", {
+    callSid: callSid || "",
+    agentId: agent?.id || "",
+    voice_provider: agent?.voice_provider || "",
+    elevenlabs_voice_id: agent?.elevenlabs_voice_id || "",
+    elevenlabs_voice_name: agent?.elevenlabs_voice_name || "",
+    voice_id: agent?.voice_id || "",
+    voice: agent?.voice || "",
+  });
   const streamParams = {
     orgId: agent.organization_id,
     organizationId: agent.organization_id,
@@ -456,6 +465,13 @@ function buildRealtimeTwiml({
     scheduleId: scheduleId || "",
     scheduleRunId: scheduleRunId || "",
   };
+  console.log("[twilio-stream] voice params", {
+    callSid: streamParams.callSid || "",
+    voiceProviderHint: streamParams.voiceProviderHint || "",
+    elevenLabsVoiceId: streamParams.elevenLabsVoiceId || "",
+    elevenLabsVoiceName: streamParams.elevenLabsVoiceName || "",
+    voiceProfile: streamParams.voiceProfile || "",
+  });
   const wsUrl = mediaStreamUrl(streamParams);
   const twiml = buildMediaStreamTwiml({
     wsUrl,
@@ -864,6 +880,12 @@ router.post(
     const { CallSid, CallStatus, CallDuration, To, AnsweredBy } =
       req.body || {};
     if (CallSid) {
+      console.log("[latency] twilio_call_status_callback", {
+        callSid: CallSid,
+        callStatus: CallStatus || "",
+        answeredBy: AnsweredBy || "",
+        eventReceivedAt: new Date().toISOString(),
+      });
       const answeredBy = String(
         AnsweredBy || req.body?.AnsweredBy || "",
       ).trim();
