@@ -381,7 +381,26 @@ function buildRealtimeTwiml({
   voiceProviderFallbackReason,
   scheduleId,
   scheduleRunId,
+  precomputedOpeningGreeting = "",
+  precomputedNormalizedPurpose = "",
 }) {
+  const openingGreeting =
+    String(precomputedOpeningGreeting || "").trim() ||
+    preparedOpeningGreetingForCall({
+      agent,
+      organization,
+      direction,
+      recipientName,
+      targetName,
+      callPurpose,
+    });
+  console.log("[outbound-call] opening greeting prepared before answer", {
+    callSid: callSid || "",
+    agentId: agent?.id || "",
+    direction: direction || "inbound",
+    hasRecipientName: Boolean(recipientName || targetName),
+    greetingChars: openingGreeting.length,
+  });
   const streamParams = {
     orgId: agent.organization_id,
     organizationId: agent.organization_id,
@@ -400,6 +419,11 @@ function buildRealtimeTwiml({
     leadId: leadId || "",
     callPurpose: callPurpose || "",
     customInstructions: customInstructions || "",
+    openingGreeting,
+    greetingMessage: openingGreeting,
+    normalizedPurpose:
+      precomputedNormalizedPurpose ||
+      voiceBehavior.humanizeOutboundPurposeForSpeech(callPurpose || "", 220),
     language: agent.language || process.env.DEFAULT_CALL_LANGUAGE || "en",
     agentName: voiceBehavior.cleanAgentNameForSpeech(
       agent.name || agent.agent_name || "",
@@ -461,6 +485,51 @@ function encodeOutboundTwiMlUrl(base, params = {}) {
 
 function mediaStreamUrlPreview(params = {}) {
   return mediaStreamUrl(params);
+}
+
+function preparedOpeningGreetingForCall({
+  agent = {},
+  organization = null,
+  direction = "inbound",
+  recipientName = "",
+  targetName = "",
+  callPurpose = "",
+} = {}) {
+  const agentName = voiceBehavior.cleanAgentNameForSpeech(
+    agent.name || agent.agent_name || "",
+  );
+  const organizationName = voiceBehavior.cleanOrganizationNameForSpeech(
+    organization?.name ||
+      organization?.business_name ||
+      organization?.company_name ||
+      "",
+  );
+  const cleanRecipientName = voiceBehavior.cleanRecipientNameForSpeech(
+    recipientName || targetName || "",
+  );
+  const outbound = String(direction || "").toLowerCase() === "outbound";
+  const rawGreeting = outbound
+    ? voiceBehavior.buildOutboundGreeting({
+        recipientName: cleanRecipientName,
+        agentName,
+        organizationName,
+        callPurpose,
+      })
+    : voiceBehavior.buildInboundGreeting({ agentName, organizationName });
+  const safeGreeting = outbound
+    ? voiceBehavior.repairOutboundAssistantText(rawGreeting, {
+        direction: "outbound",
+        recipientName: cleanRecipientName,
+        targetName: cleanRecipientName,
+        agentName,
+        organizationName,
+        callPurpose,
+      })
+    : rawGreeting;
+  return String(safeGreeting || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 420);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -576,6 +645,12 @@ async function handleOutboundTwiMl(req, res) {
     req.query?.callRecordId || req.body?.callRecordId || "";
   const leadId = req.query?.leadId || req.body?.leadId || "";
   const callPurpose = req.query?.callPurpose || req.body?.callPurpose || "";
+  const precomputedOpeningGreeting = String(
+    req.query?.openingGreeting || req.body?.openingGreeting || "",
+  ).trim();
+  const precomputedNormalizedPurpose = String(
+    req.query?.normalizedPurpose || req.body?.normalizedPurpose || "",
+  ).trim();
   const customInstructions =
     req.query?.customInstructions || req.body?.customInstructions || "";
   const voiceProviderOverride =
@@ -726,6 +801,8 @@ async function handleOutboundTwiMl(req, res) {
     voiceProviderFallbackReason,
     scheduleId,
     scheduleRunId,
+    precomputedOpeningGreeting,
+    precomputedNormalizedPurpose,
   });
   res.setHeader("Content-Type", "text/xml");
   res.send(twiml);
@@ -2691,6 +2768,25 @@ router.post(
       },
     });
 
+    const preparedOpeningGreeting = preparedOpeningGreetingForCall({
+      agent,
+      organization,
+      direction: "outbound",
+      recipientName,
+      targetName,
+      callPurpose,
+    });
+    const normalizedPurpose = voiceBehavior.humanizeOutboundPurposeForSpeech(
+      callPurpose || "",
+      220,
+    );
+    console.log("[outbound-call] opening greeting prepared before answer", {
+      callRecordId: record.id,
+      agentId: agent.id,
+      hasRecipientName: Boolean(recipientName || targetName),
+      greetingChars: preparedOpeningGreeting.length,
+    });
+
     const base = API_URL();
     const twimlUrl = encodeOutboundTwiMlUrl(base, {
       orgId: organizationId,
@@ -2703,6 +2799,8 @@ router.post(
       callerPhone: number.phone_number,
       leadId,
       callPurpose,
+      normalizedPurpose,
+      openingGreeting: preparedOpeningGreeting,
       customInstructions,
     });
     const mediaStreamUrl = mediaStreamUrlPreview({
@@ -2716,6 +2814,8 @@ router.post(
       callerPhone: number.phone_number,
       leadId,
       callPurpose,
+      normalizedPurpose,
+      openingGreeting: preparedOpeningGreeting,
       customInstructions,
     });
     console.log("[outbound-call] twimlUrl", twimlUrl);
@@ -4270,6 +4370,25 @@ router.post(
       },
     });
 
+    const preparedOpeningGreeting = preparedOpeningGreetingForCall({
+      agent,
+      organization: req.organization || null,
+      direction: "outbound",
+      recipientName,
+      targetName,
+      callPurpose,
+    });
+    const normalizedPurpose = voiceBehavior.humanizeOutboundPurposeForSpeech(
+      callPurpose || "",
+      220,
+    );
+    console.log("[outbound-call] opening greeting prepared before answer", {
+      callRecordId: record.id,
+      agentId: agent.id,
+      hasRecipientName: Boolean(recipientName || targetName),
+      greetingChars: preparedOpeningGreeting.length,
+    });
+
     const apiBase = API_URL();
     const twimlUrl = encodeOutboundTwiMlUrl(apiBase, {
       orgId: req.orgId,
@@ -4282,6 +4401,8 @@ router.post(
       callerPhone: agent.twilio_phone_number,
       leadId,
       callPurpose,
+      normalizedPurpose,
+      openingGreeting: preparedOpeningGreeting,
       customInstructions,
     });
     const mediaStreamUrl = mediaStreamUrlPreview({
@@ -4295,6 +4416,8 @@ router.post(
       callerPhone: agent.twilio_phone_number,
       leadId,
       callPurpose,
+      normalizedPurpose,
+      openingGreeting: preparedOpeningGreeting,
       customInstructions,
     });
     console.log("[outbound-call] twimlUrl", twimlUrl);
