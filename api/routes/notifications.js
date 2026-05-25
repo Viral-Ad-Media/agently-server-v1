@@ -113,6 +113,11 @@ function buildCallNotification(call) {
   const completed = TERMINAL_COMPLETED.has(status) || hasFinished;
 
   if (!failed && !completed) return null;
+  // Do not create notification-center noise for ordinary successful calls.
+  // Completed call records belong in Call Logs; Notifications should contain
+  // actionable alerts such as failures, callback requests, captured messages,
+  // unanswered questions, opt-outs, transfers, and schedules that need attention.
+  if (completed && !failed) return null;
 
   const createdAt =
     call.completed_at ||
@@ -367,15 +372,29 @@ async function ensureDerivedNotifications(db, orgId, userId) {
     );
     const existingResult = await db
       .from("tenant_notifications")
-      .select("type, entity_type, entity_id")
+      .select("type, entity_type, entity_id, call_record_id")
       .eq("organization_id", orgId)
       .in("entity_id", ids);
 
     if (existingResult.error) return;
 
-    const existing = new Set((existingResult.data || []).map(notificationKey));
+    const existing = new Set();
+    for (const item of existingResult.data || []) {
+      existing.add(notificationKey(item));
+      if (item.call_record_id) {
+        existing.add(`${item.type}:call_record:${item.call_record_id}`);
+      }
+    }
     const rows = candidates
-      .filter((item) => !existing.has(notificationKey(item)))
+      .filter((item) => {
+        if (existing.has(notificationKey(item))) return false;
+        if (item.call_record_id) {
+          return !existing.has(
+            `${item.type}:call_record:${item.call_record_id}`,
+          );
+        }
+        return true;
+      })
       .map((item) => ({
         organization_id: orgId,
         user_id: userId || null,
