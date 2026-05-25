@@ -115,10 +115,25 @@ function buildVoiceUpdates(body = {}) {
     "voiceProvider",
     "provider",
   );
+  const hasExplicitElevenLabsSelection =
+    pick(
+      body,
+      "elevenlabs_voice_id",
+      "elevenLabsVoiceId",
+      "elevenlabs_voice_name",
+      "elevenLabsVoiceName",
+    ) !== undefined;
+  const hasExplicitOpenAiSelection =
+    pick(body, "openai_voice_id", "openaiVoiceId", "openai_voice") !==
+    undefined;
   const provider =
     providerInput !== undefined
       ? normalizeProvider(providerInput, "openai")
-      : undefined;
+      : hasExplicitElevenLabsSelection
+        ? "elevenlabs"
+        : hasExplicitOpenAiSelection
+          ? "openai"
+          : undefined;
   const settings = pick(body, "voice_settings", "voiceSettings");
 
   if (provider !== undefined) updates.voice_provider = provider;

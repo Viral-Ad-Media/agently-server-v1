@@ -423,6 +423,59 @@ function buildRealtimeTwiml({
     voice_id: agent?.voice_id || "",
     voice: agent?.voice || "",
   });
+  const agentVoiceProvider = String(agent.voice_provider || "")
+    .trim()
+    .toLowerCase();
+  const hasElevenLabsVoiceId = Boolean(
+    String(agent.elevenlabs_voice_id || "").trim(),
+  );
+  const selectedVoiceProvider =
+    agentVoiceProvider === "elevenlabs" || hasElevenLabsVoiceId
+      ? "elevenlabs"
+      : agentVoiceProvider === "openai"
+        ? "openai"
+        : "";
+  const selectedElevenLabsVoiceId =
+    selectedVoiceProvider === "elevenlabs"
+      ? String(agent.elevenlabs_voice_id || agent.voice_id || "").trim()
+      : "";
+  const selectedElevenLabsVoiceName =
+    selectedVoiceProvider === "elevenlabs"
+      ? String(agent.elevenlabs_voice_name || agent.voice || "").trim()
+      : "";
+  const selectedOpenAiVoice =
+    selectedVoiceProvider === "openai"
+      ? String(
+          agent.openai_voice ||
+            agent.openai_voice_id ||
+            agent.voice_id ||
+            agent.voice ||
+            "",
+        ).trim()
+      : String(agent.openai_voice || agent.openai_voice_id || "").trim();
+  const selectedVoiceProfile =
+    selectedVoiceProvider === "elevenlabs"
+      ? selectedElevenLabsVoiceName || selectedElevenLabsVoiceId
+      : selectedOpenAiVoice || String(agent.voice || "").trim();
+
+  if (
+    selectedVoiceProvider === "elevenlabs" &&
+    agent.voice &&
+    selectedVoiceProfile &&
+    agent.voice !== selectedVoiceProfile
+  ) {
+    console.warn(
+      "[voice-provider] legacy voice ignored for ElevenLabs stream",
+      {
+        callSid: callSid || "",
+        agentId: agent?.id || "",
+        legacyVoice: agent.voice || "",
+        selectedElevenLabsVoiceName,
+        selectedElevenLabsVoiceId,
+      },
+    );
+  }
+
   const streamParams = {
     orgId: agent.organization_id,
     organizationId: agent.organization_id,
@@ -454,12 +507,14 @@ function buildRealtimeTwiml({
         organization?.company_name ||
         "",
     ),
-    voiceProviderHint: agent.voice_provider || "",
-    openAiVoice:
-      agent.openai_voice || agent.openai_voice_id || agent.voice || "",
-    elevenLabsVoiceId: agent.elevenlabs_voice_id || agent.voice_id || "",
-    elevenLabsVoiceName: agent.elevenlabs_voice_name || "",
-    voiceProfile: agent.voice || "",
+    voiceProviderHint: selectedVoiceProvider || agent.voice_provider || "",
+    openAiVoice: selectedOpenAiVoice,
+    elevenLabsVoiceId: selectedElevenLabsVoiceId,
+    elevenLabsVoiceName: selectedElevenLabsVoiceName,
+    voiceProfile: selectedVoiceProfile,
+    selectedVoiceProvider: selectedVoiceProvider || agent.voice_provider || "",
+    selectedVoiceId: selectedElevenLabsVoiceId || selectedOpenAiVoice || "",
+    selectedVoiceName: selectedElevenLabsVoiceName || selectedOpenAiVoice || "",
     voiceProviderOverride: voiceProviderOverride || "",
     voiceProviderFallbackReason: voiceProviderFallbackReason || "",
     scheduleId: scheduleId || "",
@@ -468,6 +523,10 @@ function buildRealtimeTwiml({
   console.log("[twilio-stream] voice params", {
     callSid: streamParams.callSid || "",
     voiceProviderHint: streamParams.voiceProviderHint || "",
+    selectedVoiceProvider: streamParams.selectedVoiceProvider || "",
+    selectedVoiceId: streamParams.selectedVoiceId || "",
+    selectedVoiceName: streamParams.selectedVoiceName || "",
+    openAiVoice: streamParams.openAiVoice || "",
     elevenLabsVoiceId: streamParams.elevenLabsVoiceId || "",
     elevenLabsVoiceName: streamParams.elevenLabsVoiceName || "",
     voiceProfile: streamParams.voiceProfile || "",
