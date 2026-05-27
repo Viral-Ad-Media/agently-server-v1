@@ -381,6 +381,9 @@ function buildRealtimeTwiml({
   voiceProviderFallbackReason,
   scheduleId,
   scheduleRunId,
+  maxCallSeconds,
+  platformTestMode,
+  platformTestEventId,
   precomputedOpeningGreeting = "",
   precomputedNormalizedPurpose = "",
 }) {
@@ -519,6 +522,9 @@ function buildRealtimeTwiml({
     voiceProviderFallbackReason: voiceProviderFallbackReason || "",
     scheduleId: scheduleId || "",
     scheduleRunId: scheduleRunId || "",
+    maxCallSeconds: maxCallSeconds || "",
+    platformTestMode: platformTestMode ? "true" : "",
+    platformTestEventId: platformTestEventId || "",
   };
   console.log("[twilio-stream] voice params", {
     callSid: streamParams.callSid || "",
@@ -748,6 +754,22 @@ async function handleOutboundTwiMl(req, res) {
   const scheduleId = req.query?.scheduleId || req.body?.scheduleId || "";
   const scheduleRunId =
     req.query?.scheduleRunId || req.body?.scheduleRunId || "";
+  const maxCallSeconds =
+    req.query?.maxCallSeconds ||
+    req.body?.maxCallSeconds ||
+    req.query?.max_call_seconds ||
+    req.body?.max_call_seconds ||
+    "";
+  const platformTestMode =
+    req.query?.platformTestMode === "true" ||
+    req.body?.platformTestMode === true ||
+    req.body?.platform_test_mode === true;
+  const platformTestEventId =
+    req.query?.platformTestEventId ||
+    req.body?.platformTestEventId ||
+    req.query?.platform_test_event_id ||
+    req.body?.platform_test_event_id ||
+    "";
   let recipientPhone =
     req.query?.recipientPhone || req.body?.recipientPhone || toPhone;
   let recipientName = String(
@@ -860,6 +882,9 @@ async function handleOutboundTwiMl(req, res) {
         targetName: targetName || recipientName || null,
         callPurpose: callPurpose || null,
         customInstructions: customInstructions || null,
+        maxCallSeconds: maxCallSeconds || null,
+        platformTestMode: platformTestMode || false,
+        platformTestEventId: platformTestEventId || null,
       },
     });
     callRecordId = record.id;
@@ -887,6 +912,9 @@ async function handleOutboundTwiMl(req, res) {
     voiceProviderFallbackReason,
     scheduleId,
     scheduleRunId,
+    maxCallSeconds,
+    platformTestMode,
+    platformTestEventId,
     precomputedOpeningGreeting,
     precomputedNormalizedPurpose,
   });
@@ -1033,6 +1061,20 @@ router.post(
           scheduledRecord?.metadata?.scheduleRunId ||
           scheduledRecord?.metadata?.billing?.run_id ||
           null;
+        const platformTestEventId =
+          scheduledRecord?.metadata?.platformTestEventId || null;
+        if (platformTestEventId) {
+          await db
+            .from("tenant_test_call_events")
+            .update({
+              status: CallStatus || "updated",
+              twilio_call_sid: CallSid,
+              call_record_id: scheduledRecord?.id || null,
+              raw_response: req.body || {},
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", platformTestEventId);
+        }
         if (scheduleRunId) {
           const terminalStatuses = new Set([
             "completed",
@@ -2645,6 +2687,15 @@ router.post(
     const customInstructions = String(
       req.body?.customInstructions || "",
     ).trim();
+    const maxCallSeconds = Number(
+      req.body?.maxCallSeconds || req.body?.max_call_seconds || 0,
+    );
+    const platformTestMode =
+      req.body?.platformTestMode === true ||
+      req.body?.platform_test_mode === true;
+    const platformTestEventId = String(
+      req.body?.platformTestEventId || req.body?.platform_test_event_id || "",
+    ).trim();
     let purpose;
     try {
       purpose = outboundPurposeFromBody(req.body || {});
@@ -2857,6 +2908,9 @@ router.post(
         callPurpose,
         customInstructions,
         callPurposeWarning: callPurposeWarning || null,
+        maxCallSeconds: maxCallSeconds || null,
+        platformTestMode,
+        platformTestEventId: platformTestEventId || null,
       },
     });
 
@@ -2904,6 +2958,9 @@ router.post(
       normalizedPurpose,
       openingGreeting: preparedOpeningGreeting,
       customInstructions,
+      maxCallSeconds: maxCallSeconds || undefined,
+      platformTestMode: platformTestMode ? "true" : undefined,
+      platformTestEventId: platformTestEventId || undefined,
     });
     const mediaStreamUrl = mediaStreamUrlPreview({
       orgId: organizationId,
@@ -2919,6 +2976,9 @@ router.post(
       normalizedPurpose,
       openingGreeting: preparedOpeningGreeting,
       customInstructions,
+      maxCallSeconds: maxCallSeconds || undefined,
+      platformTestMode: platformTestMode ? "true" : undefined,
+      platformTestEventId: platformTestEventId || undefined,
     });
     console.log("[outbound-call] twimlUrl", twimlUrl);
     console.log("[outbound-call] mediaStreamUrl", mediaStreamUrl);
@@ -3392,9 +3452,16 @@ router.get(
       });
     }
 
+    const visibleRows = (rows || []).filter(
+      (row) =>
+        row?.is_platform_test_number !== true &&
+        String(row?.source || row?.number_type || "") !== "platform_test" &&
+        String(row?.purchase_origin || "") !== "platform_beta_test_pool",
+    );
+
     const agentIds = [
       ...new Set(
-        (rows || []).map((n) => n.assigned_voice_agent_id).filter(Boolean),
+        visibleRows.map((n) => n.assigned_voice_agent_id).filter(Boolean),
       ),
     ];
     let agentsById = new Map();
@@ -3410,7 +3477,7 @@ router.get(
     const now = new Date().toISOString();
     const normalized = [];
 
-    for (const row of rows || []) {
+    for (const row of visibleRows) {
       const caps = row.capabilities || {};
       const voiceCapable = caps.voice !== false;
       const isNorthAmerica =
@@ -3496,7 +3563,12 @@ router.get(
     return res.json({
       success: true,
       organizationId: req.orgId,
-      numbers: rows || [],
+      numbers: (rows || []).filter(
+        (row) =>
+          row?.is_platform_test_number !== true &&
+          String(row?.source || row?.number_type || "") !== "platform_test" &&
+          String(row?.purchase_origin || "") !== "platform_beta_test_pool",
+      ),
     });
   }),
 );
@@ -4339,6 +4411,15 @@ router.post(
     const customInstructions = String(
       req.body?.customInstructions || "",
     ).trim();
+    const maxCallSeconds = Number(
+      req.body?.maxCallSeconds || req.body?.max_call_seconds || 0,
+    );
+    const platformTestMode =
+      req.body?.platformTestMode === true ||
+      req.body?.platform_test_mode === true;
+    const platformTestEventId = String(
+      req.body?.platformTestEventId || req.body?.platform_test_event_id || "",
+    ).trim();
     let purpose;
     try {
       purpose = outboundPurposeFromBody(req.body || {});
@@ -4469,6 +4550,9 @@ router.post(
         callPurpose,
         customInstructions,
         callPurposeWarning: callPurposeWarning || null,
+        maxCallSeconds: maxCallSeconds || null,
+        platformTestMode,
+        platformTestEventId: platformTestEventId || null,
       },
     });
 
@@ -4506,6 +4590,9 @@ router.post(
       normalizedPurpose,
       openingGreeting: preparedOpeningGreeting,
       customInstructions,
+      maxCallSeconds: maxCallSeconds || undefined,
+      platformTestMode: platformTestMode ? "true" : undefined,
+      platformTestEventId: platformTestEventId || undefined,
     });
     const mediaStreamUrl = mediaStreamUrlPreview({
       orgId: req.orgId,
@@ -4521,6 +4608,9 @@ router.post(
       normalizedPurpose,
       openingGreeting: preparedOpeningGreeting,
       customInstructions,
+      maxCallSeconds: maxCallSeconds || undefined,
+      platformTestMode: platformTestMode ? "true" : undefined,
+      platformTestEventId: platformTestEventId || undefined,
     });
     console.log("[outbound-call] twimlUrl", twimlUrl);
     console.log("[outbound-call] mediaStreamUrl", mediaStreamUrl);

@@ -77,8 +77,12 @@ router.get(
 
     const org = req.organization;
 
-    // Fetch FAQs for each agent
-    const agentRows = agentsResult.data || [];
+    // Fetch FAQs for each visible tenant agent. Platform beta-test agents are
+    // internal utility agents and must not appear in the normal dashboard flow.
+    const allAgentRows = agentsResult.data || [];
+    const agentRows = allAgentRows.filter(
+      (agent) => agent?.is_platform_test_agent !== true,
+    );
     const agentsWithFaqs = await Promise.all(
       agentRows.map(async (agent) => {
         const { data: faqs } = await db

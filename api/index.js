@@ -209,6 +209,11 @@ safeMount(
 );
 safeMount("/api/twilio", () => require("./routes/twilio"), "twilio");
 safeMount(
+  "/api/test-agent",
+  () => require("./routes/test-agent"),
+  "test-agent",
+);
+safeMount(
   "/api/notifications",
   () => require("./routes/notifications"),
   "notifications",

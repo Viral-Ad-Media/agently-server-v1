@@ -23,6 +23,7 @@ const miscRoutes = require("./routes/misc");
 const widgetRoutes = require("./routes/widget");
 const chatbotPublicRoutes = require("./routes/chatbot-public");
 const twilioRoutes = require("./routes/twilio");
+const testAgentRoutes = require("./routes/test-agent");
 const notificationsRoutes = require("./routes/notifications");
 const elevenlabsRoutes = require("./routes/elevenlabs");
 const voicesRoutes = require("./routes/voices");
@@ -88,6 +89,7 @@ app.use("/api/leads", leadsRoutes);
 app.use("/api/outreach", outreachRoutes);
 app.use("/api/chatbot-public", chatbotPublicRoutes);
 app.use("/api/twilio", twilioRoutes); // ← NEW: all Twilio routes
+app.use("/api/test-agent", testAgentRoutes);
 app.use("/api/notifications", notificationsRoutes);
 app.use("/api/elevenlabs", elevenlabsRoutes);
 app.use("/api/voices", voicesRoutes);
