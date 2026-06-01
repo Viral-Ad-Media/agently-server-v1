@@ -27,12 +27,16 @@ function intEnv(name, fallback, min = 0) {
 function normalizePhone(value = "") {
   const raw = String(value || "").trim();
   if (!raw) return "";
-  const cleaned = raw.replace(/[\s().-]/g, "");
-  return cleaned.startsWith("+") ? cleaned : `+${cleaned}`;
+  const digits = raw.replace(/\D/g, "");
+  if (!digits) return "";
+  if (raw.startsWith("+")) return `+${digits}`;
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  return `+${digits}`;
 }
 
 function isE164(value = "") {
-  return /^\+[1-9]\d{7,14}$/.test(String(value || ""));
+  return /^\+[1-9]\d{7,14}$/.test(normalizePhone(value));
 }
 
 function platformNumberConfig() {
@@ -545,7 +549,8 @@ router.post(
         .json({
           error: {
             code: "RECIPIENT_REQUIRED",
-            message: "Add one valid E.164 recipient phone number.",
+            message:
+              "Add one valid phone number. US formats like (832) 509-0881 and +1 832 509 0881 are accepted.",
           },
         });
     }
@@ -658,7 +663,8 @@ router.post(
         .json({
           error: {
             code: "RECIPIENTS_REQUIRED",
-            message: "Add at least one valid E.164 recipient.",
+            message:
+              "Add at least one valid phone number. US formats like (832) 509-0881 and +1 832 509 0881 are accepted.",
           },
         });
     }
