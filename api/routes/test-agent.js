@@ -62,11 +62,16 @@ function limits() {
 }
 
 function clampText(value, max) {
-  return String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, max);
 }
 
 function normalizeAllowedVoice(voiceId) {
-  const normalized = String(voiceId || "").trim().toLowerCase();
+  const normalized = String(voiceId || "")
+    .trim()
+    .toLowerCase();
   return ALLOWED_TEST_VOICES.some((voice) => voice.id === normalized)
     ? normalized
     : ALLOWED_TEST_VOICES[0].id;
@@ -117,11 +122,15 @@ async function getUsage(db, organizationId) {
 async function updateUsageConfig(db, usageId, body = {}) {
   const voiceId = normalizeAllowedVoice(body.voiceId || body.voice_id);
   const payload = {
-    agent_name: clampText(body.agentName || body.agent_name || "Test Agent", 80),
+    agent_name: clampText(
+      body.agentName || body.agent_name || "Test Agent",
+      80,
+    ),
     voice_provider: "openai",
     voice_id: voiceId,
     voice_name:
-      ALLOWED_TEST_VOICES.find((voice) => voice.id === voiceId)?.name || "Alloy",
+      ALLOWED_TEST_VOICES.find((voice) => voice.id === voiceId)?.name ||
+      "Alloy",
     greeting: clampText(
       body.greeting ||
         "Hello, this is your Agently test agent. How can I help you today?",
@@ -195,14 +204,18 @@ async function ensureHiddenTestAgent(db, req, usageRow) {
       usageRow.greeting ||
       "Hello, this is your Agently test agent. How can I help you today?",
     tone: "Friendly",
-    business_hours: "Platform beta test mode",
+    business_hours: "Trial test mode",
     escalation_phone: "",
     voicemail_fallback: false,
     data_capture_fields: ["name", "phone", "email", "reason"],
     rules: { autoBook: false, autoEscalate: false, captureAllLeads: true },
     is_active: true,
     is_platform_test_agent: true,
-    number_source: "platform_test",
+    // Keep this nullable so existing production databases with a stricter
+    // voice_agents_number_source_check constraint do not reject the hidden
+    // test agent row. The platform-test identity is tracked by
+    // is_platform_test_agent instead.
+    number_source: null,
     updated_at: new Date().toISOString(),
   };
 
@@ -229,7 +242,10 @@ async function ensureHiddenTestAgent(db, req, usageRow) {
   if (usageRow.test_voice_agent_id !== agent.id) {
     await db
       .from("tenant_test_agent_usage")
-      .update({ test_voice_agent_id: agent.id, updated_at: new Date().toISOString() })
+      .update({
+        test_voice_agent_id: agent.id,
+        updated_at: new Date().toISOString(),
+      })
       .eq("id", usageRow.id);
   }
 
@@ -259,7 +275,7 @@ async function ensureHiddenTestNumber(db, req, agent) {
     regulatory_status: "verified",
     assigned_voice_agent_id: agent.id,
     source: "platform_test",
-    purchase_origin: "platform_beta_test_pool",
+    purchase_origin: "platform_test_pool",
     verification_method: "platform_owned",
     verification_status: "verified",
     configuration_status: "configured",
@@ -343,10 +359,15 @@ function sanitizeRecipients(input) {
   const output = [];
   for (const item of rawList) {
     const record = item && typeof item === "object" ? item : { phone: item };
-    const phone = normalizePhone(record.phone || record.toPhone || record.to || "");
+    const phone = normalizePhone(
+      record.phone || record.toPhone || record.to || "",
+    );
     if (!isE164(phone)) continue;
     output.push({
-      name: clampText(record.name || record.recipientName || "Test Recipient", 80),
+      name: clampText(
+        record.name || record.recipientName || "Test Recipient",
+        80,
+      ),
       phone,
     });
   }
@@ -360,7 +381,10 @@ function sanitizeRecipients(input) {
 
 function getPurpose(body, usage) {
   return clampText(
-    body.callPurpose || body.purpose || usage.default_call_purpose || "Test this Agently voice agent with a short beta trial call.",
+    body.callPurpose ||
+      body.purpose ||
+      usage.default_call_purpose ||
+      "Test this Agently voice agent with a short trial call.",
     1200,
   );
 }
@@ -372,19 +396,28 @@ function getInstructions(body, usage, maxCallSeconds) {
   );
   return [
     userInstructions,
-    `Platform beta test mode: this call is limited to ${Math.ceil(maxCallSeconds / 60)} minutes. Keep the conversation focused, helpful, and concise.`,
+    `Trial test mode: this call is limited to ${Math.ceil(maxCallSeconds / 60)} minutes. Keep the conversation focused, helpful, and concise.`,
   ]
     .filter(Boolean)
     .join("\n\n");
 }
 
-function sendThroughRouter(routerInstance, targetUrl, req, res, next, beforeSend) {
+function sendThroughRouter(
+  routerInstance,
+  targetUrl,
+  req,
+  res,
+  next,
+  beforeSend,
+) {
   const originalUrl = req.url;
   const originalJson = res.json.bind(res);
   req.url = targetUrl;
   res.json = function patchedJson(payload) {
     Promise.resolve(beforeSend ? beforeSend(payload) : undefined)
-      .catch((err) => console.warn("[test-agent] response side-effect failed:", err.message))
+      .catch((err) =>
+        console.warn("[test-agent] response side-effect failed:", err.message),
+      )
       .finally(() => originalJson(payload));
     return res;
   };
@@ -392,9 +425,19 @@ function sendThroughRouter(routerInstance, targetUrl, req, res, next, beforeSend
     req.url = originalUrl;
     res.json = originalJson;
     if (err) {
-      Promise.resolve(beforeSend ? beforeSend({ success: false, error: { message: err.message, code: err.code || err.status } }) : undefined)
+      Promise.resolve(
+        beforeSend
+          ? beforeSend({
+              success: false,
+              error: { message: err.message, code: err.code || err.status },
+            })
+          : undefined,
+      )
         .catch((sideEffectError) =>
-          console.warn("[test-agent] error side-effect failed:", sideEffectError.message),
+          console.warn(
+            "[test-agent] error side-effect failed:",
+            sideEffectError.message,
+          ),
         )
         .finally(() => next(err));
       return;
@@ -426,26 +469,34 @@ router.get(
       platformNumber: platform.number || "",
       usage: serializeUsage(usage, limitConfig),
       allowedVoices: ALLOWED_TEST_VOICES,
-      testAgent: testAgent ? serializeAgent(testAgent, []) : {
-        id: usage.test_voice_agent_id || "",
-        name: usage.agent_name || "Test Agent",
-        direction: "outbound",
-        twilioPhoneNumber: platform.number || "",
-        twilioPhoneSid: platform.sid || "",
-        voice: usage.voice_id || ALLOWED_TEST_VOICES[0].id,
-        voiceProvider: "openai",
-        voiceId: usage.voice_id || ALLOWED_TEST_VOICES[0].id,
-        language: "English",
-        greeting: usage.greeting || "Hello, this is your Agently test agent. How can I help you today?",
-        tone: "Friendly",
-        businessHours: "Platform beta test mode",
-        faqs: [],
-        escalationPhone: "",
-        voicemailFallback: false,
-        dataCaptureFields: ["name", "phone", "email", "reason"],
-        rules: { autoBook: false, autoEscalate: false, captureAllLeads: true },
-        isActive: true,
-      },
+      testAgent: testAgent
+        ? serializeAgent(testAgent, [])
+        : {
+            id: usage.test_voice_agent_id || "",
+            name: usage.agent_name || "Test Agent",
+            direction: "outbound",
+            twilioPhoneNumber: platform.number || "",
+            twilioPhoneSid: platform.sid || "",
+            voice: usage.voice_id || ALLOWED_TEST_VOICES[0].id,
+            voiceProvider: "openai",
+            voiceId: usage.voice_id || ALLOWED_TEST_VOICES[0].id,
+            language: "English",
+            greeting:
+              usage.greeting ||
+              "Hello, this is your Agently test agent. How can I help you today?",
+            tone: "Friendly",
+            businessHours: "Trial test mode",
+            faqs: [],
+            escalationPhone: "",
+            voicemailFallback: false,
+            dataCaptureFields: ["name", "phone", "email", "reason"],
+            rules: {
+              autoBook: false,
+              autoEscalate: false,
+              captureAllLeads: true,
+            },
+            isActive: true,
+          },
       defaults: {
         defaultCallPurpose: usage.default_call_purpose || "",
         defaultCustomInstructions: usage.default_custom_instructions || "",
@@ -463,7 +514,11 @@ router.patch(
     const usage = await getUsage(db, req.orgId);
     const updated = await updateUsageConfig(db, usage.id, req.body || {});
     const agent = await ensureHiddenTestAgent(db, req, updated);
-    res.json({ success: true, testAgent: serializeAgent(agent, []), usage: serializeUsage(updated, limits()) });
+    res.json({
+      success: true,
+      testAgent: serializeAgent(agent, []),
+      usage: serializeUsage(updated, limits()),
+    });
   }),
 );
 
@@ -475,31 +530,62 @@ router.post(
     const db = getSupabase();
     const usage = await getUsage(db, req.orgId);
     const limitConfig = limits();
-    const recipients = sanitizeRecipients(req.body?.recipients || req.body?.recipient || [{ name: req.body?.recipientName, phone: req.body?.toPhone || req.body?.to }]);
+    const recipients = sanitizeRecipients(
+      req.body?.recipients ||
+        req.body?.recipient || [
+          {
+            name: req.body?.recipientName,
+            phone: req.body?.toPhone || req.body?.to,
+          },
+        ],
+    );
     if (!recipients.length) {
-      return res.status(400).json({ error: { code: "RECIPIENT_REQUIRED", message: "Add one valid E.164 recipient phone number." } });
+      return res
+        .status(400)
+        .json({
+          error: {
+            code: "RECIPIENT_REQUIRED",
+            message: "Add one valid E.164 recipient phone number.",
+          },
+        });
     }
     if (recipients.length > 1) {
-      return res.status(400).json({ error: { code: "ONE_CALL_NOW_RECIPIENT", message: "Call Now supports one test recipient at a time. Use Schedule Test Call for multiple recipients." } });
+      return res
+        .status(400)
+        .json({
+          error: {
+            code: "ONE_CALL_NOW_RECIPIENT",
+            message:
+              "Call Now supports one test recipient at a time. Use Schedule Test Call for multiple recipients.",
+          },
+        });
     }
     const consumed = await consumeTrials(db, req.orgId, 1);
     try {
       const agent = await ensureHiddenTestAgent(db, req, consumed);
       await ensureHiddenTestNumber(db, req, agent);
       const recipient = recipients[0];
-      const eventInsert = await db.from("tenant_test_call_events").insert({
-        organization_id: req.orgId,
-        usage_id: consumed.id,
-        test_voice_agent_id: agent.id,
-        type: "call_now",
-        status: "initiated",
-        recipient_name: recipient.name,
-        recipient_phone: recipient.phone,
-        call_purpose: getPurpose(req.body || {}, consumed),
-        custom_instructions: getInstructions(req.body || {}, consumed, limitConfig.maxCallSeconds),
-        max_call_seconds: limitConfig.maxCallSeconds,
-        created_by: req.user?.id || null,
-      }).select("*").single();
+      const eventInsert = await db
+        .from("tenant_test_call_events")
+        .insert({
+          organization_id: req.orgId,
+          usage_id: consumed.id,
+          test_voice_agent_id: agent.id,
+          type: "call_now",
+          status: "initiated",
+          recipient_name: recipient.name,
+          recipient_phone: recipient.phone,
+          call_purpose: getPurpose(req.body || {}, consumed),
+          custom_instructions: getInstructions(
+            req.body || {},
+            consumed,
+            limitConfig.maxCallSeconds,
+          ),
+          max_call_seconds: limitConfig.maxCallSeconds,
+          created_by: req.user?.id || null,
+        })
+        .select("*")
+        .single();
       if (eventInsert.error) throw eventInsert.error;
       const event = eventInsert.data;
 
@@ -517,20 +603,37 @@ router.post(
         platformTestMode: true,
       };
 
-      return sendThroughRouter(twilioRoutes, "/outbound", req, res, next, async (payload) => {
-        if (payload?.success) {
-          await db.from("tenant_test_call_events").update({
-            status: payload.status || "initiated",
-            twilio_call_sid: payload.callSid || null,
-            call_record_id: payload.callRecordId || null,
-            raw_response: payload,
-            updated_at: new Date().toISOString(),
-          }).eq("id", event.id);
-        } else {
-          await db.from("tenant_test_call_events").update({ status: "failed", raw_response: payload, updated_at: new Date().toISOString() }).eq("id", event.id);
-          await refundTrials(db, consumed.id, 1);
-        }
-      });
+      return sendThroughRouter(
+        twilioRoutes,
+        "/outbound",
+        req,
+        res,
+        next,
+        async (payload) => {
+          if (payload?.success) {
+            await db
+              .from("tenant_test_call_events")
+              .update({
+                status: payload.status || "initiated",
+                twilio_call_sid: payload.callSid || null,
+                call_record_id: payload.callRecordId || null,
+                raw_response: payload,
+                updated_at: new Date().toISOString(),
+              })
+              .eq("id", event.id);
+          } else {
+            await db
+              .from("tenant_test_call_events")
+              .update({
+                status: "failed",
+                raw_response: payload,
+                updated_at: new Date().toISOString(),
+              })
+              .eq("id", event.id);
+            await refundTrials(db, consumed.id, 1);
+          }
+        },
+      );
     } catch (error) {
       await refundTrials(db, consumed.id, 1);
       throw error;
@@ -546,39 +649,68 @@ router.post(
     const db = getSupabase();
     const usage = await getUsage(db, req.orgId);
     const limitConfig = limits();
-    const recipients = sanitizeRecipients(req.body?.recipients || req.body?.directRecipients || []);
+    const recipients = sanitizeRecipients(
+      req.body?.recipients || req.body?.directRecipients || [],
+    );
     if (!recipients.length) {
-      return res.status(400).json({ error: { code: "RECIPIENTS_REQUIRED", message: "Add at least one valid E.164 recipient." } });
+      return res
+        .status(400)
+        .json({
+          error: {
+            code: "RECIPIENTS_REQUIRED",
+            message: "Add at least one valid E.164 recipient.",
+          },
+        });
     }
     if (recipients.length > limitConfig.maxRecipientsPerRequest) {
-      return res.status(400).json({ error: { code: "TOO_MANY_TEST_RECIPIENTS", message: `A test schedule can include at most ${limitConfig.maxRecipientsPerRequest} recipients.` } });
+      return res
+        .status(400)
+        .json({
+          error: {
+            code: "TOO_MANY_TEST_RECIPIENTS",
+            message: `A test schedule can include at most ${limitConfig.maxRecipientsPerRequest} recipients.`,
+          },
+        });
     }
     const consumed = await consumeTrials(db, req.orgId, recipients.length);
     try {
       const agent = await ensureHiddenTestAgent(db, req, consumed);
       const number = await ensureHiddenTestNumber(db, req, agent);
       const callPurpose = getPurpose(req.body || {}, consumed);
-      const customInstructions = getInstructions(req.body || {}, consumed, limitConfig.maxCallSeconds);
-      const { data: event, error: eventError } = await db.from("tenant_test_call_events").insert({
-        organization_id: req.orgId,
-        usage_id: consumed.id,
-        test_voice_agent_id: agent.id,
-        type: "schedule",
-        status: "queued",
-        recipient_name: recipients.map((recipient) => recipient.name).join(", "),
-        recipient_phone: recipients.map((recipient) => recipient.phone).join(","),
-        call_purpose: callPurpose,
-        custom_instructions: customInstructions,
-        max_call_seconds: limitConfig.maxCallSeconds,
-        scheduled_for: null,
-        created_by: req.user?.id || null,
-      }).select("*").single();
+      const customInstructions = getInstructions(
+        req.body || {},
+        consumed,
+        limitConfig.maxCallSeconds,
+      );
+      const { data: event, error: eventError } = await db
+        .from("tenant_test_call_events")
+        .insert({
+          organization_id: req.orgId,
+          usage_id: consumed.id,
+          test_voice_agent_id: agent.id,
+          type: "schedule",
+          status: "queued",
+          recipient_name: recipients
+            .map((recipient) => recipient.name)
+            .join(", "),
+          recipient_phone: recipients
+            .map((recipient) => recipient.phone)
+            .join(","),
+          call_purpose: callPurpose,
+          custom_instructions: customInstructions,
+          max_call_seconds: limitConfig.maxCallSeconds,
+          scheduled_for: null,
+          created_by: req.user?.id || null,
+        })
+        .select("*")
+        .single();
       if (eventError) throw eventError;
 
       req.body = {
         ...req.body,
         name: clampText(req.body?.name || "Platform test call", 120),
-        scheduleType: req.body?.scheduleType || req.body?.schedule_type || "one_time_batch",
+        scheduleType:
+          req.body?.scheduleType || req.body?.schedule_type || "one_time_batch",
         voiceAgentId: agent.id,
         voice_agent_id: agent.id,
         fromNumberId: number.id,
@@ -598,26 +730,46 @@ router.post(
           maxCallsPerDay: limitConfig.maxCalls,
         },
         metadata: {
-          ...(req.body?.metadata && typeof req.body.metadata === "object" ? req.body.metadata : {}),
+          ...(req.body?.metadata && typeof req.body.metadata === "object"
+            ? req.body.metadata
+            : {}),
           platformTestMode: true,
           platformTestEventId: event.id,
           maxCallSeconds: limitConfig.maxCallSeconds,
         },
       };
 
-      return sendThroughRouter(outreachRoutes, "/schedules", req, res, next, async (payload) => {
-        if (payload?.success) {
-          await db.from("tenant_test_call_events").update({
-            status: "queued",
-            schedule_id: payload.schedule?.id || payload.schedule?.scheduleId || null,
-            raw_response: payload,
-            updated_at: new Date().toISOString(),
-          }).eq("id", event.id);
-        } else {
-          await db.from("tenant_test_call_events").update({ status: "failed", raw_response: payload, updated_at: new Date().toISOString() }).eq("id", event.id);
-          await refundTrials(db, consumed.id, recipients.length);
-        }
-      });
+      return sendThroughRouter(
+        outreachRoutes,
+        "/schedules",
+        req,
+        res,
+        next,
+        async (payload) => {
+          if (payload?.success) {
+            await db
+              .from("tenant_test_call_events")
+              .update({
+                status: "queued",
+                schedule_id:
+                  payload.schedule?.id || payload.schedule?.scheduleId || null,
+                raw_response: payload,
+                updated_at: new Date().toISOString(),
+              })
+              .eq("id", event.id);
+          } else {
+            await db
+              .from("tenant_test_call_events")
+              .update({
+                status: "failed",
+                raw_response: payload,
+                updated_at: new Date().toISOString(),
+              })
+              .eq("id", event.id);
+            await refundTrials(db, consumed.id, recipients.length);
+          }
+        },
+      );
     } catch (error) {
       await refundTrials(db, consumed.id, recipients.length);
       throw error;
