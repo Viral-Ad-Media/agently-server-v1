@@ -189,6 +189,11 @@ safeMount(
 );
 safeMount("/api/chatbots", () => require("./routes/chatbots"), "chatbots");
 safeMount(
+  "/api/knowledge-bases",
+  () => require("./routes/knowledge-bases"),
+  "knowledge-bases",
+);
+safeMount(
   "/api/chatbots",
   () => require("./routes/chatbot-deploy"),
   "chatbot-deploy",

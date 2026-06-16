@@ -33,7 +33,7 @@ function serializeSchedule(row) {
     tag: row.tag || "",
     voiceAgentId: row.voice_agent_id || "",
     windows: Array.isArray(row.windows) ? row.windows : [],
-    timezone: row.timezone || "America/New_York",
+    timezone: row.timezone || "America/Chicago",
     extraContext: row.extra_context || "",
     isActive: row.is_active ?? true,
     createdAt: row.created_at,
@@ -675,7 +675,7 @@ router.post(
       tag = "",
       voiceAgentId,
       windows = [],
-      timezone = "America/New_York",
+      timezone = "America/Chicago",
       extraContext = "",
       syncExistingLeads = false,
     } = req.body || {};

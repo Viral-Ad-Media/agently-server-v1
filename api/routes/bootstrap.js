@@ -15,6 +15,11 @@ const {
   serializeOrganization,
 } = require("../../lib/serializers");
 const { buildDashboard, buildAgentStats } = require("../../lib/dashboard");
+const {
+  ensureDefaultKnowledgeBaseForOrg,
+  listKnowledgeBasesForOrg,
+  getAssignedKnowledgeBaseIdsForVoiceAgent,
+} = require("../../lib/knowledge-bases");
 
 const router = express.Router();
 
@@ -76,6 +81,8 @@ router.get(
     ]);
 
     const org = req.organization;
+    await ensureDefaultKnowledgeBaseForOrg(db, org);
+    const knowledgeBases = await listKnowledgeBasesForOrg(db, orgId);
 
     // Fetch FAQs for each visible tenant agent. Platform beta-test agents are
     // internal utility agents and must not appear in the normal dashboard flow.
@@ -85,12 +92,29 @@ router.get(
     );
     const agentsWithFaqs = await Promise.all(
       agentRows.map(async (agent) => {
-        const { data: faqs } = await db
+        const knowledgeBaseIds = await getAssignedKnowledgeBaseIdsForVoiceAgent(
+          db,
+          {
+            organizationId: orgId,
+            agentId: agent.id,
+            organization: org,
+          },
+        );
+        let faqsQuery = db
           .from("faqs")
           .select("*")
-          .eq("voice_agent_id", agent.id)
-          .order("created_at", { ascending: true });
-        return serializeAgent(agent, faqs || []);
+          .eq("voice_agent_id", agent.id);
+        if (knowledgeBaseIds.length) {
+          faqsQuery = faqsQuery.in("knowledge_base_id", knowledgeBaseIds);
+        }
+        const { data: faqs } = await faqsQuery.order("created_at", {
+          ascending: true,
+        });
+        const serialized = serializeAgent(agent, faqs || []);
+        if (!serialized.knowledgeBaseId && knowledgeBaseIds.length) {
+          serialized.knowledgeBaseId = knowledgeBaseIds[0];
+        }
+        return serialized;
       }),
     );
 
@@ -130,6 +154,7 @@ router.get(
       conversation: messages.map(serializeMessage),
       dashboard,
       agentStats,
+      knowledgeBases,
     });
   }),
 );

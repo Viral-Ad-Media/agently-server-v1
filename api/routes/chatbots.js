@@ -5,6 +5,13 @@ const { getSupabase } = require("../../lib/supabase");
 const { requireAuth, requireAdmin } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 const { serializeChatbot } = require("../../lib/serializers");
+const {
+  ensureDefaultKnowledgeBaseForOrg,
+  verifyKnowledgeBase,
+  assignChatbotKnowledgeBase,
+  getAssignedKnowledgeBaseIdsForChatbot,
+  findOrCreateKnowledgeSource,
+} = require("../../lib/knowledge-bases");
 // scraper.service is required lazily inside the scrape route so that a missing
 // cheerio dep does not take down the entire /api/chatbots router at load time.
 
@@ -42,33 +49,53 @@ router.post(
       position: body.position || "right",
     });
 
+    const requestedKnowledgeBaseId =
+      body.knowledgeBaseId || body.knowledge_base_id || null;
+    const selectedKnowledgeBase = requestedKnowledgeBaseId
+      ? await verifyKnowledgeBase(db, {
+          organizationId: req.orgId,
+          knowledgeBaseId: requestedKnowledgeBaseId,
+        })
+      : await ensureDefaultKnowledgeBaseForOrg(db, req.organization);
+
+    if (requestedKnowledgeBaseId && !selectedKnowledgeBase?.id) {
+      return res.status(400).json({
+        error: { message: "Selected knowledge base was not found." },
+      });
+    }
+
+    const insertPayload = {
+      organization_id: req.orgId,
+      voice_agent_id:
+        body.voiceAgentId || req.organization.active_voice_agent_id || null,
+      name: body.name || "My Chatbot",
+      header_title: body.headerTitle || "Chat with us",
+      welcome_message:
+        body.welcomeMessage || "Hello! How can I help you today?",
+      placeholder: body.placeholder || "Type your message...",
+      launcher_label: body.launcherLabel || "Chat",
+      accent_color: body.accentColor || "#4f46e5",
+      position: body.position || "right",
+      avatar_label: body.avatarLabel || "A",
+      custom_prompt: body.customPrompt || "",
+      suggested_prompts: body.suggestedPrompts || [
+        "What are your hours?",
+        "How do I book?",
+        "What services do you offer?",
+      ],
+      faqs: body.faqs || [],
+      chat_voice: body.chatVoice || "alloy",
+      chat_languages: body.chatLanguages || ["en"],
+      collect_leads:
+        body.collectLeads !== undefined ? !!body.collectLeads : true,
+    };
+    if (selectedKnowledgeBase?.id) {
+      insertPayload.knowledge_base_id = selectedKnowledgeBase.id;
+    }
+
     const { data: chatbot, error } = await db
       .from("chatbots")
-      .insert({
-        organization_id: req.orgId,
-        voice_agent_id:
-          body.voiceAgentId || req.organization.active_voice_agent_id || null,
-        name: body.name || "My Chatbot",
-        header_title: body.headerTitle || "Chat with us",
-        welcome_message:
-          body.welcomeMessage || "Hello! How can I help you today?",
-        placeholder: body.placeholder || "Type your message...",
-        launcher_label: body.launcherLabel || "Chat",
-        accent_color: body.accentColor || "#4f46e5",
-        position: body.position || "right",
-        avatar_label: body.avatarLabel || "A",
-        custom_prompt: body.customPrompt || "",
-        suggested_prompts: body.suggestedPrompts || [
-          "What are your hours?",
-          "How do I book?",
-          "What services do you offer?",
-        ],
-        faqs: body.faqs || [],
-        chat_voice: body.chatVoice || "alloy",
-        chat_languages: body.chatLanguages || ["en"],
-        collect_leads:
-          body.collectLeads !== undefined ? !!body.collectLeads : true,
-      })
+      .insert(insertPayload)
       .select()
       .single();
 
@@ -86,6 +113,15 @@ router.post(
       .eq("id", chatbot.id);
     chatbot.embed_script = realScript;
     chatbot.widget_script_url = realUrl;
+
+    if (selectedKnowledgeBase?.id) {
+      await assignChatbotKnowledgeBase(db, {
+        organizationId: req.orgId,
+        chatbotId: chatbot.id,
+        knowledgeBaseId: selectedKnowledgeBase.id,
+      });
+      chatbot.knowledge_base_id = selectedKnowledgeBase.id;
+    }
 
     res.status(201).json(serializeChatbot(chatbot));
   }),
@@ -132,6 +168,24 @@ router.patch(
     updates.embed_script = embedScript;
     updates.widget_script_url = widgetUrl;
 
+    const requestedKnowledgeBaseId =
+      body.knowledgeBaseId || body.knowledge_base_id || null;
+    if (
+      requestedKnowledgeBaseId !== null &&
+      requestedKnowledgeBaseId !== undefined
+    ) {
+      const base = await verifyKnowledgeBase(db, {
+        organizationId: req.orgId,
+        knowledgeBaseId: requestedKnowledgeBaseId,
+      });
+      if (!base?.id) {
+        return res.status(400).json({
+          error: { message: "Selected knowledge base was not found." },
+        });
+      }
+      updates.knowledge_base_id = requestedKnowledgeBaseId;
+    }
+
     const { data: chatbot, error } = await db
       .from("chatbots")
       .update(updates)
@@ -142,6 +196,18 @@ router.patch(
 
     if (error || !chatbot)
       return res.status(404).json({ error: { message: "Chatbot not found." } });
+
+    if (
+      requestedKnowledgeBaseId !== null &&
+      requestedKnowledgeBaseId !== undefined
+    ) {
+      await assignChatbotKnowledgeBase(db, {
+        organizationId: req.orgId,
+        chatbotId: id,
+        knowledgeBaseId: requestedKnowledgeBaseId,
+      });
+      chatbot.knowledge_base_id = requestedKnowledgeBaseId;
+    }
 
     res.json(serializeChatbot(chatbot));
   }),
@@ -165,7 +231,7 @@ router.post(
     const db = getSupabase();
     const { data: chatbot } = await db
       .from("chatbots")
-      .select("id, voice_agent_id")
+      .select("id, voice_agent_id, knowledge_base_id")
       .eq("id", id)
       .eq("organization_id", req.orgId)
       .single();
@@ -193,12 +259,33 @@ router.post(
       });
     }
 
-    // Use chunks‑only scraper (no FAQ generation)
+    const knowledgeBaseIds = await getAssignedKnowledgeBaseIdsForChatbot(db, {
+      organizationId: req.orgId,
+      chatbotId: id,
+      voiceAgentId: chatbot.voice_agent_id || null,
+      organization: req.organization,
+    });
+    const knowledgeBaseId =
+      knowledgeBaseIds[0] || chatbot.knowledge_base_id || null;
+    const source = knowledgeBaseId
+      ? await findOrCreateKnowledgeSource(db, {
+          organizationId: req.orgId,
+          knowledgeBaseId,
+          url: website,
+          isPrimary: false,
+        })
+      : null;
+
+    // Use chunks-only scraper (no FAQ generation). In Phase 1 it stores chunks
+    // under the selected business knowledge base so Golfbase/Nutritionbase data
+    // cannot mix after assignment.
     const result = await scrapeAndStore({
       url: website,
       chatbotId: id,
       organizationId: req.orgId,
       voiceAgentId: chatbot.voice_agent_id || null,
+      knowledgeBaseId,
+      knowledgeSourceId: source?.id || null,
     });
 
     res.json({

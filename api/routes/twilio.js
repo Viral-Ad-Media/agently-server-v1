@@ -625,6 +625,166 @@ function preparedOpeningGreetingForCall({
 }
 
 // ─────────────────────────────────────────────────────────────
+// Helper: many-to-many outbound phone number assignments
+// Phase 3: phone numbers are reusable tenant resources. A number can be
+// available to multiple outbound agents while inbound default routing remains
+// controlled by twilio_phone_numbers.assigned_voice_agent_id.
+// ─────────────────────────────────────────────────────────────
+function normalizeAssignmentDirection(value, fallback = "outbound") {
+  const raw = String(value || fallback || "outbound")
+    .trim()
+    .toLowerCase();
+  return ["outbound", "inbound", "both"].includes(raw) ? raw : "outbound";
+}
+
+function assignmentAllowsOutbound(direction) {
+  const normalized = normalizeAssignmentDirection(direction, "outbound");
+  return normalized === "outbound" || normalized === "both";
+}
+
+async function loadTenantNumberByIdOrSid(db, organizationId, numberId) {
+  const id = String(numberId || "").trim();
+  if (!id) return null;
+  const { data, error } = await db
+    .from("twilio_phone_numbers")
+    .select("*")
+    .eq("organization_id", organizationId)
+    .or(`id.eq.${id},phone_sid.eq.${id}`)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+async function loadOutboundAssignmentsByNumber(db, organizationId, numberIds) {
+  const ids = [...new Set((numberIds || []).filter(Boolean))];
+  const assignmentsByNumberId = new Map();
+  if (!ids.length) return assignmentsByNumberId;
+
+  try {
+    const { data, error } = await db
+      .from("agent_phone_number_assignments")
+      .select(
+        "id, organization_id, agent_id, phone_number_id, phone_number, phone_sid, direction, is_default_for_agent, is_default_for_number, created_at, voice_agents:agent_id(id,name,direction,is_active)",
+      )
+      .eq("organization_id", organizationId)
+      .in("phone_number_id", ids)
+      .in("direction", ["outbound", "both"])
+      .order("is_default_for_agent", { ascending: false })
+      .order("created_at", { ascending: true });
+
+    if (error) throw error;
+
+    for (const assignment of data || []) {
+      if (!assignmentAllowsOutbound(assignment.direction)) continue;
+      const list = assignmentsByNumberId.get(assignment.phone_number_id) || [];
+      list.push(assignment);
+      assignmentsByNumberId.set(assignment.phone_number_id, list);
+    }
+  } catch (err) {
+    console.warn(
+      "[twilio/numbers] assignment table unavailable; falling back to legacy single-agent mapping:",
+      err.message || String(err),
+    );
+  }
+
+  return assignmentsByNumberId;
+}
+
+async function findDefaultOutboundNumberForAgent(db, organizationId, agentId) {
+  const normalizedAgentId = String(agentId || "").trim();
+  if (!normalizedAgentId) return null;
+
+  try {
+    const { data: assignment, error } = await db
+      .from("agent_phone_number_assignments")
+      .select(
+        "id, phone_number_id, phone_number, phone_sid, direction, is_default_for_agent",
+      )
+      .eq("organization_id", organizationId)
+      .eq("agent_id", normalizedAgentId)
+      .in("direction", ["outbound", "both"])
+      .order("is_default_for_agent", { ascending: false })
+      .order("created_at", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+
+    if (!error && assignment?.phone_number_id) {
+      const { data: number } = await db
+        .from("twilio_phone_numbers")
+        .select("*")
+        .eq("organization_id", organizationId)
+        .eq("id", assignment.phone_number_id)
+        .maybeSingle();
+      if (number) return { number, assignment };
+    }
+    if (error) throw error;
+  } catch (err) {
+    console.warn(
+      "[outbound-call] assignment lookup unavailable; using legacy agent-number lookup:",
+      err.message || String(err),
+    );
+  }
+
+  const { data: legacyNumber } = await db
+    .from("twilio_phone_numbers")
+    .select("*")
+    .eq("organization_id", organizationId)
+    .eq("assigned_voice_agent_id", normalizedAgentId)
+    .maybeSingle();
+  return legacyNumber ? { number: legacyNumber, assignment: null } : null;
+}
+
+async function upsertOutboundNumberAssignment({
+  db,
+  organizationId,
+  number,
+  agent,
+  direction = "outbound",
+  isDefaultForAgent = true,
+}) {
+  const normalizedDirection = normalizeAssignmentDirection(
+    direction,
+    "outbound",
+  );
+  const defaultFlag = isDefaultForAgent !== false;
+
+  if (defaultFlag && assignmentAllowsOutbound(normalizedDirection)) {
+    await db
+      .from("agent_phone_number_assignments")
+      .update({
+        is_default_for_agent: false,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("organization_id", organizationId)
+      .eq("agent_id", agent.id)
+      .in("direction", ["outbound", "both"]);
+  }
+
+  const payload = {
+    organization_id: organizationId,
+    agent_id: agent.id,
+    phone_number_id: number.id,
+    phone_number: number.phone_number,
+    phone_sid: number.phone_sid,
+    direction: normalizedDirection,
+    is_default_for_agent: defaultFlag,
+    is_default_for_number: false,
+    updated_at: new Date().toISOString(),
+  };
+
+  const { data, error } = await db
+    .from("agent_phone_number_assignments")
+    .upsert(payload, {
+      onConflict: "organization_id,agent_id,phone_number_id,direction",
+    })
+    .select("*")
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+// ─────────────────────────────────────────────────────────────
 // Helper: lookup org + agent from a Twilio phone number
 // ─────────────────────────────────────────────────────────────
 async function lookupAgentByPhone(toPhone) {
@@ -2718,23 +2878,35 @@ router.post(
       });
 
     const db = getSupabase();
-    let q = db
-      .from("twilio_phone_numbers")
-      .select("*")
-      .eq("organization_id", organizationId);
-    if (fromNumberId) q = q.eq("id", fromNumberId);
-    else if (fromNumber) q = q.eq("phone_number", fromNumber);
-    else
-      q = q.eq(
-        "assigned_voice_agent_id",
-        agentId || req.organization?.active_voice_agent_id,
+    const requestedAgentId = agentId || req.organization?.active_voice_agent_id;
+    let number = null;
+    let selectedAssignment = null;
+
+    if (fromNumberId || fromNumber) {
+      let q = db
+        .from("twilio_phone_numbers")
+        .select("*")
+        .eq("organization_id", organizationId);
+      if (fromNumberId) q = q.eq("id", fromNumberId);
+      else if (fromNumber) q = q.eq("phone_number", fromNumber);
+      const result = await q.maybeSingle();
+      number = result.data || null;
+    } else {
+      const resolved = await findDefaultOutboundNumberForAgent(
+        db,
+        organizationId,
+        requestedAgentId,
       );
-    const { data: number } = await q.maybeSingle();
+      number = resolved?.number || null;
+      selectedAssignment = resolved?.assignment || null;
+    }
+
     if (!number)
       return res.status(404).json({
         error: {
           code: "NUMBER_NOT_OWNED",
-          message: "No configured from-number was found for this tenant/agent.",
+          message:
+            "No configured from-number was found for this tenant/agent. Assign a business number to this agent first.",
         },
       });
 
@@ -2750,7 +2922,8 @@ router.post(
         },
       });
     const actualAgentId =
-      agentId ||
+      requestedAgentId ||
+      selectedAssignment?.agent_id ||
       number.assigned_voice_agent_id ||
       req.organization?.active_voice_agent_id;
     if (!actualAgentId)
@@ -2782,7 +2955,11 @@ router.post(
         });
       }
     }
+    // In Phase 3, outbound readiness can be satisfied by the many-to-many
+    // assignment table, even if the number's inbound/default agent field is
+    // empty. The actual agent is loaded and verified below.
     if (
+      !actualAgentId &&
       readiness.assigned_agent?.status &&
       readiness.assigned_agent.status !== "ready"
     ) {
@@ -3413,6 +3590,13 @@ router.post(
     // Update webhooks to point to this server
     await updateNumberWebhooks({ phoneSid });
 
+    const { data: agent } = await db
+      .from("voice_agents")
+      .select("id,name")
+      .eq("id", targetAgentId)
+      .eq("organization_id", req.orgId)
+      .maybeSingle();
+
     await db
       .from("voice_agents")
       .update({
@@ -3422,6 +3606,35 @@ router.post(
       })
       .eq("id", targetAgentId)
       .eq("organization_id", req.orgId);
+
+    // Phase 3 compatibility: legacy assignment calls should also create the
+    // non-exclusive outbound assignment row when the number exists in the
+    // tenant phone-number table.
+    if (agent?.id) {
+      try {
+        const { data: numberRow } = await db
+          .from("twilio_phone_numbers")
+          .select("*")
+          .eq("organization_id", req.orgId)
+          .eq("phone_sid", phoneSid)
+          .maybeSingle();
+        if (numberRow?.id) {
+          await upsertOutboundNumberAssignment({
+            db,
+            organizationId: req.orgId,
+            number: numberRow,
+            agent,
+            direction: "outbound",
+            isDefaultForAgent: true,
+          });
+        }
+      } catch (err) {
+        console.warn(
+          "[numbers/assign] assignment mirror skipped:",
+          err.message || String(err),
+        );
+      }
+    }
 
     res.json({ success: true });
   }),
@@ -3459,16 +3672,32 @@ router.get(
         String(row?.purchase_origin || "") !== "platform_beta_test_pool",
     );
 
+    const assignmentsByNumberId = await loadOutboundAssignmentsByNumber(
+      db,
+      organizationId,
+      visibleRows.map((row) => row.id),
+    );
+
+    const assignmentAgentIds = [];
+    for (const list of assignmentsByNumberId.values()) {
+      for (const assignment of list) {
+        if (assignment.agent_id) assignmentAgentIds.push(assignment.agent_id);
+      }
+    }
+
     const agentIds = [
-      ...new Set(
-        visibleRows.map((n) => n.assigned_voice_agent_id).filter(Boolean),
-      ),
+      ...new Set([
+        ...visibleRows.map((n) => n.assigned_voice_agent_id).filter(Boolean),
+        ...assignmentAgentIds,
+      ]),
     ];
     let agentsById = new Map();
     if (agentIds.length) {
       const { data: agents } = await db
         .from("voice_agents")
-        .select("id,name,direction,twilio_phone_number,twilio_phone_sid")
+        .select(
+          "id,name,direction,twilio_phone_number,twilio_phone_sid,is_active",
+        )
         .eq("organization_id", organizationId)
         .in("id", agentIds);
       agentsById = new Map((agents || []).map((a) => [a.id, a]));
@@ -3487,6 +3716,9 @@ router.get(
       const shouldMarkReady = isNorthAmerica && voiceCapable;
       let current = row;
 
+      const outboundAssignments = assignmentsByNumberId.get(row.id) || [];
+      const hasOutboundAssignments = outboundAssignments.length > 0;
+
       if (shouldMarkReady) {
         const readinessPatch = {
           configuration_status: "ready",
@@ -3494,9 +3726,10 @@ router.get(
           inbound_voice_status: "ready",
           outbound_voice_status: "ready",
           regulatory_readiness_status: "verified",
-          assigned_agent_status: row.assigned_voice_agent_id
-            ? "ready"
-            : "needs_assignment",
+          assigned_agent_status:
+            row.assigned_voice_agent_id || hasOutboundAssignments
+              ? "ready"
+              : "needs_assignment",
           last_error: null,
           updated_at: now,
         };
@@ -3510,9 +3743,41 @@ router.get(
         current = updated || { ...row, ...readinessPatch };
       }
 
-      const assignedAgent = current.assigned_voice_agent_id
+      const inboundAgent = current.assigned_voice_agent_id
         ? agentsById.get(current.assigned_voice_agent_id) || null
         : null;
+
+      const outboundAssignedAgents = outboundAssignments
+        .map((assignment) => {
+          const relationshipAgent =
+            assignment.voice_agents &&
+            typeof assignment.voice_agents === "object"
+              ? assignment.voice_agents
+              : null;
+          const agent =
+            agentsById.get(assignment.agent_id) || relationshipAgent;
+          if (!agent) return null;
+          return {
+            ...agent,
+            assignmentId: assignment.id,
+            assignmentDirection: assignment.direction,
+            isDefaultForAgent: assignment.is_default_for_agent === true,
+          };
+        })
+        .filter(Boolean);
+
+      const legacyAssignedAgent = inboundAgent;
+      const effectiveOutboundAgents = outboundAssignedAgents.length
+        ? outboundAssignedAgents
+        : legacyAssignedAgent
+          ? [
+              {
+                ...legacyAssignedAgent,
+                assignmentDirection: "legacy",
+                isDefaultForAgent: true,
+              },
+            ]
+          : [];
 
       normalized.push({
         ...current,
@@ -3525,7 +3790,11 @@ router.get(
         assignedVoiceAgentId: current.assigned_voice_agent_id,
         voiceAgentId: current.assigned_voice_agent_id,
         agentId: current.assigned_voice_agent_id,
-        assignedAgent,
+        assignedAgent: inboundAgent,
+        inboundAgent,
+        outboundAssignedAgents: effectiveOutboundAgents,
+        assignedAgents: effectiveOutboundAgents,
+        assignmentCount: effectiveOutboundAgents.length,
         configurationStatus: current.configuration_status,
         overallStatus: current.overall_status,
         inboundVoiceStatus: current.inbound_voice_status,
@@ -3629,7 +3898,9 @@ router.post("/purchase-number", requireAuth, requireAdmin, (req, res, next) => {
   return router.handle(req, res, next);
 });
 
-// Assign one tenant-owned number to one tenant-owned agent.
+// Assign one tenant-owned number to one tenant-owned agent for outbound use.
+// Phase 3 change: this no longer enforces one-number-one-agent. A single
+// tenant-owned number can now be attached to multiple outbound agents.
 router.post(
   "/numbers/:id/assign-agent",
   requireAuth,
@@ -3639,6 +3910,13 @@ router.post(
     const organizationId = req.orgId;
     const numberId = req.params.id;
     const agentId = req.body?.agentId || req.body?.voiceAgentId;
+    const direction = normalizeAssignmentDirection(
+      req.body?.direction,
+      "outbound",
+    );
+    const makeInboundDefault =
+      req.body?.makeInboundDefault === true ||
+      req.body?.inboundDefault === true;
 
     if (!agentId) {
       return res
@@ -3646,16 +3924,12 @@ router.post(
         .json({ error: { message: "agentId is required." } });
     }
 
-    const { data: number, error: numberErr } = await db
-      .from("twilio_phone_numbers")
-      .select("*")
-      .eq("organization_id", organizationId)
-      .or(`id.eq.${numberId},phone_sid.eq.${numberId}`)
-      .maybeSingle();
+    const number = await loadTenantNumberByIdOrSid(
+      db,
+      organizationId,
+      numberId,
+    );
 
-    if (numberErr) {
-      return res.status(500).json({ error: { message: numberErr.message } });
-    }
     if (!number) {
       return res.status(404).json({
         error: { message: "Phone number not found for this organization." },
@@ -3675,38 +3949,28 @@ router.post(
       });
     }
 
-    const { data: existingForAgent } = await db
-      .from("twilio_phone_numbers")
-      .select("id,phone_number")
-      .eq("organization_id", organizationId)
-      .eq("assigned_voice_agent_id", agentId)
-      .neq("id", number.id)
-      .limit(1);
-
-    if (existingForAgent?.length) {
-      return res.status(409).json({
-        error: {
-          code: "AGENT_ALREADY_HAS_NUMBER",
-          message: `${agent.name || "This agent"} already has ${existingForAgent[0].phone_number} assigned. Unassign that number first.`,
-        },
+    let assignment;
+    try {
+      assignment = await upsertOutboundNumberAssignment({
+        db,
+        organizationId,
+        number,
+        agent,
+        direction,
+        isDefaultForAgent: req.body?.isDefaultForAgent !== false,
       });
-    }
-
-    if (
-      number.assigned_voice_agent_id &&
-      number.assigned_voice_agent_id !== agentId
-    ) {
-      return res.status(409).json({
+    } catch (err) {
+      return res.status(500).json({
         error: {
-          code: "NUMBER_ALREADY_ASSIGNED",
+          code: "ASSIGNMENT_TABLE_NOT_READY",
           message:
-            "This number is already assigned. Unassign it before assigning it to another agent.",
+            "Number assignment could not be saved. Run the Phase 3 agent phone-number assignments migration first.",
+          details: err.message || String(err),
         },
       });
     }
 
     const patch = {
-      assigned_voice_agent_id: agentId,
       assigned_agent_status: "ready",
       configuration_status: "ready",
       overall_status: "ready",
@@ -3716,6 +3980,12 @@ router.post(
       last_error: null,
       updated_at: new Date().toISOString(),
     };
+
+    // Keep inbound/default routing explicit. For backward compatibility, if the
+    // number had no default agent yet, the first assignment becomes the default.
+    if (!number.assigned_voice_agent_id || makeInboundDefault) {
+      patch.assigned_voice_agent_id = agentId;
+    }
 
     const { data: updatedNumber, error: updateErr } = await db
       .from("twilio_phone_numbers")
@@ -3729,6 +3999,8 @@ router.post(
       return res.status(500).json({ error: { message: updateErr.message } });
     }
 
+    // Legacy compatibility: older outbound paths still read the default number
+    // from voice_agents. This does not make the number exclusive to this agent.
     await db
       .from("voice_agents")
       .update({
@@ -3740,7 +4012,90 @@ router.post(
       .eq("id", agentId)
       .eq("organization_id", organizationId);
 
-    return res.json({ success: true, number: updatedNumber, agentId });
+    return res.json({
+      success: true,
+      number: updatedNumber,
+      assignment,
+      agentId,
+      message: `${number.phone_number || "Number"} is now available to ${agent.name || "this agent"} for outbound calls.`,
+    });
+  }),
+);
+
+// Remove one outbound agent from one tenant-owned number without releasing the
+// number and without clearing other agents that use the same number.
+router.delete(
+  "/numbers/:id/assignments/:agentId",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const organizationId = req.orgId;
+    const number = await loadTenantNumberByIdOrSid(
+      db,
+      organizationId,
+      req.params.id,
+    );
+    const agentId = String(req.params.agentId || "").trim();
+
+    if (!number) {
+      return res.status(404).json({
+        error: { message: "Phone number not found for this organization." },
+      });
+    }
+    if (!agentId) {
+      return res
+        .status(400)
+        .json({ error: { message: "agentId is required." } });
+    }
+
+    try {
+      await db
+        .from("agent_phone_number_assignments")
+        .delete()
+        .eq("organization_id", organizationId)
+        .eq("phone_number_id", number.id)
+        .eq("agent_id", agentId)
+        .in("direction", ["outbound", "both"]);
+    } catch (err) {
+      return res.status(500).json({
+        error: {
+          code: "ASSIGNMENT_TABLE_NOT_READY",
+          message:
+            "Number assignment could not be removed. Run the Phase 3 assignment migration first.",
+          details: err.message || String(err),
+        },
+      });
+    }
+
+    // If this agent no longer has any outbound number assignment, clear the
+    // legacy fields so older UI paths do not show a stale number.
+    const { data: remainingAssignments } = await db
+      .from("agent_phone_number_assignments")
+      .select("phone_number, phone_sid")
+      .eq("organization_id", organizationId)
+      .eq("agent_id", agentId)
+      .in("direction", ["outbound", "both"])
+      .order("is_default_for_agent", { ascending: false })
+      .limit(1);
+
+    const nextAssignment = remainingAssignments?.[0];
+    await db
+      .from("voice_agents")
+      .update({
+        twilio_phone_number: nextAssignment?.phone_number || "",
+        twilio_phone_sid: nextAssignment?.phone_sid || "",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", agentId)
+      .eq("organization_id", organizationId);
+
+    return res.json({
+      success: true,
+      numberId: number.id,
+      agentId,
+      remainingDefaultNumber: nextAssignment?.phone_number || null,
+    });
   }),
 );
 
@@ -3781,6 +4136,29 @@ router.patch(
 
     const oldAgentId = number.assigned_voice_agent_id;
 
+    let assignmentAgentIds = [];
+    try {
+      const { data: assignments } = await db
+        .from("agent_phone_number_assignments")
+        .select("agent_id")
+        .eq("organization_id", organizationId)
+        .eq("phone_number_id", number.id);
+      assignmentAgentIds = (assignments || [])
+        .map((row) => row.agent_id)
+        .filter(Boolean);
+
+      await db
+        .from("agent_phone_number_assignments")
+        .delete()
+        .eq("organization_id", organizationId)
+        .eq("phone_number_id", number.id);
+    } catch (err) {
+      console.warn(
+        "[twilio/numbers] assignment cleanup skipped:",
+        err.message || String(err),
+      );
+    }
+
     const { data: updatedNumber, error: updateErr } = await db
       .from("twilio_phone_numbers")
       .update({
@@ -3797,7 +4175,10 @@ router.patch(
       return res.status(500).json({ error: { message: updateErr.message } });
     }
 
-    if (oldAgentId) {
+    const agentIdsToClear = [
+      ...new Set([oldAgentId, ...assignmentAgentIds].filter(Boolean)),
+    ];
+    if (agentIdsToClear.length) {
       await db
         .from("voice_agents")
         .update({
@@ -3805,8 +4186,8 @@ router.patch(
           twilio_phone_sid: "",
           updated_at: new Date().toISOString(),
         })
-        .eq("id", oldAgentId)
-        .eq("organization_id", organizationId);
+        .eq("organization_id", organizationId)
+        .in("id", agentIdsToClear);
     }
 
     return res.json({ success: true, number: updatedNumber });
@@ -3823,7 +4204,7 @@ router.delete(
 
     const db = getSupabase();
 
-    // Clear from voice agents first
+    // Clear from voice agents and many-to-many assignment rows first.
     await db
       .from("voice_agents")
       .update({
@@ -3833,6 +4214,19 @@ router.delete(
       })
       .eq("twilio_phone_sid", sid)
       .eq("organization_id", req.orgId);
+
+    try {
+      await db
+        .from("agent_phone_number_assignments")
+        .delete()
+        .eq("organization_id", req.orgId)
+        .eq("phone_sid", sid);
+    } catch (err) {
+      console.warn(
+        "[twilio/numbers/delete] assignment cleanup skipped:",
+        err.message || String(err),
+      );
+    }
 
     await releasePhoneNumber(sid);
     res.json({ success: true });
@@ -4456,21 +4850,51 @@ router.post(
       .eq("is_active", true)
       .single();
 
-    if (!agent?.twilio_phone_number) {
+    let outboundFromNumber = normalizePhone(
+      req.body?.fromNumber ||
+        req.body?.from ||
+        agent?.twilio_phone_number ||
+        "",
+    );
+    const outboundFromNumberId =
+      req.body?.fromNumberId || req.body?.numberId || null;
+    let number = null;
+
+    if (outboundFromNumberId || outboundFromNumber) {
+      let q = db
+        .from("twilio_phone_numbers")
+        .select("*")
+        .eq("organization_id", req.orgId);
+      if (outboundFromNumberId) q = q.eq("id", outboundFromNumberId);
+      else q = q.eq("phone_number", outboundFromNumber);
+      const result = await q.maybeSingle();
+      number = result.data || null;
+    }
+
+    if (!number?.id) {
+      const resolved = await findDefaultOutboundNumberForAgent(
+        db,
+        req.orgId,
+        agent.id,
+      );
+      number = resolved?.number || null;
+      outboundFromNumber = normalizePhone(
+        number?.phone_number || outboundFromNumber,
+      );
+    }
+
+    if (!outboundFromNumber && number?.phone_number) {
+      outboundFromNumber = normalizePhone(number.phone_number);
+    }
+
+    if (!outboundFromNumber) {
       return res.status(400).json({
         error: {
           message:
-            "This agent has no Twilio number assigned. Purchase one first.",
+            "This agent has no business number assigned. Connect or assign a number first.",
         },
       });
     }
-
-    const { data: number } = await db
-      .from("twilio_phone_numbers")
-      .select("*")
-      .eq("organization_id", req.orgId)
-      .eq("phone_number", agent.twilio_phone_number)
-      .maybeSingle();
 
     const destinationCountry = guessCountryFromE164(toPhone);
     console.log("[outbound-call] destinationCountry", destinationCountry);
@@ -4512,7 +4936,7 @@ router.post(
     console.log("[outbound-call] validation passed", {
       organizationId: req.orgId,
       agentId: agent.id,
-      fromNumber: agent.twilio_phone_number,
+      fromNumber: outboundFromNumber,
       to: toPhone,
     });
     console.log("[outbound-call] callPurpose", callPurpose);
@@ -4584,7 +5008,7 @@ router.post(
       recipientPhone: toPhone,
       recipientName,
       targetName,
-      callerPhone: agent.twilio_phone_number,
+      callerPhone: outboundFromNumber,
       leadId,
       callPurpose,
       normalizedPurpose,
@@ -4602,7 +5026,7 @@ router.post(
       recipientPhone: toPhone,
       recipientName,
       targetName,
-      callerPhone: agent.twilio_phone_number,
+      callerPhone: outboundFromNumber,
       leadId,
       callPurpose,
       normalizedPurpose,
@@ -4616,7 +5040,7 @@ router.post(
     console.log("[outbound-call] mediaStreamUrl", mediaStreamUrl);
 
     const result = await makeOutboundCall({
-      from: agent.twilio_phone_number,
+      from: outboundFromNumber,
       to: toPhone,
       twimlUrl,
       statusCallbackUrl: `${apiBase}/api/twilio/call-status`,

@@ -6,6 +6,13 @@ const { requireAuth, requireAdmin } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 const { serializeAgent } = require("../../lib/serializers");
 const { updateNumberWebhooks } = require("../../lib/twilio");
+const {
+  ensureDefaultKnowledgeBaseForOrg,
+  assignVoiceAgentKnowledgeBase,
+  verifyKnowledgeBase,
+  getAssignedKnowledgeBaseIdsForVoiceAgent,
+  findOrCreateKnowledgeSource,
+} = require("../../lib/knowledge-bases");
 
 const router = express.Router();
 
@@ -18,39 +25,59 @@ router.post(
     const db = getSupabase();
     const body = req.body || {};
 
+    const requestedKnowledgeBaseId =
+      body.knowledgeBaseId || body.knowledge_base_id || null;
+    const defaultKnowledgeBase = requestedKnowledgeBaseId
+      ? await verifyKnowledgeBase(db, {
+          organizationId: req.orgId,
+          knowledgeBaseId: requestedKnowledgeBaseId,
+        })
+      : await ensureDefaultKnowledgeBaseForOrg(db, req.organization);
+
+    if (requestedKnowledgeBaseId && !defaultKnowledgeBase?.id) {
+      return res.status(400).json({
+        error: { message: "Selected knowledge base was not found." },
+      });
+    }
+
+    const insertPayload = {
+      organization_id: req.orgId,
+      name: body.name || "New AI Agent",
+      direction: body.direction || "inbound",
+      voice: body.voice || process.env.DEFAULT_AGENT_VOICE || "alloy",
+      voice_provider:
+        body.voiceProvider || process.env.VOICE_PROVIDER_DEFAULT || null,
+      voice_id: body.voiceId || null,
+      voice_catalog_id: body.voiceCatalogId || null,
+      voice_settings: body.voiceSettings || body.voice_settings || {},
+      language: body.language || "English",
+      greeting:
+        body.greeting ||
+        "Hello, thank you for calling. How can I help you today?",
+      tone: body.tone || "Professional",
+      business_hours: body.businessHours || "9am-5pm Monday-Friday",
+      escalation_phone: body.escalationPhone || "",
+      voicemail_fallback: body.voicemailFallback ?? true,
+      data_capture_fields: body.dataCaptureFields || [
+        "name",
+        "phone",
+        "email",
+        "reason",
+      ],
+      rules: body.rules || {
+        autoBook: false,
+        autoEscalate: true,
+        captureAllLeads: true,
+      },
+      is_active: true,
+    };
+    if (defaultKnowledgeBase?.id) {
+      insertPayload.knowledge_base_id = defaultKnowledgeBase.id;
+    }
+
     const { data: agent, error } = await db
       .from("voice_agents")
-      .insert({
-        organization_id: req.orgId,
-        name: body.name || "New AI Agent",
-        direction: body.direction || "inbound",
-        voice: body.voice || process.env.DEFAULT_AGENT_VOICE || "alloy",
-        voice_provider:
-          body.voiceProvider || process.env.VOICE_PROVIDER_DEFAULT || null,
-        voice_id: body.voiceId || null,
-        voice_catalog_id: body.voiceCatalogId || null,
-        voice_settings: body.voiceSettings || body.voice_settings || {},
-        language: body.language || "English",
-        greeting:
-          body.greeting ||
-          "Hello, thank you for calling. How can I help you today?",
-        tone: body.tone || "Professional",
-        business_hours: body.businessHours || "9am-5pm Monday-Friday",
-        escalation_phone: body.escalationPhone || "",
-        voicemail_fallback: body.voicemailFallback ?? true,
-        data_capture_fields: body.dataCaptureFields || [
-          "name",
-          "phone",
-          "email",
-          "reason",
-        ],
-        rules: body.rules || {
-          autoBook: false,
-          autoEscalate: true,
-          captureAllLeads: true,
-        },
-        is_active: true,
-      })
+      .insert(insertPayload)
       .select()
       .single();
 
@@ -58,6 +85,15 @@ router.post(
       return res
         .status(500)
         .json({ error: { message: "Failed to create voice agent." } });
+    }
+
+    if (defaultKnowledgeBase?.id) {
+      await assignVoiceAgentKnowledgeBase(db, {
+        organizationId: req.orgId,
+        agentId: agent.id,
+        knowledgeBaseId: defaultKnowledgeBase.id,
+      });
+      agent.knowledge_base_id = defaultKnowledgeBase.id;
     }
 
     res.status(201).json(serializeAgent(agent, []));
@@ -112,7 +148,8 @@ router.patch(
     // Clears twilio_phone_number and twilio_phone_sid from this agent
     // so the number can be assigned to a different agent.
     // The number itself remains in "All Owned" — it is NOT released from Twilio.
-    // NOTE: Two agents must NEVER share the same phone number.
+    // Shared outbound numbers are supported through agent_phone_number_assignments.
+    // This legacy field is cleared only for the edited agent.
     if (body.unassignNumber === true) {
       // Conflict check — no other agent should be getting this number
       updates.twilio_phone_number = "";
@@ -142,6 +179,23 @@ router.patch(
       } catch (e) {
         console.warn("[voice-agents] webhook update failed:", e.message);
       }
+    }
+
+    const requestedKnowledgeBaseId =
+      body.knowledgeBaseId || body.knowledge_base_id || null;
+    if (
+      requestedKnowledgeBaseId !== null &&
+      requestedKnowledgeBaseId !== undefined
+    ) {
+      const result = await assignVoiceAgentKnowledgeBase(db, {
+        organizationId: req.orgId,
+        agentId: id,
+        knowledgeBaseId: requestedKnowledgeBaseId,
+      });
+      if (!result.ok) {
+        return res.status(400).json({ error: { message: result.message } });
+      }
+      agent.knowledge_base_id = requestedKnowledgeBaseId;
     }
 
     const { data: faqs } = await db
@@ -202,6 +256,87 @@ router.post(
       .select("*")
       .eq("voice_agent_id", id);
     res.json(serializeAgent(updated, faqs || []));
+  }),
+);
+
+// ── POST /api/voice-agents/:id/import-knowledge ──────────────
+router.post(
+  "/:id/import-knowledge",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const { website } = req.body || {};
+    if (!website || !String(website).trim()) {
+      return res
+        .status(400)
+        .json({ error: { message: "website URL is required." } });
+    }
+
+    const db = getSupabase();
+    const { data: agent } = await db
+      .from("voice_agents")
+      .select("id, knowledge_base_id")
+      .eq("id", id)
+      .eq("organization_id", req.orgId)
+      .maybeSingle();
+    if (!agent?.id) {
+      return res
+        .status(404)
+        .json({ error: { message: "Voice agent not found." } });
+    }
+
+    let scrapeAndStore;
+    try {
+      ({ scrapeAndStore } = require("../../lib/scraper.service"));
+    } catch (depErr) {
+      console.error(
+        "[voice-agents] scraper.service failed to load:",
+        depErr.message,
+      );
+      return res.status(500).json({
+        error: {
+          message:
+            "Website scraping is temporarily unavailable. A server dependency is missing (cheerio). Please contact support.",
+          detail: depErr.message,
+        },
+      });
+    }
+
+    const knowledgeBaseIds = await getAssignedKnowledgeBaseIdsForVoiceAgent(
+      db,
+      {
+        organizationId: req.orgId,
+        agentId: id,
+        organization: req.organization,
+      },
+    );
+    const knowledgeBaseId =
+      knowledgeBaseIds[0] || agent.knowledge_base_id || null;
+    const source = knowledgeBaseId
+      ? await findOrCreateKnowledgeSource(db, {
+          organizationId: req.orgId,
+          knowledgeBaseId,
+          url: website,
+          isPrimary: false,
+        })
+      : null;
+
+    const result = await scrapeAndStore({
+      url: website,
+      organizationId: req.orgId,
+      voiceAgentId: id,
+      chatbotId: null,
+      knowledgeBaseId,
+      knowledgeSourceId: source?.id || null,
+    });
+
+    res.json({
+      success: true,
+      chunksStored: result.chunksStored,
+      strategy: result.strategy,
+      message: `Scraped ${result.chunksStored} content chunks using ${result.strategy}.`,
+    });
   }),
 );
 

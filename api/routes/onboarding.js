@@ -6,6 +6,12 @@ const { requireAuth } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 const { generateFaqsFromWebsite } = require("../../lib/openai");
 const { serializeAgent } = require("../../lib/serializers");
+const {
+  ensureDefaultKnowledgeBaseForOrg,
+  assignVoiceAgentKnowledgeBase,
+  assignChatbotKnowledgeBase,
+  findOrCreateKnowledgeSource,
+} = require("../../lib/knowledge-bases");
 
 const router = express.Router();
 
@@ -74,11 +80,34 @@ router.post(
         industry: profile.industry || "",
         website: profile.website || "",
         location: profile.location || "",
-        timezone: profile.timezone || "America/New_York",
+        timezone: profile.timezone || "America/Chicago",
         onboarded: true,
         updated_at: new Date().toISOString(),
       })
       .eq("id", orgId);
+
+    const onboardingOrg = {
+      id: orgId,
+      name: profile.name || "My Business",
+      industry: profile.industry || "",
+      website: profile.website || "",
+      location: profile.location || "",
+      timezone: profile.timezone || "America/Chicago",
+    };
+    const knowledgeBase = await ensureDefaultKnowledgeBaseForOrg(
+      db,
+      onboardingOrg,
+    );
+    const primaryKnowledgeSource =
+      knowledgeBase?.id && onboardingOrg.website
+        ? await findOrCreateKnowledgeSource(db, {
+            organizationId: orgId,
+            knowledgeBaseId: knowledgeBase.id,
+            url: onboardingOrg.website,
+            title: `${onboardingOrg.name} Website`,
+            isPrimary: true,
+          })
+        : null;
 
     // Determine greeting — use provided or build from agent name + business name
     const agentName = agentConfig.name || "Maya";
@@ -89,34 +118,37 @@ router.post(
         : `Hello, thank you for calling ${businessName}! This is ${agentName}. How can I help you today?`;
 
     // Create voice agent using Twilio/OpenAI realtime pipeline
+    const agentPayload = {
+      organization_id: orgId,
+      name: agentName,
+      direction: agentConfig.direction || "inbound",
+      voice: normalizeVoice(
+        agentConfig.voice || process.env.DEFAULT_AGENT_VOICE || "Domi",
+      ),
+      language: agentConfig.language || "English",
+      greeting,
+      tone: agentConfig.tone || "Professional",
+      business_hours: agentConfig.businessHours || "9am-5pm Monday-Friday",
+      escalation_phone: agentConfig.escalationPhone || "",
+      voicemail_fallback: agentConfig.voicemailFallback ?? true,
+      data_capture_fields: agentConfig.dataCaptureFields || [
+        "name",
+        "phone",
+        "email",
+        "reason",
+      ],
+      rules: agentConfig.rules || {
+        autoBook: false,
+        autoEscalate: true,
+        captureAllLeads: true,
+      },
+      is_active: true,
+    };
+    if (knowledgeBase?.id) agentPayload.knowledge_base_id = knowledgeBase.id;
+
     const { data: agentRow, error: agentErr } = await db
       .from("voice_agents")
-      .insert({
-        organization_id: orgId,
-        name: agentName,
-        direction: agentConfig.direction || "inbound",
-        voice: normalizeVoice(
-          agentConfig.voice || process.env.DEFAULT_AGENT_VOICE || "Domi",
-        ),
-        language: agentConfig.language || "English",
-        greeting,
-        tone: agentConfig.tone || "Professional",
-        business_hours: agentConfig.businessHours || "9am-5pm Monday-Friday",
-        escalation_phone: agentConfig.escalationPhone || "",
-        voicemail_fallback: agentConfig.voicemailFallback ?? true,
-        data_capture_fields: agentConfig.dataCaptureFields || [
-          "name",
-          "phone",
-          "email",
-          "reason",
-        ],
-        rules: agentConfig.rules || {
-          autoBook: false,
-          autoEscalate: true,
-          captureAllLeads: true,
-        },
-        is_active: true,
-      })
+      .insert(agentPayload)
       .select()
       .single();
 
@@ -129,6 +161,15 @@ router.post(
       });
     }
 
+    if (knowledgeBase?.id) {
+      await assignVoiceAgentKnowledgeBase(db, {
+        organizationId: orgId,
+        agentId: agentRow.id,
+        knowledgeBaseId: knowledgeBase.id,
+      });
+      agentRow.knowledge_base_id = knowledgeBase.id;
+    }
+
     // Insert FAQs
     const faqs = agentConfig.faqs || [];
     let insertedFaqs = [];
@@ -136,12 +177,19 @@ router.post(
       const { data: faqData } = await db
         .from("faqs")
         .insert(
-          faqs.map((f) => ({
-            organization_id: orgId,
-            voice_agent_id: agentRow.id,
-            question: f.question,
-            answer: f.answer,
-          })),
+          faqs.map((f) => {
+            const row = {
+              organization_id: orgId,
+              voice_agent_id: agentRow.id,
+              question: f.question,
+              answer: f.answer,
+              source_type: "onboarding",
+            };
+            if (knowledgeBase?.id) row.knowledge_base_id = knowledgeBase.id;
+            if (primaryKnowledgeSource?.id)
+              row.knowledge_source_id = primaryKnowledgeSource.id;
+            return row;
+          }),
         )
         .select();
       insertedFaqs = faqData || [];
@@ -166,11 +214,19 @@ router.post(
           welcome_message: `Hello! Welcome to ${businessName}. How can I help you today?`,
           faqs: faqs.map((f) => ({ question: f.question, answer: f.answer })),
           is_active: true,
+          ...(knowledgeBase?.id ? { knowledge_base_id: knowledgeBase.id } : {}),
         })
         .select()
         .single();
 
       if (chatbotRow) {
+        if (knowledgeBase?.id) {
+          await assignChatbotKnowledgeBase(db, {
+            organizationId: orgId,
+            chatbotId: chatbotRow.id,
+            knowledgeBaseId: knowledgeBase.id,
+          });
+        }
         const apiUrl = (process.env.API_URL || "").replace(/\/$/, "");
         const embedScript = `<!-- Agently Chat Widget -->\n<iframe id="agently-widget-${chatbotRow.id}" src="${apiUrl}/chatbot-widget/${chatbotRow.id}" style="position:fixed;bottom:20px;right:20px;width:420px;height:700px;max-width:90vw;max-height:90vh;border:none;background:transparent;z-index:1000000;overflow:hidden;" scrolling="no" frameborder="0" allow="microphone" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"></iframe>`;
         await db

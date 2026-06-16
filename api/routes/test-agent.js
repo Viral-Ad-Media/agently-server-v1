@@ -550,7 +550,7 @@ router.post(
           error: {
             code: "RECIPIENT_REQUIRED",
             message:
-              "Add one valid phone number. US formats like (832) 509-0881 and +1 832 509 0881 are accepted.",
+              "Add one valid phone number. US formats like (123) 456-7890 and +1 123 456 7890 are accepted.",
           },
         });
     }
@@ -664,7 +664,7 @@ router.post(
           error: {
             code: "RECIPIENTS_REQUIRED",
             message:
-              "Add at least one valid phone number. US formats like (832) 509-0881 and +1 832 509 0881 are accepted.",
+              "Add at least one valid phone number. US formats like (123) 456-7890 and +1 123 456 7890 are accepted.",
           },
         });
     }

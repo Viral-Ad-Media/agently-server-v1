@@ -281,6 +281,60 @@ function buildOccurrenceGeneration(
   });
 }
 
+const WEEKDAY_CODES = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+
+function weekdayCodeForLocalDate(localDate) {
+  const [year, month, day] = String(localDate || "")
+    .split("-")
+    .map(Number);
+  if (!year || !month || !day) return null;
+  return WEEKDAY_CODES[
+    new Date(Date.UTC(year, month - 1, day, 12, 0, 0)).getUTCDay()
+  ];
+}
+
+function exactWindowsFromGeneration(generation = {}) {
+  const windows = [];
+  const seen = new Set();
+  for (const occurrence of generation.occurrences || []) {
+    const localDate = occurrence.localDate || occurrence.local_date || null;
+    const time = String(
+      occurrence.localTime || occurrence.local_time || "",
+    ).slice(0, 5);
+    if (!localDate || !/^\d{2}:\d{2}$/.test(time)) continue;
+    const key = `${localDate}|${time}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const weekday = weekdayCodeForLocalDate(localDate);
+    windows.push({
+      date: localDate,
+      localDate,
+      weekdays: weekday ? [weekday] : [],
+      time,
+    });
+  }
+  return windows;
+}
+
+function storedWindowsForSchedule({
+  generation,
+  scheduleType,
+  fallbackDays = [],
+  fallbackTimes = [],
+}) {
+  if (
+    ["one_time", "one_time_batch"].includes(
+      String(scheduleType || generation?.scheduleType || ""),
+    )
+  ) {
+    return exactWindowsFromGeneration(generation);
+  }
+  return fallbackTimes.map((time) => ({
+    weekdays: fallbackDays.length ? fallbackDays : [],
+    time,
+  }));
+}
+
 function buildRunRowsFromOccurrences({
   organizationId,
   schedule,
@@ -690,8 +744,8 @@ router.post(
     }
     const timezone =
       String(
-        body.timezone || req.organization?.timezone || "America/New_York",
-      ).trim() || "America/New_York";
+        body.timezone || req.organization?.timezone || "America/Chicago",
+      ).trim() || "America/Chicago";
     const scheduleType = normalizeScheduleType(
       body.scheduleType || body.schedule_type,
     );
@@ -758,8 +812,8 @@ router.post(
     const status = normalizeScheduleStatus(body.status || "active", "active");
     const timezone =
       String(
-        body.timezone || req.organization?.timezone || "America/New_York",
-      ).trim() || "America/New_York";
+        body.timezone || req.organization?.timezone || "America/Chicago",
+      ).trim() || "America/Chicago";
     let startAt = resolveStartAt(body, timezone);
     let timesPerDay = normalizeTimesPerDay(
       body.timesPerDay || body.times_per_day,
@@ -841,6 +895,28 @@ router.post(
           .filter(Boolean),
       ),
     ].sort();
+    const storedWindows = storedWindowsForSchedule({
+      generation,
+      scheduleType,
+      fallbackDays: daysOfWeek,
+      fallbackTimes: timesPerDay,
+    });
+    const generatedLocalDates = [
+      ...new Set(
+        (generation.occurrences || [])
+          .map((item) => item.localDate)
+          .filter(Boolean),
+      ),
+    ].sort();
+    const storedDaysOfWeek = daysOfWeek.length
+      ? daysOfWeek
+      : [
+          ...new Set(
+            storedWindows
+              .flatMap((window) => window.weekdays || [])
+              .filter(Boolean),
+          ),
+        ];
 
     const targetType =
       directRecipients.length && leadIds.length
@@ -889,7 +965,7 @@ router.post(
       schedule_type: scheduleType,
       start_at: new Date(startAt).toISOString(),
       timezone,
-      days_of_week: daysOfWeek,
+      days_of_week: storedDaysOfWeek,
       times_per_day: timesPerDay,
       max_calls_per_day: Math.max(
         1,
@@ -914,19 +990,20 @@ router.post(
       ),
       status,
       is_active: status === "active",
-      windows: timesPerDay.map((time) => ({
-        weekdays: daysOfWeek.length
-          ? daysOfWeek
-          : ["mon", "tue", "wed", "thu", "fri"],
-        time,
-      })),
+      windows: storedWindows,
       extra_context: String(body.customInstructions || body.callPurpose || ""),
       progress: {},
       metadata: {
         createdBy: req.user?.id || null,
         scheduleVersion: 1,
         directRecipients,
-        scheduleConfig: scheduleConfigFromBody(body, scheduleType),
+        scheduleDates: generatedLocalDates,
+        scheduleWindows: storedWindows,
+        scheduleConfig: {
+          ...scheduleConfigFromBody(body, scheduleType),
+          scheduleDates: generatedLocalDates,
+          scheduleWindows: storedWindows,
+        },
         recurrenceRule: {
           type: generation.scheduleType,
           timezone: generation.timezone,
@@ -1131,10 +1208,10 @@ router.patch(
     }
     const patchTimezone = String(body.timezone || "").trim();
     if (body.timezone !== undefined)
-      updates.timezone = patchTimezone || "America/New_York";
+      updates.timezone = patchTimezone || "America/Chicago";
     const resolvedStartAt = resolveStartAt(
       body,
-      patchTimezone || "America/New_York",
+      patchTimezone || "America/Chicago",
     );
     if (resolvedStartAt) updates.start_at = resolvedStartAt;
     if (body.daysOfWeek !== undefined || body.days_of_week !== undefined)
