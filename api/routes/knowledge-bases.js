@@ -44,7 +44,10 @@ function serializeWithSources(row, sources = []) {
 }
 
 async function loadKnowledgeBaseDetails(db, organizationId, knowledgeBaseId) {
-  const base = await verifyKnowledgeBase(db, { organizationId, knowledgeBaseId });
+  const base = await verifyKnowledgeBase(db, {
+    organizationId,
+    knowledgeBaseId,
+  });
   if (!base?.id) return null;
   const [sources, agentLinks, chatbotLinks] = await Promise.all([
     safeDb(
@@ -117,7 +120,8 @@ router.post(
       cleanText(body.businessName || body.business_name || body.name) ||
       titleFromDomain(domain);
     const name =
-      cleanText(body.name) || `${businessName || titleFromDomain(domain)} Knowledge Base`;
+      cleanText(body.name) ||
+      `${businessName || titleFromDomain(domain)} Knowledge Base`;
 
     const existing = await safeDb(
       "existing knowledge base domain",
@@ -140,7 +144,8 @@ router.post(
     }
 
     const currentBases = await listKnowledgeBasesForOrg(db, req.orgId);
-    const shouldBePrimary = body.isPrimary === true || currentBases.length === 0;
+    const shouldBePrimary =
+      body.isPrimary === true || currentBases.length === 0;
 
     const { data: base, error } = await db
       .from("knowledge_bases")
@@ -155,7 +160,10 @@ router.post(
         is_primary: shouldBePrimary,
         status: "active",
         sync_status: "pending",
-        metadata: body.metadata && typeof body.metadata === "object" ? body.metadata : {},
+        metadata:
+          body.metadata && typeof body.metadata === "object"
+            ? body.metadata
+            : {},
       })
       .select()
       .single();
@@ -190,7 +198,9 @@ router.get(
       req.params.id,
     );
     if (!details) {
-      return res.status(404).json({ error: { message: "Knowledge base not found." } });
+      return res
+        .status(404)
+        .json({ error: { message: "Knowledge base not found." } });
     }
     res.json({ knowledgeBase: details });
   }),
@@ -207,22 +217,33 @@ router.patch(
       knowledgeBaseId: req.params.id,
     });
     if (!existing?.id) {
-      return res.status(404).json({ error: { message: "Knowledge base not found." } });
+      return res
+        .status(404)
+        .json({ error: { message: "Knowledge base not found." } });
     }
 
     const body = req.body || {};
     const updates = { updated_at: new Date().toISOString() };
     if (body.name !== undefined) updates.name = cleanText(body.name);
     if (body.businessName !== undefined || body.business_name !== undefined) {
-      updates.business_name = cleanText(body.businessName || body.business_name);
+      updates.business_name = cleanText(
+        body.businessName || body.business_name,
+      );
     }
-    if (body.description !== undefined) updates.description = cleanText(body.description);
-    if (body.industry !== undefined) updates.industry = cleanText(body.industry);
-    if (body.status !== undefined) updates.status = cleanText(body.status) || "active";
+    if (body.description !== undefined)
+      updates.description = cleanText(body.description);
+    if (body.industry !== undefined)
+      updates.industry = cleanText(body.industry);
+    if (body.status !== undefined)
+      updates.status = cleanText(body.status) || "active";
     if (body.metadata !== undefined && typeof body.metadata === "object") {
       updates.metadata = body.metadata;
     }
-    if (body.primaryUrl !== undefined || body.primary_url !== undefined || body.website !== undefined) {
+    if (
+      body.primaryUrl !== undefined ||
+      body.primary_url !== undefined ||
+      body.website !== undefined
+    ) {
       const primaryUrl = normalizeUrl(requestedWebsite(body));
       if (!primaryUrl) {
         return res.status(400).json({
@@ -251,7 +272,9 @@ router.patch(
 
     if (error || !updated) {
       return res.status(500).json({
-        error: { message: error?.message || "Failed to update knowledge base." },
+        error: {
+          message: error?.message || "Failed to update knowledge base.",
+        },
       });
     }
 
@@ -276,9 +299,15 @@ router.delete(
   requireAdmin,
   asyncHandler(async (req, res) => {
     const db = getSupabase();
-    const details = await loadKnowledgeBaseDetails(db, req.orgId, req.params.id);
+    const details = await loadKnowledgeBaseDetails(
+      db,
+      req.orgId,
+      req.params.id,
+    );
     if (!details) {
-      return res.status(404).json({ error: { message: "Knowledge base not found." } });
+      return res
+        .status(404)
+        .json({ error: { message: "Knowledge base not found." } });
     }
     if (details.isPrimary) {
       return res.status(400).json({
@@ -318,11 +347,17 @@ router.post(
       knowledgeBaseId: req.params.id,
     });
     if (!base?.id) {
-      return res.status(404).json({ error: { message: "Knowledge base not found." } });
+      return res
+        .status(404)
+        .json({ error: { message: "Knowledge base not found." } });
     }
-    const url = normalizeUrl(req.body?.url || req.body?.website || req.body?.sourceUrl);
+    const url = normalizeUrl(
+      req.body?.url || req.body?.website || req.body?.sourceUrl,
+    );
     if (!url) {
-      return res.status(400).json({ error: { message: "A valid source URL is required." } });
+      return res
+        .status(400)
+        .json({ error: { message: "A valid source URL is required." } });
     }
     const source = await findOrCreateKnowledgeSource(db, {
       organizationId: req.orgId,
@@ -332,7 +367,9 @@ router.post(
       isPrimary: req.body?.isPrimary === true,
     });
     if (!source?.id) {
-      return res.status(500).json({ error: { message: "Failed to create source." } });
+      return res
+        .status(500)
+        .json({ error: { message: "Failed to create source." } });
     }
     res.status(201).json({ source: serializeKnowledgeSource(source) });
   }),
@@ -349,19 +386,35 @@ router.patch(
       knowledgeBaseId: req.params.id,
     });
     if (!base?.id) {
-      return res.status(404).json({ error: { message: "Knowledge base not found." } });
+      return res
+        .status(404)
+        .json({ error: { message: "Knowledge base not found." } });
     }
     const updates = { updated_at: new Date().toISOString() };
-    if (req.body?.title !== undefined) updates.title = cleanText(req.body.title);
-    if (req.body?.isPrimary !== undefined) updates.is_primary = req.body.isPrimary === true;
-    if (req.body?.scrapeStatus !== undefined) updates.scrape_status = cleanText(req.body.scrapeStatus);
-    if (req.body?.metadata !== undefined && typeof req.body.metadata === "object") {
+    if (req.body?.title !== undefined)
+      updates.title = cleanText(req.body.title);
+    if (req.body?.isPrimary !== undefined)
+      updates.is_primary = req.body.isPrimary === true;
+    if (req.body?.scrapeStatus !== undefined)
+      updates.scrape_status = cleanText(req.body.scrapeStatus);
+    if (
+      req.body?.metadata !== undefined &&
+      typeof req.body.metadata === "object"
+    ) {
       updates.metadata = req.body.metadata;
     }
-    if (req.body?.url !== undefined || req.body?.website !== undefined || req.body?.sourceUrl !== undefined) {
-      const url = normalizeUrl(req.body.url || req.body.website || req.body.sourceUrl);
+    if (
+      req.body?.url !== undefined ||
+      req.body?.website !== undefined ||
+      req.body?.sourceUrl !== undefined
+    ) {
+      const url = normalizeUrl(
+        req.body.url || req.body.website || req.body.sourceUrl,
+      );
       if (!url) {
-        return res.status(400).json({ error: { message: "A valid source URL is required." } });
+        return res
+          .status(400)
+          .json({ error: { message: "A valid source URL is required." } });
       }
       updates.url = url;
       updates.normalized_url = url;
@@ -417,11 +470,102 @@ router.delete(
       .eq("knowledge_base_id", req.params.id)
       .eq("organization_id", req.orgId);
     if (error) {
-      return res.status(500).json({ error: { message: error.message || "Failed to delete source." } });
+      return res.status(500).json({
+        error: { message: error.message || "Failed to delete source." },
+      });
     }
     res.json({ success: true });
   }),
 );
+
+async function performKnowledgeSourceSync({
+  db,
+  organizationId,
+  base,
+  source,
+}) {
+  let scrapeAndStore;
+  try {
+    ({ scrapeAndStore } = require("../../lib/scraper.service"));
+  } catch (depErr) {
+    console.error(
+      "[knowledge-bases] scraper.service failed to load:",
+      depErr.message,
+    );
+    throw new Error(
+      "Website scraping is temporarily unavailable. A server dependency is missing. Please contact support.",
+    );
+  }
+
+  await db
+    .from("knowledge_sources")
+    .update({
+      scrape_status: "scraping",
+      last_error: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", source.id)
+    .eq("organization_id", organizationId);
+
+  await db
+    .from("knowledge_bases")
+    .update({
+      sync_status: "scraping",
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", base.id)
+    .eq("organization_id", organizationId);
+
+  try {
+    const result = await scrapeAndStore({
+      url: source.normalized_url || source.url,
+      organizationId,
+      voiceAgentId: null,
+      chatbotId: null,
+      knowledgeBaseId: base.id,
+      knowledgeSourceId: source.id,
+    });
+
+    const { data: updatedSource } = await db
+      .from("knowledge_sources")
+      .select("*")
+      .eq("id", source.id)
+      .eq("organization_id", organizationId)
+      .maybeSingle();
+
+    return {
+      success: true,
+      chunksStored: result.chunksStored || 0,
+      pagesScraped: result.pagesScraped || 0,
+      pagesDiscovered: result.pagesDiscovered || 0,
+      productsFound: result.productsFound || 0,
+      productsStored: result.productsStored || 0,
+      strategy: result.strategy || "scraper-v2",
+      source: serializeKnowledgeSource(updatedSource || source),
+      result,
+    };
+  } catch (error) {
+    const message = error?.message || "Failed to sync this source.";
+    await db
+      .from("knowledge_sources")
+      .update({
+        scrape_status: "failed",
+        last_error: message,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", source.id)
+      .eq("organization_id", organizationId);
+    await db
+      .from("knowledge_bases")
+      .update({
+        sync_status: "failed",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", base.id)
+      .eq("organization_id", organizationId);
+    throw new Error(message);
+  }
+}
 
 router.post(
   "/:id/sources/:sourceId/sync",
@@ -434,7 +578,9 @@ router.post(
       knowledgeBaseId: req.params.id,
     });
     if (!base?.id) {
-      return res.status(404).json({ error: { message: "Knowledge base not found." } });
+      return res
+        .status(404)
+        .json({ error: { message: "Knowledge base not found." } });
     }
 
     const { data: source, error: sourceError } = await db
@@ -449,74 +595,14 @@ router.post(
       return res.status(404).json({ error: { message: "Source not found." } });
     }
 
-    let scrapeAndStore;
-    try {
-      ({ scrapeAndStore } = require("../../lib/scraper.service"));
-    } catch (depErr) {
-      console.error("[knowledge-bases] scraper.service failed to load:", depErr.message);
-      return res.status(500).json({
-        error: {
-          message:
-            "Website scraping is temporarily unavailable. A server dependency is missing. Please contact support.",
-          detail: depErr.message,
-        },
-      });
-    }
-
-    await db
-      .from("knowledge_sources")
-      .update({
-        scrape_status: "scraping",
-        last_error: null,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", source.id)
-      .eq("organization_id", req.orgId);
-
-    await db
-      .from("knowledge_bases")
-      .update({
-        sync_status: "scraping",
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", base.id)
-      .eq("organization_id", req.orgId);
-
-    try {
-      const result = await scrapeAndStore({
-        url: source.normalized_url || source.url,
-        organizationId: req.orgId,
-        voiceAgentId: null,
-        chatbotId: null,
-        knowledgeBaseId: base.id,
-        knowledgeSourceId: source.id,
-      });
-
-      const { data: updatedSource } = await db
-        .from("knowledge_sources")
-        .select("*")
-        .eq("id", source.id)
-        .eq("organization_id", req.orgId)
-        .maybeSingle();
-
-      res.json({
-        success: true,
-        chunksStored: result.chunksStored || 0,
-        pagesScraped: result.pagesScraped || 0,
-        pagesDiscovered: result.pagesDiscovered || 0,
-        productsFound: result.productsFound || 0,
-        productsStored: result.productsStored || 0,
-        strategy: result.strategy || "scraper-v2",
-        source: serializeKnowledgeSource(updatedSource || source),
-        result,
-      });
-    } catch (error) {
-      const message = error?.message || "Failed to sync this source.";
+    const wantsBackground =
+      req.body?.background === true || req.query.background === "true";
+    if (wantsBackground) {
       await db
         .from("knowledge_sources")
         .update({
-          scrape_status: "failed",
-          last_error: message,
+          scrape_status: "scraping",
+          last_error: null,
           updated_at: new Date().toISOString(),
         })
         .eq("id", source.id)
@@ -524,12 +610,52 @@ router.post(
       await db
         .from("knowledge_bases")
         .update({
-          sync_status: "failed",
+          sync_status: "scraping",
           updated_at: new Date().toISOString(),
         })
         .eq("id", base.id)
         .eq("organization_id", req.orgId);
-      return res.status(500).json({ error: { message } });
+
+      const run = () =>
+        performKnowledgeSourceSync({
+          db,
+          organizationId: req.orgId,
+          base,
+          source,
+        }).catch((error) => {
+          console.error(
+            "[knowledge-bases] background sync failed:",
+            error.message,
+          );
+        });
+
+      if (typeof setImmediate === "function") setImmediate(run);
+      else setTimeout(run, 0);
+
+      return res.status(202).json({
+        success: true,
+        accepted: true,
+        background: true,
+        message: "Knowledge sync started in the background.",
+        source: serializeKnowledgeSource({
+          ...source,
+          scrape_status: "scraping",
+        }),
+      });
+    }
+
+    try {
+      const result = await performKnowledgeSourceSync({
+        db,
+        organizationId: req.orgId,
+        base,
+        source,
+      });
+      return res.json(result);
+    } catch (error) {
+      return res.status(500).json({
+        error: { message: error.message || "Failed to sync this source." },
+      });
     }
   }),
 );
@@ -570,18 +696,24 @@ router.get(
       knowledgeBaseId: req.params.id,
     });
     if (!base?.id) {
-      return res.status(404).json({ error: { message: "Knowledge base not found." } });
+      return res
+        .status(404)
+        .json({ error: { message: "Knowledge base not found." } });
     }
 
     const { data, error } = await db
       .from("faqs")
-      .select("id,question,answer,voice_agent_id,chatbot_id,knowledge_base_id,knowledge_source_id,source_type,metadata,created_at,updated_at")
+      .select(
+        "id,question,answer,voice_agent_id,chatbot_id,knowledge_base_id,knowledge_source_id,source_type,metadata,created_at,updated_at",
+      )
       .eq("organization_id", req.orgId)
       .eq("knowledge_base_id", req.params.id)
       .order("created_at", { ascending: true });
 
     if (error) {
-      return res.status(500).json({ error: { message: error.message || "Failed to load FAQs." } });
+      return res
+        .status(500)
+        .json({ error: { message: error.message || "Failed to load FAQs." } });
     }
 
     const faqs = (data || []).map(serializeFaqRow);
@@ -589,7 +721,9 @@ router.get(
       knowledgeBaseId: req.params.id,
       faqs,
       manualFaqs: faqs.filter((faq) =>
-        ["manual", "knowledge_base_manual", "chatbot_manual"].includes(String(faq.sourceType || "").toLowerCase()),
+        ["manual", "knowledge_base_manual", "chatbot_manual"].includes(
+          String(faq.sourceType || "").toLowerCase(),
+        ),
       ),
     });
   }),
@@ -606,14 +740,18 @@ router.put(
       knowledgeBaseId: req.params.id,
     });
     if (!base?.id) {
-      return res.status(404).json({ error: { message: "Knowledge base not found." } });
+      return res
+        .status(404)
+        .json({ error: { message: "Knowledge base not found." } });
     }
 
     const faqs = normalizeFaqPayload(req.body?.faqs);
     const chatbotId = isUuid(req.body?.chatbotId || req.body?.chatbot_id || "")
       ? String(req.body.chatbotId || req.body.chatbot_id)
       : null;
-    const voiceAgentId = isUuid(req.body?.voiceAgentId || req.body?.voice_agent_id || "")
+    const voiceAgentId = isUuid(
+      req.body?.voiceAgentId || req.body?.voice_agent_id || "",
+    )
       ? String(req.body.voiceAgentId || req.body.voice_agent_id)
       : null;
 
@@ -636,24 +774,34 @@ router.put(
         source_type: "knowledge_base_manual",
         metadata: {
           source: "knowledge_base_manual_editor",
-          updatedFrom: chatbotId ? "chatbot_page" : voiceAgentId ? "voice_agent_page" : "knowledge_base_page",
+          updatedFrom: chatbotId
+            ? "chatbot_page"
+            : voiceAgentId
+              ? "voice_agent_page"
+              : "knowledge_base_page",
         },
       }));
       const { error: insertError } = await db.from("faqs").insert(rows);
       if (insertError) {
-        return res.status(500).json({ error: { message: insertError.message || "Failed to save FAQs." } });
+        return res.status(500).json({
+          error: { message: insertError.message || "Failed to save FAQs." },
+        });
       }
     }
 
     const { data, error } = await db
       .from("faqs")
-      .select("id,question,answer,voice_agent_id,chatbot_id,knowledge_base_id,knowledge_source_id,source_type,metadata,created_at,updated_at")
+      .select(
+        "id,question,answer,voice_agent_id,chatbot_id,knowledge_base_id,knowledge_source_id,source_type,metadata,created_at,updated_at",
+      )
       .eq("organization_id", req.orgId)
       .eq("knowledge_base_id", req.params.id)
       .order("created_at", { ascending: true });
 
     if (error) {
-      return res.status(500).json({ error: { message: error.message || "Failed to reload FAQs." } });
+      return res.status(500).json({
+        error: { message: error.message || "Failed to reload FAQs." },
+      });
     }
 
     const allFaqs = (data || []).map(serializeFaqRow);
@@ -662,7 +810,9 @@ router.put(
       knowledgeBaseId: req.params.id,
       faqs: allFaqs,
       manualFaqs: allFaqs.filter((faq) =>
-        ["manual", "knowledge_base_manual", "chatbot_manual"].includes(String(faq.sourceType || "").toLowerCase()),
+        ["manual", "knowledge_base_manual", "chatbot_manual"].includes(
+          String(faq.sourceType || "").toLowerCase(),
+        ),
       ),
     });
   }),
@@ -678,7 +828,9 @@ router.post(
       knowledgeBaseId: req.params.id,
     });
     if (!base?.id) {
-      return res.status(404).json({ error: { message: "Knowledge base not found." } });
+      return res
+        .status(404)
+        .json({ error: { message: "Knowledge base not found." } });
     }
 
     const query = cleanText(req.body?.query || req.body?.q || "");
@@ -689,7 +841,10 @@ router.post(
         knowledgeBaseIds: [req.params.id],
         query,
         limit,
-        maxChars: Math.min(Math.max(Number(req.body?.maxChars || 900), 300), 1800),
+        maxChars: Math.min(
+          Math.max(Number(req.body?.maxChars || 900), 300),
+          1800,
+        ),
       }),
       searchScopedFaqs(db, {
         organizationId: req.orgId,
@@ -722,13 +877,17 @@ router.get(
       knowledgeBaseId: req.params.id,
     });
     if (!base?.id) {
-      return res.status(404).json({ error: { message: "Knowledge base not found." } });
+      return res
+        .status(404)
+        .json({ error: { message: "Knowledge base not found." } });
     }
 
     const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 250);
     let query = db
       .from("scraped_products")
-      .select("id,name,slug,url,description,price,price_text,currency,availability,brand,sku,image_url,variants,raw_source,knowledge_source_id,metadata,created_at,updated_at")
+      .select(
+        "id,name,slug,url,description,price,price_text,currency,availability,brand,sku,image_url,variants,raw_source,knowledge_source_id,metadata,created_at,updated_at",
+      )
       .eq("organization_id", req.orgId)
       .eq("knowledge_base_id", req.params.id)
       .order("name", { ascending: true })
@@ -740,7 +899,11 @@ router.get(
     const { data, error } = await query;
     if (error) {
       const msg = String(error.message || "").toLowerCase();
-      if (msg.includes("does not exist") || msg.includes("schema cache") || msg.includes("could not find")) {
+      if (
+        msg.includes("does not exist") ||
+        msg.includes("schema cache") ||
+        msg.includes("could not find")
+      ) {
         return res.json({ products: [] });
       }
       return res.status(500).json({ error: { message: error.message } });
@@ -787,7 +950,10 @@ router.put(
     if (!result.ok) {
       return res.status(404).json({ error: { message: result.message } });
     }
-    res.json({ success: true, knowledgeBase: serializeKnowledgeBase(result.knowledgeBase) });
+    res.json({
+      success: true,
+      knowledgeBase: serializeKnowledgeBase(result.knowledgeBase),
+    });
   }),
 );
 
@@ -807,7 +973,10 @@ router.put(
     if (!result.ok) {
       return res.status(404).json({ error: { message: result.message } });
     }
-    res.json({ success: true, knowledgeBase: serializeKnowledgeBase(result.knowledgeBase) });
+    res.json({
+      success: true,
+      knowledgeBase: serializeKnowledgeBase(result.knowledgeBase),
+    });
   }),
 );
 
