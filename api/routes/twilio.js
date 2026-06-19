@@ -1117,6 +1117,111 @@ function dbRunStatusFromOutcome(outcome, callStatus) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// ── PUBLIC: Async AMD Status Callback ────────────────────────
+// Twilio sends AnsweredBy here when AsyncAmd=true. Keep this separate from
+// normal call-status so calls can connect immediately without AMD blocking.
+// ─────────────────────────────────────────────────────────────
+router.post(
+  "/amd-status",
+  asyncHandler(async (req, res) => {
+    const body = req.body || {};
+    const callSid = body.CallSid || body.callSid || body.CallSID || "";
+    const answeredBy = String(
+      body.AnsweredBy || body.answeredBy || body.Answeredby || "",
+    ).trim();
+    const machineDetected = /machine|fax|unknown/i.test(answeredBy);
+    if (callSid) {
+      console.log("[latency] async_amd_status_callback", {
+        callSid,
+        answeredBy,
+        machineDetected,
+        eventReceivedAt: new Date().toISOString(),
+      });
+      const columnsPatch = {
+        answered_by: answeredBy || undefined,
+        voicemail_detected: machineDetected || undefined,
+        ...(machineDetected
+          ? {
+              call_category: "voicemail",
+              disposition: "async_amd_machine_detected",
+            }
+          : answeredBy
+            ? {
+                call_category: "answered_human",
+                disposition: "async_amd_human_detected",
+              }
+            : {}),
+      };
+      await updateCallRecordMetadataBySid(
+        callSid,
+        {
+          answered_by: answeredBy,
+          machine_detection_result: answeredBy,
+          voicemail_detected: machineDetected,
+          async_amd: {
+            answeredBy,
+            machineDetected,
+            raw: body,
+            receivedAt: new Date().toISOString(),
+          },
+        },
+        columnsPatch,
+      );
+
+      try {
+        const db = getSupabase();
+        const { data: scheduledRecord } = await db
+          .from("call_records")
+          .select("id, metadata")
+          .eq("twilio_call_sid", callSid)
+          .maybeSingle();
+        const scheduleRunId =
+          scheduledRecord?.metadata?.scheduleRunId ||
+          scheduledRecord?.metadata?.billing?.run_id ||
+          null;
+        if (scheduleRunId) {
+          const { data: existingRun } = await db
+            .from("lead_outreach_runs")
+            .select("id,outcome_metadata")
+            .eq("id", scheduleRunId)
+            .maybeSingle();
+          const existingMeta =
+            existingRun?.outcome_metadata &&
+            typeof existingRun.outcome_metadata === "object"
+              ? existingRun.outcome_metadata
+              : {};
+          await db
+            .from("lead_outreach_runs")
+            .update({
+              outcome_metadata: {
+                ...existingMeta,
+                answeredBy,
+                machineDetectionResult: answeredBy,
+                voicemailDetected: machineDetected,
+                asyncAmd: {
+                  answeredBy,
+                  machineDetected,
+                  raw: body,
+                  receivedAt: new Date().toISOString(),
+                },
+                outcome: machineDetected ? "voicemail" : existingMeta.outcome,
+              },
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", scheduleRunId);
+        }
+      } catch (err) {
+        console.warn("[Twilio async-amd] scheduled run update skipped", {
+          callSid,
+          error: err.message || String(err),
+        });
+      }
+    }
+    res.status(204).send();
+  }),
+);
+
+// ─────────────────────────────────────────────────────────────
 // ── PUBLIC: Call Status Callback ─────────────────────────────
 // Twilio sends call lifecycle events here.
 // We update usage on 'completed' if we somehow missed the WS 'end' event.
@@ -1172,8 +1277,18 @@ router.post(
           "canceled",
           "cancelled",
         ]);
+        const statusOutcome = normalizeTwilioCallOutcome(
+          CallStatus,
+          AnsweredBy,
+          durationSeconds,
+        );
         const generalColumnsPatch = {
           status: CallStatus || undefined,
+          call_category:
+            statusOutcome === "answered" ? "answered_human" : statusOutcome,
+          disposition: statusOutcome,
+          answered_by: AnsweredBy || undefined,
+          voicemail_detected: statusOutcome === "voicemail" || undefined,
           ...(direction ? { direction } : {}),
           ...(durationSeconds > 0 ? { duration: durationSeconds } : {}),
           ...(terminalStatuses.has(normalizedStatus)
@@ -3170,6 +3285,9 @@ router.post(
       });
       console.log("[outbound-call] machineDetection enabled", {
         value: process.env.OUTBOUND_MACHINE_DETECTION || "Enable",
+        asyncAmd:
+          String(process.env.OUTBOUND_ASYNC_AMD || "true").toLowerCase() !==
+          "false",
       });
       console.log("[outbound-call] callSid", result.callSid);
       await updateCallRecordById(record.id, {

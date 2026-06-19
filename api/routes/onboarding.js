@@ -131,6 +131,28 @@ router.post(
       business_hours: agentConfig.businessHours || "9am-5pm Monday-Friday",
       escalation_phone: agentConfig.escalationPhone || "",
       voicemail_fallback: agentConfig.voicemailFallback ?? true,
+      voicemail_behavior:
+        agentConfig.voicemailBehavior ||
+        agentConfig.voicemailSettings?.action ||
+        "hangup",
+      voicemail_message:
+        agentConfig.voicemailMessage ||
+        agentConfig.voicemailSettings?.message ||
+        "",
+      voicemail_callback_delay_minutes: Number(
+        agentConfig.voicemailCallbackDelayMinutes ||
+          agentConfig.voicemailSettings?.callbackDelayMinutes ||
+          60,
+      ),
+      voicemail_max_redial_attempts: Number(
+        agentConfig.voicemailMaxRedialAttempts ||
+          agentConfig.voicemailSettings?.maxRedialAttempts ||
+          1,
+      ),
+      voicemail_settings: agentConfig.voicemailSettings || {},
+      call_screening_enabled: agentConfig.callScreeningEnabled !== false,
+      call_screening_message: agentConfig.callScreeningMessage || "",
+      call_screening_settings: agentConfig.callScreeningSettings || {},
       data_capture_fields: agentConfig.dataCaptureFields || [
         "name",
         "phone",

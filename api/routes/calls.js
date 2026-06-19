@@ -410,6 +410,151 @@ function derivedStatus(row = {}, run = null) {
   return raw || "queued";
 }
 
+function normalizeTags(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) =>
+        String(item || "")
+          .trim()
+          .toLowerCase(),
+      )
+      .filter(Boolean)
+      .filter((item, index, list) => list.indexOf(item) === index)
+      .slice(0, 30);
+  }
+  if (typeof value === "string") {
+    return value
+      .split(",")
+      .map((item) => item.trim().toLowerCase())
+      .filter(Boolean)
+      .filter((item, index, list) => list.indexOf(item) === index)
+      .slice(0, 30);
+  }
+  return [];
+}
+
+function firstNonEmpty(...values) {
+  for (const value of values) {
+    if (value == null) continue;
+    const text = String(value).trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function normalizeCallCategory(row = {}, run = null) {
+  const metadata = asObject(row.metadata);
+  const amd = asObject(
+    metadata.async_amd || metadata.amd || metadata.machine_detection || {},
+  );
+  const statusText = [
+    row.status,
+    row.outcome,
+    row.disposition,
+    row.call_category,
+    row.answered_by,
+    row.failure_reason,
+    run?.status,
+    metadata.call_category,
+    metadata.disposition,
+    metadata.answered_by,
+    metadata.machine_detection_result,
+    metadata.AnsweredBy,
+    amd.AnsweredBy,
+    amd.answered_by,
+    metadata.hangup_reason,
+    metadata.call_end_details?.reason,
+  ]
+    .map((item) => String(item || "").toLowerCase())
+    .join(" ");
+  const explicit = String(row.call_category || metadata.call_category || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_");
+  if (explicit) return explicit;
+  if (
+    row.screening_detected ||
+    metadata.screening_detected ||
+    /screened|screening/.test(statusText)
+  ) {
+    if (/connected|patched|recipient_joined/.test(statusText))
+      return "screened_then_connected";
+    return "screened";
+  }
+  if (
+    row.voicemail_detected ||
+    metadata.voicemail_detected ||
+    /machine|voicemail|answering_machine|fax/.test(statusText)
+  ) {
+    if (/left|message_left|voicemail_left/.test(statusText))
+      return "left_voicemail";
+    return "voicemail";
+  }
+  if (
+    /manual_followup|manual follow|follow[_ -]?up|callback/.test(statusText)
+  ) {
+    if (/callback/.test(statusText)) return "callback_scheduled";
+    return "manual_followup_required";
+  }
+  if (/opt[_ -]?out|do not call|dnc|not interested/.test(statusText))
+    return "opted_out";
+  if (/transfer/.test(statusText)) return "transferred";
+  if (/busy/.test(statusText)) return "busy";
+  if (/no[-_ ]?answer|not picked|did not pick|unanswered/.test(statusText))
+    return "no_answer";
+  if (
+    /unavailable|invalid|not in service|not reachable|number_unavailable/.test(
+      statusText,
+    )
+  )
+    return "unavailable";
+  if (/failed|error|undelivered|canceled|cancelled/.test(statusText))
+    return "failed";
+  const status = derivedStatus(row, run);
+  const duration = durationSeconds(row);
+  if (
+    status === "completed" ||
+    duration > 0 ||
+    /human|answered/.test(statusText)
+  )
+    return "answered_human";
+  if (status === "failed" || status === "cancelled") return "failed";
+  return "unknown";
+}
+
+function categoryLabel(category = "") {
+  const labels = {
+    answered_human: "Answered by human",
+    voicemail: "Voicemail",
+    left_voicemail: "Voicemail message left",
+    no_answer: "No answer",
+    busy: "Busy",
+    failed: "Failed",
+    unavailable: "Unavailable number",
+    screened: "Screened by assistant",
+    screened_then_connected: "Screened then connected",
+    callback_scheduled: "Callback scheduled",
+    manual_followup_required: "Needs manual follow-up",
+    opted_out: "Opted out",
+    transferred: "Transferred",
+    unknown: "Unknown",
+  };
+  return labels[category] || String(category || "Unknown").replace(/_/g, " ");
+}
+
+function isRerunEligibleCategory(category = "") {
+  return [
+    "voicemail",
+    "no_answer",
+    "busy",
+    "failed",
+    "unavailable",
+    "screened",
+    "callback_scheduled",
+    "manual_followup_required",
+  ].includes(String(category || "").toLowerCase());
+}
+
 function serializeCallForLogs(row, outboundRunIds = new Set(), run = null) {
   const duration = durationSeconds(row) || Number(run?.call_duration || 0) || 0;
   const direction = derivedDirection(row, outboundRunIds, run);
@@ -432,6 +577,21 @@ function serializeCallForLogs(row, outboundRunIds = new Set(), run = null) {
     metadata.destination_phone ||
     metadata.recipient?.phone ||
     "";
+  const callCategory = normalizeCallCategory(row, run);
+  const tags = normalizeTags(row.tags || metadata.tags || []);
+  const disposition = firstNonEmpty(
+    row.disposition,
+    metadata.disposition,
+    metadata.call_disposition,
+    callCategory,
+  );
+  const answeredBy = firstNonEmpty(
+    row.answered_by,
+    metadata.answered_by,
+    metadata.AnsweredBy,
+    metadata.async_amd?.AnsweredBy,
+    metadata.machine_detection_result,
+  );
   return {
     id: row.id,
     organization_id: row.organization_id,
@@ -449,7 +609,44 @@ function serializeCallForLogs(row, outboundRunIds = new Set(), run = null) {
     started_at: row.started_at,
     completed_at: row.completed_at,
     ended_at: row.ended_at,
-    outcome: row.outcome || (status === "completed" ? "Completed" : status),
+    outcome:
+      row.outcome ||
+      categoryLabel(callCategory) ||
+      (status === "completed" ? "Completed" : status),
+    call_category: callCategory,
+    callCategory,
+    category_label: categoryLabel(callCategory),
+    categoryLabel: categoryLabel(callCategory),
+    disposition,
+    answered_by: answeredBy,
+    answeredBy,
+    voicemail_detected: Boolean(
+      row.voicemail_detected ||
+      metadata.voicemail_detected ||
+      ["voicemail", "left_voicemail"].includes(callCategory),
+    ),
+    voicemailDetected: Boolean(
+      row.voicemail_detected ||
+      metadata.voicemail_detected ||
+      ["voicemail", "left_voicemail"].includes(callCategory),
+    ),
+    screening_detected: Boolean(
+      row.screening_detected ||
+      metadata.screening_detected ||
+      ["screened", "screened_then_connected"].includes(callCategory),
+    ),
+    screeningDetected: Boolean(
+      row.screening_detected ||
+      metadata.screening_detected ||
+      ["screened", "screened_then_connected"].includes(callCategory),
+    ),
+    tags,
+    rerun_eligible: isRerunEligibleCategory(callCategory),
+    rerunEligible: isRerunEligibleCategory(callCategory),
+    schedule_id:
+      run?.schedule_id || metadata.scheduleId || metadata.schedule_id || null,
+    campaign_id:
+      run?.schedule_id || metadata.scheduleId || metadata.schedule_id || null,
     summary: row.summary || "",
     transcript: normalizeTranscript(row.transcript),
     recording_available: Boolean(
@@ -491,6 +688,102 @@ function redactCallMetadata(metadata = {}) {
   if (safe.recording?.raw) safe.recording.raw = "[redacted]";
   return safe;
 }
+
+function mergeTags(currentTags, requestedTags, action = "replace") {
+  const current = normalizeTags(currentTags);
+  const requested = normalizeTags(requestedTags);
+  if (action === "add") return normalizeTags([...current, ...requested]);
+  if (action === "remove") {
+    const removeSet = new Set(requested);
+    return current.filter((tag) => !removeSet.has(tag));
+  }
+  return requested;
+}
+
+// ── POST /api/calls/bulk-tags ────────────────────────────────
+router.post(
+  "/bulk-tags",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const callIds = Array.isArray(req.body?.callIds)
+      ? req.body.callIds.map((id) => String(id || "").trim()).filter(Boolean)
+      : [];
+    if (!callIds.length) {
+      return res
+        .status(400)
+        .json({ error: { message: "callIds are required." } });
+    }
+    const action = ["add", "remove", "replace"].includes(
+      String(req.body?.action || ""),
+    )
+      ? String(req.body.action)
+      : "add";
+    const requestedTags = normalizeTags(req.body?.tags || req.body?.tag || []);
+    if (!requestedTags.length && action !== "replace") {
+      return res
+        .status(400)
+        .json({ error: { message: "At least one tag is required." } });
+    }
+    const { data: rows, error } = await db
+      .from("call_records")
+      .select("id,tags")
+      .eq("organization_id", req.orgId)
+      .in("id", callIds);
+    if (error) throw error;
+    const updates = (rows || []).map((row) => {
+      const tags = mergeTags(row.tags, requestedTags, action);
+      return db
+        .from("call_records")
+        .update({ tags, updated_at: new Date().toISOString() })
+        .eq("id", row.id)
+        .eq("organization_id", req.orgId)
+        .select("id,tags")
+        .maybeSingle();
+    });
+    const settled = await Promise.allSettled(updates);
+    const updated = settled
+      .filter((item) => item.status === "fulfilled" && item.value?.data)
+      .map((item) => item.value.data);
+    res.json({ success: true, updatedCount: updated.length, calls: updated });
+  }),
+);
+
+// ── PATCH /api/calls/:id/tags ────────────────────────────────
+router.patch(
+  "/:id/tags",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const action = ["add", "remove", "replace"].includes(
+      String(req.body?.action || ""),
+    )
+      ? String(req.body.action)
+      : "replace";
+    const requestedTags = normalizeTags(req.body?.tags || req.body?.tag || []);
+    const { data: call, error } = await db
+      .from("call_records")
+      .select("id,tags")
+      .eq("id", req.params.id)
+      .eq("organization_id", req.orgId)
+      .maybeSingle();
+    if (error || !call) {
+      return res
+        .status(404)
+        .json({ error: { message: "Call record not found." } });
+    }
+    const tags = mergeTags(call.tags, requestedTags, action);
+    const { data: updated, error: updateError } = await db
+      .from("call_records")
+      .update({ tags, updated_at: new Date().toISOString() })
+      .eq("id", call.id)
+      .eq("organization_id", req.orgId)
+      .select("id,tags")
+      .maybeSingle();
+    if (updateError) throw updateError;
+    res.json({ success: true, call: updated });
+  }),
+);
 
 // ── GET /api/calls/:id ──────────────────────────────────────
 router.get(
@@ -550,6 +843,20 @@ router.get(
         voice_agent_id: call.voice_agent_id,
         direction: serialized.direction,
         status: serialized.status,
+        call_category: serialized.call_category,
+        callCategory: serialized.callCategory,
+        category_label: serialized.category_label,
+        categoryLabel: serialized.categoryLabel,
+        disposition: serialized.disposition,
+        answered_by: serialized.answered_by,
+        answeredBy: serialized.answeredBy,
+        voicemail_detected: serialized.voicemail_detected,
+        voicemailDetected: serialized.voicemailDetected,
+        screening_detected: serialized.screening_detected,
+        screeningDetected: serialized.screeningDetected,
+        tags: serialized.tags,
+        rerun_eligible: serialized.rerun_eligible,
+        rerunEligible: serialized.rerunEligible,
         from: serialized.from || "",
         to: serialized.to || "",
         duration: serialized.duration,
@@ -561,9 +868,13 @@ router.get(
         recording_storage_provider: call.recording_storage_provider || null,
         recording_storage_path: call.recording_storage_path || null,
         metadata: redactCallMetadata({
-          voicemail_detected: call.metadata?.voicemail_detected,
-          answered_by: call.metadata?.answered_by,
+          call_category: serialized.call_category,
+          disposition: serialized.disposition,
+          voicemail_detected: serialized.voicemail_detected,
+          screening_detected: serialized.screening_detected,
+          answered_by: serialized.answered_by || call.metadata?.answered_by,
           machine_detection_result: call.metadata?.machine_detection_result,
+          tags: serialized.tags,
           hangup_reason:
             call.metadata?.hangup_reason ||
             call.metadata?.call_end_details?.reason,
@@ -729,7 +1040,28 @@ router.get(
       .eq("organization_id", req.orgId)
       .order("created_at", { ascending: false })
       .range(from, to);
-    if (req.query.status) query = query.eq("status", String(req.query.status));
+    if (req.query.status && String(req.query.status) !== "all") {
+      query = query.eq("status", String(req.query.status));
+    }
+    const requestedAgentId = firstNonEmpty(
+      req.query.voiceAgentId,
+      req.query.voice_agent_id,
+    );
+    if (requestedAgentId && requestedAgentId !== "all") {
+      query = query.eq("voice_agent_id", requestedAgentId);
+    }
+    const requestedCategory = firstNonEmpty(
+      req.query.callCategory,
+      req.query.call_category,
+      req.query.category,
+    );
+    if (requestedCategory && requestedCategory !== "all") {
+      query = query.eq("call_category", requestedCategory);
+    }
+    const requestedTag = firstNonEmpty(req.query.tag, req.query.tags);
+    if (requestedTag && requestedTag !== "all") {
+      query = query.contains("tags", [requestedTag.toLowerCase()]);
+    }
     const { data, error, count } = await query;
     if (error) throw error;
 
@@ -818,15 +1150,39 @@ router.get(
         console.warn("[calls] reconciliation failed", err),
       );
     }
-    if (req.query.direction) {
+    if (req.query.direction && String(req.query.direction) !== "all") {
       const requestedDirection = String(req.query.direction).toLowerCase();
       calls = calls.filter((call) => call.direction === requestedDirection);
+    }
+    if (requestedCategory && requestedCategory !== "all") {
+      calls = calls.filter((call) => call.call_category === requestedCategory);
+    }
+    if (requestedAgentId && requestedAgentId !== "all") {
+      calls = calls.filter((call) => call.voice_agent_id === requestedAgentId);
+    }
+    const requestedCampaignId = firstNonEmpty(
+      req.query.campaignId,
+      req.query.campaign_id,
+      req.query.scheduleId,
+      req.query.schedule_id,
+    );
+    if (requestedCampaignId && requestedCampaignId !== "all") {
+      calls = calls.filter(
+        (call) =>
+          call.campaign_id === requestedCampaignId ||
+          call.schedule_id === requestedCampaignId,
+      );
+    }
+    if (requestedTag && requestedTag !== "all") {
+      calls = calls.filter((call) =>
+        (call.tags || []).includes(requestedTag.toLowerCase()),
+      );
     }
 
     const { data: metricRows, error: metricError } = await db
       .from("call_records")
       .select(
-        "id,status,outcome,duration,recording_duration,started_at,answered_at,ended_at,completed_at,metadata",
+        "id,status,outcome,duration,recording_duration,started_at,answered_at,ended_at,completed_at,metadata,call_category,disposition,answered_by,voicemail_detected,screening_detected,tags",
       )
       .eq("organization_id", req.orgId)
       .limit(1000);
@@ -835,13 +1191,33 @@ router.get(
       (acc, row) => {
         const status = derivedStatus(row);
         const duration = durationSeconds(row);
+        const category = normalizeCallCategory(row);
         acc.totalCalls += 1;
         if (status === "completed") acc.completed += 1;
         if (status === "failed" || status === "cancelled") acc.failed += 1;
         acc.durationSum += duration;
+        acc.categories[category] = (acc.categories[category] || 0) + 1;
+        if (category === "answered_human") acc.answeredHuman += 1;
+        if (category === "voicemail" || category === "left_voicemail")
+          acc.voicemail += 1;
+        if (category === "no_answer") acc.noAnswer += 1;
+        if (category === "screened" || category === "screened_then_connected")
+          acc.screened += 1;
+        if (isRerunEligibleCategory(category)) acc.rerunEligible += 1;
         return acc;
       },
-      { totalCalls: 0, completed: 0, failed: 0, durationSum: 0 },
+      {
+        totalCalls: 0,
+        completed: 0,
+        failed: 0,
+        durationSum: 0,
+        categories: {},
+        answeredHuman: 0,
+        voicemail: 0,
+        noAnswer: 0,
+        screened: 0,
+        rerunEligible: 0,
+      },
     );
     const avgDuration = metrics.totalCalls
       ? Math.round(metrics.durationSum / metrics.totalCalls)
@@ -858,6 +1234,12 @@ router.get(
         completed: metrics.completed,
         failed: metrics.failed,
         avgDuration,
+        categories: metrics.categories,
+        answeredHuman: metrics.answeredHuman,
+        voicemail: metrics.voicemail,
+        noAnswer: metrics.noAnswer,
+        screened: metrics.screened,
+        rerunEligible: metrics.rerunEligible,
       },
     });
   }),
@@ -924,7 +1306,7 @@ router.post(
     const db = getSupabase();
     const { data: call, error } = await db
       .from("call_records")
-      .select("id,transcript,outcome")
+      .select("*")
       .eq("id", req.params.id)
       .eq("organization_id", req.orgId)
       .maybeSingle();
@@ -932,22 +1314,56 @@ router.post(
       return res
         .status(404)
         .json({ error: { message: "Call record not found." } });
-    const transcriptText = (call.transcript || [])
+
+    const transcriptRows = Array.isArray(call.transcript)
+      ? call.transcript
+      : [];
+    const transcriptText = transcriptRows
       .map(
         (l) =>
-          `${l.speaker || l.role || "speaker"}: ${l.text || l.transcript || ""}`,
+          `${l.speaker || l.role || "speaker"}: ${l.text || l.transcript || l.content || ""}`,
       )
-      .join("\n");
-    const summary = await generateCallSummary(
-      transcriptText,
-      call.outcome || "completed",
-    );
-    await db
+      .join("\n")
+      .trim();
+
+    const fallbackSummary = () => {
+      if (call.summary) return String(call.summary);
+      if (!transcriptText)
+        return "No transcript is available yet, so a summary could not be generated for this call.";
+      const firstLines = transcriptText
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .slice(0, 5)
+        .join(" ");
+      return firstLines
+        ? `Call summary based on available transcript: ${firstLines}`
+        : "Call completed.";
+    };
+
+    let summary = "";
+    try {
+      summary = transcriptText
+        ? await generateCallSummary(transcriptText, call.outcome || "completed")
+        : fallbackSummary();
+    } catch (summaryError) {
+      console.warn("Call summary generation failed:", summaryError.message);
+      summary = fallbackSummary();
+    }
+
+    const { data: updatedCall } = await db
       .from("call_records")
       .update({ summary, updated_at: new Date().toISOString() })
       .eq("id", call.id)
-      .eq("organization_id", req.orgId);
-    res.json({ success: true, callId: call.id, summary });
+      .eq("organization_id", req.orgId)
+      .select("*")
+      .maybeSingle();
+    res.json({
+      success: true,
+      callId: call.id,
+      summary,
+      call: updatedCall ? serializeCall(updatedCall) : { id: call.id, summary },
+    });
   }),
 );
 

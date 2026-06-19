@@ -58,6 +58,35 @@ router.post(
       business_hours: body.businessHours || "9am-5pm Monday-Friday",
       escalation_phone: body.escalationPhone || "",
       voicemail_fallback: body.voicemailFallback ?? true,
+      voicemail_behavior:
+        body.voicemailBehavior ||
+        body.voicemail_settings?.action ||
+        body.voicemailSettings?.action ||
+        "hangup",
+      voicemail_message:
+        body.voicemailMessage ||
+        body.voicemail_settings?.message ||
+        body.voicemailSettings?.message ||
+        "",
+      voicemail_callback_delay_minutes: Number(
+        body.voicemailCallbackDelayMinutes ||
+          body.voicemail_settings?.callbackDelayMinutes ||
+          body.voicemailSettings?.callbackDelayMinutes ||
+          60,
+      ),
+      voicemail_max_redial_attempts: Number(
+        body.voicemailMaxRedialAttempts ||
+          body.voicemail_settings?.maxRedialAttempts ||
+          body.voicemailSettings?.maxRedialAttempts ||
+          1,
+      ),
+      voicemail_settings:
+        body.voicemailSettings || body.voicemail_settings || {},
+      call_screening_enabled: body.callScreeningEnabled !== false,
+      call_screening_message:
+        body.callScreeningMessage || body.call_screening_message || "",
+      call_screening_settings:
+        body.callScreeningSettings || body.call_screening_settings || {},
       data_capture_fields: body.dataCaptureFields || [
         "name",
         "phone",
@@ -130,6 +159,32 @@ router.patch(
       updates.escalation_phone = body.escalationPhone;
     if (body.voicemailFallback !== undefined)
       updates.voicemail_fallback = body.voicemailFallback;
+    if (body.voicemailBehavior !== undefined)
+      updates.voicemail_behavior = body.voicemailBehavior || "hangup";
+    if (body.voicemailMessage !== undefined)
+      updates.voicemail_message = body.voicemailMessage || "";
+    if (body.voicemailCallbackDelayMinutes !== undefined)
+      updates.voicemail_callback_delay_minutes =
+        Number(body.voicemailCallbackDelayMinutes) || 60;
+    if (body.voicemailMaxRedialAttempts !== undefined)
+      updates.voicemail_max_redial_attempts =
+        Number(body.voicemailMaxRedialAttempts) || 1;
+    if (
+      body.voicemailSettings !== undefined ||
+      body.voicemail_settings !== undefined
+    )
+      updates.voicemail_settings =
+        body.voicemailSettings || body.voicemail_settings || {};
+    if (body.callScreeningEnabled !== undefined)
+      updates.call_screening_enabled = body.callScreeningEnabled !== false;
+    if (body.callScreeningMessage !== undefined)
+      updates.call_screening_message = body.callScreeningMessage || "";
+    if (
+      body.callScreeningSettings !== undefined ||
+      body.call_screening_settings !== undefined
+    )
+      updates.call_screening_settings =
+        body.callScreeningSettings || body.call_screening_settings || {};
     if (body.dataCaptureFields !== undefined)
       updates.data_capture_fields = body.dataCaptureFields;
     if (body.rules !== undefined) updates.rules = body.rules;

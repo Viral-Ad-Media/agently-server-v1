@@ -21,6 +21,11 @@ const {
   isUuid,
 } = require("../../lib/knowledge-bases");
 
+const {
+  searchScopedKnowledgeChunks,
+  searchScopedFaqs,
+} = require("../../lib/knowledge-retrieval");
+
 const router = express.Router();
 
 function requestedWebsite(body = {}) {
@@ -415,6 +420,354 @@ router.delete(
       return res.status(500).json({ error: { message: error.message || "Failed to delete source." } });
     }
     res.json({ success: true });
+  }),
+);
+
+router.post(
+  "/:id/sources/:sourceId/sync",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const base = await verifyKnowledgeBase(db, {
+      organizationId: req.orgId,
+      knowledgeBaseId: req.params.id,
+    });
+    if (!base?.id) {
+      return res.status(404).json({ error: { message: "Knowledge base not found." } });
+    }
+
+    const { data: source, error: sourceError } = await db
+      .from("knowledge_sources")
+      .select("*")
+      .eq("id", req.params.sourceId)
+      .eq("knowledge_base_id", req.params.id)
+      .eq("organization_id", req.orgId)
+      .maybeSingle();
+
+    if (sourceError || !source?.id) {
+      return res.status(404).json({ error: { message: "Source not found." } });
+    }
+
+    let scrapeAndStore;
+    try {
+      ({ scrapeAndStore } = require("../../lib/scraper.service"));
+    } catch (depErr) {
+      console.error("[knowledge-bases] scraper.service failed to load:", depErr.message);
+      return res.status(500).json({
+        error: {
+          message:
+            "Website scraping is temporarily unavailable. A server dependency is missing. Please contact support.",
+          detail: depErr.message,
+        },
+      });
+    }
+
+    await db
+      .from("knowledge_sources")
+      .update({
+        scrape_status: "scraping",
+        last_error: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", source.id)
+      .eq("organization_id", req.orgId);
+
+    await db
+      .from("knowledge_bases")
+      .update({
+        sync_status: "scraping",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", base.id)
+      .eq("organization_id", req.orgId);
+
+    try {
+      const result = await scrapeAndStore({
+        url: source.normalized_url || source.url,
+        organizationId: req.orgId,
+        voiceAgentId: null,
+        chatbotId: null,
+        knowledgeBaseId: base.id,
+        knowledgeSourceId: source.id,
+      });
+
+      const { data: updatedSource } = await db
+        .from("knowledge_sources")
+        .select("*")
+        .eq("id", source.id)
+        .eq("organization_id", req.orgId)
+        .maybeSingle();
+
+      res.json({
+        success: true,
+        chunksStored: result.chunksStored || 0,
+        pagesScraped: result.pagesScraped || 0,
+        pagesDiscovered: result.pagesDiscovered || 0,
+        productsFound: result.productsFound || 0,
+        productsStored: result.productsStored || 0,
+        strategy: result.strategy || "scraper-v2",
+        source: serializeKnowledgeSource(updatedSource || source),
+        result,
+      });
+    } catch (error) {
+      const message = error?.message || "Failed to sync this source.";
+      await db
+        .from("knowledge_sources")
+        .update({
+          scrape_status: "failed",
+          last_error: message,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", source.id)
+        .eq("organization_id", req.orgId);
+      await db
+        .from("knowledge_bases")
+        .update({
+          sync_status: "failed",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", base.id)
+        .eq("organization_id", req.orgId);
+      return res.status(500).json({ error: { message } });
+    }
+  }),
+);
+
+function serializeFaqRow(row) {
+  return {
+    id: row.id,
+    question: row.question || "",
+    answer: row.answer || "",
+    knowledgeBaseId: row.knowledge_base_id || null,
+    knowledgeSourceId: row.knowledge_source_id || null,
+    voiceAgentId: row.voice_agent_id || null,
+    chatbotId: row.chatbot_id || null,
+    sourceType: row.source_type || "manual",
+    metadata: row.metadata || {},
+    createdAt: row.created_at || null,
+    updatedAt: row.updated_at || null,
+  };
+}
+
+function normalizeFaqPayload(value) {
+  return (Array.isArray(value) ? value : [])
+    .slice(0, 120)
+    .map((item) => ({
+      question: cleanText(item?.question || item?.q || ""),
+      answer: cleanText(item?.answer || item?.a || ""),
+    }))
+    .filter((item) => item.question && item.answer);
+}
+
+router.get(
+  "/:id/faqs",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const base = await verifyKnowledgeBase(db, {
+      organizationId: req.orgId,
+      knowledgeBaseId: req.params.id,
+    });
+    if (!base?.id) {
+      return res.status(404).json({ error: { message: "Knowledge base not found." } });
+    }
+
+    const { data, error } = await db
+      .from("faqs")
+      .select("id,question,answer,voice_agent_id,chatbot_id,knowledge_base_id,knowledge_source_id,source_type,metadata,created_at,updated_at")
+      .eq("organization_id", req.orgId)
+      .eq("knowledge_base_id", req.params.id)
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      return res.status(500).json({ error: { message: error.message || "Failed to load FAQs." } });
+    }
+
+    const faqs = (data || []).map(serializeFaqRow);
+    res.json({
+      knowledgeBaseId: req.params.id,
+      faqs,
+      manualFaqs: faqs.filter((faq) =>
+        ["manual", "knowledge_base_manual", "chatbot_manual"].includes(String(faq.sourceType || "").toLowerCase()),
+      ),
+    });
+  }),
+);
+
+router.put(
+  "/:id/faqs",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const base = await verifyKnowledgeBase(db, {
+      organizationId: req.orgId,
+      knowledgeBaseId: req.params.id,
+    });
+    if (!base?.id) {
+      return res.status(404).json({ error: { message: "Knowledge base not found." } });
+    }
+
+    const faqs = normalizeFaqPayload(req.body?.faqs);
+    const chatbotId = isUuid(req.body?.chatbotId || req.body?.chatbot_id || "")
+      ? String(req.body.chatbotId || req.body.chatbot_id)
+      : null;
+    const voiceAgentId = isUuid(req.body?.voiceAgentId || req.body?.voice_agent_id || "")
+      ? String(req.body.voiceAgentId || req.body.voice_agent_id)
+      : null;
+
+    let deleteQuery = db
+      .from("faqs")
+      .delete()
+      .eq("organization_id", req.orgId)
+      .eq("knowledge_base_id", req.params.id)
+      .in("source_type", ["manual", "knowledge_base_manual", "chatbot_manual"]);
+    await deleteQuery;
+
+    if (faqs.length) {
+      const rows = faqs.map((faq) => ({
+        organization_id: req.orgId,
+        knowledge_base_id: req.params.id,
+        chatbot_id: chatbotId,
+        voice_agent_id: voiceAgentId,
+        question: faq.question,
+        answer: faq.answer,
+        source_type: "knowledge_base_manual",
+        metadata: {
+          source: "knowledge_base_manual_editor",
+          updatedFrom: chatbotId ? "chatbot_page" : voiceAgentId ? "voice_agent_page" : "knowledge_base_page",
+        },
+      }));
+      const { error: insertError } = await db.from("faqs").insert(rows);
+      if (insertError) {
+        return res.status(500).json({ error: { message: insertError.message || "Failed to save FAQs." } });
+      }
+    }
+
+    const { data, error } = await db
+      .from("faqs")
+      .select("id,question,answer,voice_agent_id,chatbot_id,knowledge_base_id,knowledge_source_id,source_type,metadata,created_at,updated_at")
+      .eq("organization_id", req.orgId)
+      .eq("knowledge_base_id", req.params.id)
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      return res.status(500).json({ error: { message: error.message || "Failed to reload FAQs." } });
+    }
+
+    const allFaqs = (data || []).map(serializeFaqRow);
+    res.json({
+      success: true,
+      knowledgeBaseId: req.params.id,
+      faqs: allFaqs,
+      manualFaqs: allFaqs.filter((faq) =>
+        ["manual", "knowledge_base_manual", "chatbot_manual"].includes(String(faq.sourceType || "").toLowerCase()),
+      ),
+    });
+  }),
+);
+
+router.post(
+  "/:id/search",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const base = await verifyKnowledgeBase(db, {
+      organizationId: req.orgId,
+      knowledgeBaseId: req.params.id,
+    });
+    if (!base?.id) {
+      return res.status(404).json({ error: { message: "Knowledge base not found." } });
+    }
+
+    const query = cleanText(req.body?.query || req.body?.q || "");
+    const limit = Math.min(Math.max(Number(req.body?.limit || 12), 1), 25);
+    const [chunks, faqs] = await Promise.all([
+      searchScopedKnowledgeChunks(db, {
+        organizationId: req.orgId,
+        knowledgeBaseIds: [req.params.id],
+        query,
+        limit,
+        maxChars: Math.min(Math.max(Number(req.body?.maxChars || 900), 300), 1800),
+      }),
+      searchScopedFaqs(db, {
+        organizationId: req.orgId,
+        knowledgeBaseIds: [req.params.id],
+        query,
+        limit: Math.min(limit, 12),
+      }),
+    ]);
+
+    res.json({
+      query,
+      knowledgeBaseId: req.params.id,
+      chunks,
+      faqs,
+      stats: {
+        chunks: chunks.length,
+        faqs: faqs.length,
+      },
+    });
+  }),
+);
+
+router.get(
+  "/:id/products",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const base = await verifyKnowledgeBase(db, {
+      organizationId: req.orgId,
+      knowledgeBaseId: req.params.id,
+    });
+    if (!base?.id) {
+      return res.status(404).json({ error: { message: "Knowledge base not found." } });
+    }
+
+    const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 250);
+    let query = db
+      .from("scraped_products")
+      .select("id,name,slug,url,description,price,price_text,currency,availability,brand,sku,image_url,variants,raw_source,knowledge_source_id,metadata,created_at,updated_at")
+      .eq("organization_id", req.orgId)
+      .eq("knowledge_base_id", req.params.id)
+      .order("name", { ascending: true })
+      .limit(limit);
+    if (req.query.sourceId) {
+      query = query.eq("knowledge_source_id", String(req.query.sourceId));
+    }
+
+    const { data, error } = await query;
+    if (error) {
+      const msg = String(error.message || "").toLowerCase();
+      if (msg.includes("does not exist") || msg.includes("schema cache") || msg.includes("could not find")) {
+        return res.json({ products: [] });
+      }
+      return res.status(500).json({ error: { message: error.message } });
+    }
+
+    res.json({
+      products: (data || []).map((product) => ({
+        id: product.id,
+        name: product.name,
+        slug: product.slug,
+        url: product.url,
+        description: product.description || "",
+        price: product.price,
+        priceText: product.price_text || "",
+        currency: product.currency || "",
+        availability: product.availability || "",
+        brand: product.brand || "",
+        sku: product.sku || "",
+        imageUrl: product.image_url || "",
+        variants: product.variants || [],
+        rawSource: product.raw_source || "",
+        knowledgeSourceId: product.knowledge_source_id || null,
+        metadata: product.metadata || {},
+        createdAt: product.created_at || null,
+        updatedAt: product.updated_at || null,
+      })),
+    });
   }),
 );
 

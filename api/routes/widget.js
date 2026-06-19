@@ -2,6 +2,10 @@
 
 const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
+const {
+  getAssignedKnowledgeBaseIdsForChatbot,
+} = require("../../lib/knowledge-bases");
+const { searchScopedFaqs } = require("../../lib/knowledge-retrieval");
 
 const router = express.Router();
 
@@ -35,7 +39,7 @@ router.get("/:id", async (req, res) => {
       (Array.isArray(chatbot.chat_languages) ? chatbot.chat_languages : ["en"]);
     const chatVoice = queryVoice || chatbot.chat_voice || "alloy";
 
-    // Resolve agent name for the lead tag and system prompt
+    // Resolve agent name for the lead tag and system prompt.
     let agentName = chatbot.name || chatbot.header_title || "Assistant";
     if (chatbot.voice_agent_id) {
       try {
@@ -46,6 +50,35 @@ router.get("/:id", async (req, res) => {
           .single();
         if (agent && agent.name) agentName = agent.name;
       } catch (_) {}
+    }
+
+    // Strict Knowledge Base isolation for the deployed widget. Legacy chatbot.faqs
+    // are not scoped and must not be exposed once a Knowledge Base is assigned.
+    let scopedWidgetFaqs = [];
+    try {
+      const knowledgeBaseIds = await getAssignedKnowledgeBaseIdsForChatbot(db, {
+        organizationId: chatbot.organization_id,
+        chatbotId: id,
+        voiceAgentId: chatbot.voice_agent_id || null,
+        organization: { id: chatbot.organization_id },
+      });
+      if (knowledgeBaseIds.length) {
+        scopedWidgetFaqs = await searchScopedFaqs(db, {
+          organizationId: chatbot.organization_id,
+          chatbotId: id,
+          knowledgeBaseIds,
+          query: "",
+          limit: 8,
+        });
+      } else {
+        scopedWidgetFaqs = Array.isArray(chatbot.faqs) ? chatbot.faqs : [];
+      }
+    } catch (faqErr) {
+      console.warn(
+        "[widget] scoped FAQ load failed:",
+        faqErr.message || faqErr,
+      );
+      scopedWidgetFaqs = [];
     }
 
     const cfg = {
@@ -64,7 +97,9 @@ router.get("/:id", async (req, res) => {
           ? chatbot.suggested_prompts
           : [],
       ),
-      faqs: JSON.stringify(Array.isArray(chatbot.faqs) ? chatbot.faqs : []),
+      faqs: JSON.stringify(
+        Array.isArray(scopedWidgetFaqs) ? scopedWidgetFaqs : [],
+      ),
       chatLanguages: JSON.stringify(chatLanguages),
       chatVoice: safeStr(chatVoice),
       realtimeWsUrl: safeStr(

@@ -57,11 +57,56 @@ function platformNumberConfig() {
   };
 }
 
+async function resolvePlatformNumberConfig(db, organizationId) {
+  const envConfig = platformNumberConfig();
+  if (envConfig.configured && isE164(envConfig.number)) return envConfig;
+  if (!db) return envConfig;
+
+  try {
+    const query = db
+      .from("twilio_phone_numbers")
+      .select(
+        "phone_number, phone_sid, sid, number_type, source, purchase_origin, is_platform_test_number",
+      )
+      .eq("organization_id", organizationId)
+      .or(
+        "is_platform_test_number.eq.true,number_type.eq.platform_test,source.eq.platform_test,purchase_origin.eq.platform_test_pool,purchase_origin.eq.platform_beta_test_pool",
+      )
+      .order("created_at", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    const { data, error } = await query;
+    if (error) {
+      console.warn(
+        "[test-agent] platform test number lookup skipped:",
+        error.message,
+      );
+      return envConfig;
+    }
+    const number = normalizePhone(data?.phone_number || "");
+    if (isE164(number)) {
+      return {
+        number,
+        sid: String(data?.phone_sid || data?.sid || "").trim(),
+        configured: true,
+        source: "database",
+      };
+    }
+  } catch (error) {
+    console.warn(
+      "[test-agent] platform test number lookup failed:",
+      error.message,
+    );
+  }
+
+  return envConfig;
+}
+
 function limits() {
   return {
     maxCalls: intEnv("PLATFORM_TEST_MAX_CALLS", 3, 1),
     maxRecipientsPerRequest: intEnv("PLATFORM_TEST_MAX_RECIPIENTS", 3, 1),
-    maxCallSeconds: intEnv("PLATFORM_TEST_MAX_CALL_SECONDS", 300, 30),
+    maxCallSeconds: intEnv("PLATFORM_TEST_MAX_CALL_SECONDS", 100, 30),
   };
 }
 
@@ -161,7 +206,7 @@ async function updateUsageConfig(db, usageId, body = {}) {
 }
 
 async function ensureHiddenTestAgent(db, req, usageRow) {
-  const platform = platformNumberConfig();
+  const platform = await resolvePlatformNumberConfig(db, req.orgId);
   if (!platform.configured || !isE164(platform.number)) {
     const err = new Error(
       "Platform test phone number is not configured. Set PLATFORM_TEST_PHONE_NUMBER to an E.164 number.",
@@ -257,7 +302,7 @@ async function ensureHiddenTestAgent(db, req, usageRow) {
 }
 
 async function ensureHiddenTestNumber(db, req, agent) {
-  const platform = platformNumberConfig();
+  const platform = await resolvePlatformNumberConfig(db, req.orgId);
   const phoneSid = platform.sid || `platform-test-${req.orgId}`;
 
   const { data: existing } = await db
@@ -400,7 +445,7 @@ function getInstructions(body, usage, maxCallSeconds) {
   );
   return [
     userInstructions,
-    `Trial test mode: this call is limited to ${Math.ceil(maxCallSeconds / 60)} minutes. Keep the conversation focused, helpful, and concise.`,
+    `Trial test mode: this call is limited to ${maxCallSeconds} seconds. Keep the conversation focused, helpful, and concise.`,
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -457,7 +502,7 @@ router.get(
     const db = getSupabase();
     const usage = await getUsage(db, req.orgId);
     const limitConfig = limits();
-    const platform = platformNumberConfig();
+    const platform = await resolvePlatformNumberConfig(db, req.orgId);
     let testAgent = null;
     if (usage.test_voice_agent_id) {
       const { data } = await db
@@ -544,26 +589,22 @@ router.post(
         ],
     );
     if (!recipients.length) {
-      return res
-        .status(400)
-        .json({
-          error: {
-            code: "RECIPIENT_REQUIRED",
-            message:
-              "Add one valid phone number. US formats like (123) 456-7890 and +1 123 456 7890 are accepted.",
-          },
-        });
+      return res.status(400).json({
+        error: {
+          code: "RECIPIENT_REQUIRED",
+          message:
+            "Add one valid phone number. US formats like (123) 456-7890 and +1 123 456 7890 are accepted.",
+        },
+      });
     }
     if (recipients.length > 1) {
-      return res
-        .status(400)
-        .json({
-          error: {
-            code: "ONE_CALL_NOW_RECIPIENT",
-            message:
-              "Call Now supports one test recipient at a time. Use Schedule Test Call for multiple recipients.",
-          },
-        });
+      return res.status(400).json({
+        error: {
+          code: "ONE_CALL_NOW_RECIPIENT",
+          message:
+            "Call Now supports one test recipient at a time. Use Schedule Test Call for multiple recipients.",
+        },
+      });
     }
     const consumed = await consumeTrials(db, req.orgId, 1);
     try {
@@ -658,25 +699,21 @@ router.post(
       req.body?.recipients || req.body?.directRecipients || [],
     );
     if (!recipients.length) {
-      return res
-        .status(400)
-        .json({
-          error: {
-            code: "RECIPIENTS_REQUIRED",
-            message:
-              "Add at least one valid phone number. US formats like (123) 456-7890 and +1 123 456 7890 are accepted.",
-          },
-        });
+      return res.status(400).json({
+        error: {
+          code: "RECIPIENTS_REQUIRED",
+          message:
+            "Add at least one valid phone number. US formats like (123) 456-7890 and +1 123 456 7890 are accepted.",
+        },
+      });
     }
     if (recipients.length > limitConfig.maxRecipientsPerRequest) {
-      return res
-        .status(400)
-        .json({
-          error: {
-            code: "TOO_MANY_TEST_RECIPIENTS",
-            message: `A test schedule can include at most ${limitConfig.maxRecipientsPerRequest} recipients.`,
-          },
-        });
+      return res.status(400).json({
+        error: {
+          code: "TOO_MANY_TEST_RECIPIENTS",
+          message: `A test schedule can include at most ${limitConfig.maxRecipientsPerRequest} recipients.`,
+        },
+      });
     }
     const consumed = await consumeTrials(db, req.orgId, recipients.length);
     try {

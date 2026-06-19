@@ -208,6 +208,898 @@ function scheduleValidationResponse(res, error) {
   });
 }
 
+const RERUN_ELIGIBLE_CATEGORIES = new Set([
+  "voicemail",
+  "left_voicemail",
+  "no_answer",
+  "busy",
+  "failed",
+  "unavailable",
+  "callback_scheduled",
+  "manual_followup_required",
+  "screened",
+]);
+
+const RERUN_PROTECTED_CATEGORIES = new Set([
+  "answered_human",
+  "screened_then_connected",
+  "opted_out",
+  "transferred",
+]);
+
+function normalizeRerunCategory(value) {
+  const raw = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+  if (!raw) return "unknown";
+  const aliases = {
+    unanswered: "no_answer",
+    noanswer: "no_answer",
+    no_answered: "no_answer",
+    noanswercall: "no_answer",
+    machine: "voicemail",
+    answering_machine: "voicemail",
+    voicemail_left: "left_voicemail",
+    left_message: "left_voicemail",
+    message_left: "left_voicemail",
+    human: "answered_human",
+    answered: "answered_human",
+    connected: "answered_human",
+    error: "failed",
+    provider_failed: "failed",
+    invalid: "unavailable",
+    not_in_service: "unavailable",
+    follow_up: "manual_followup_required",
+    manual_followup: "manual_followup_required",
+  };
+  return aliases[raw] || raw;
+}
+
+function normalizeRerunCategoryList(value) {
+  const items = normalizeArray(value);
+  return [
+    ...new Set(
+      items
+        .flatMap((item) => String(item || "").split(","))
+        .map((item) => normalizeRerunCategory(item))
+        .filter((item) => item && item !== "all"),
+    ),
+  ];
+}
+
+function isRerunEligibleCategory(category, { includeProtected = false } = {}) {
+  const normalized = normalizeRerunCategory(category);
+  if (RERUN_PROTECTED_CATEGORIES.has(normalized) && !includeProtected)
+    return false;
+  return RERUN_ELIGIBLE_CATEGORIES.has(normalized);
+}
+
+function metadataObject(value) {
+  if (!value) return {};
+  if (typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? parsed
+        : {};
+    } catch (_) {
+      return {};
+    }
+  }
+  return {};
+}
+
+function stringValue(...values) {
+  for (const value of values) {
+    if (value === undefined || value === null) continue;
+    const text = String(value).trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function safeTags(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) =>
+        String(item || "")
+          .trim()
+          .toLowerCase(),
+      )
+      .filter(Boolean);
+  }
+  if (typeof value === "string") {
+    return value
+      .split(",")
+      .map((item) => item.trim().toLowerCase())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function categoryFromCallOrRun(call = null, run = null) {
+  const callMeta = metadataObject(call?.metadata || call?.call_metadata);
+  const runMeta = metadataObject(run?.outcome_metadata || run?.metadata);
+  const explicit = stringValue(
+    call?.call_category,
+    call?.callCategory,
+    callMeta.call_category,
+    callMeta.callCategory,
+    runMeta.call_category,
+    runMeta.callCategory,
+    runMeta.outcome,
+    runMeta.displayOutcome,
+  );
+  if (explicit) return normalizeRerunCategory(explicit);
+  const text = [
+    call?.status,
+    call?.outcome,
+    call?.disposition,
+    call?.answered_by,
+    callMeta.disposition,
+    callMeta.answered_by,
+    callMeta.machine_detection_result,
+    callMeta.hangup_reason,
+    run?.status,
+    run?.error_code,
+    run?.error_message,
+    detailedOutcome(run || {}),
+  ]
+    .map((item) => String(item || "").toLowerCase())
+    .join(" ");
+  if (
+    call?.voicemail_detected ||
+    callMeta.voicemail_detected ||
+    /voicemail|machine|answering_machine/.test(text)
+  )
+    return "voicemail";
+  if (
+    call?.screening_detected ||
+    callMeta.screening_detected ||
+    /screen/.test(text)
+  )
+    return "screened";
+  if (/busy/.test(text)) return "busy";
+  if (/no[-_ ]?answer|unanswered|did not pick|not picked/.test(text))
+    return "no_answer";
+  if (/unavailable|invalid|not in service|not reachable/.test(text))
+    return "unavailable";
+  if (/callback/.test(text)) return "callback_scheduled";
+  if (/follow/.test(text)) return "manual_followup_required";
+  if (/opt[_ -]?out|do not call/.test(text)) return "opted_out";
+  if (/transfer/.test(text)) return "transferred";
+  if (/failed|error|cancelled|canceled/.test(text)) return "failed";
+  if (/completed|answered/.test(text)) return "answered_human";
+  return "unknown";
+}
+
+function phoneFromCallOrRun(call = null, run = null) {
+  const callMeta = metadataObject(call?.metadata || call?.call_metadata);
+  const directRecipient = metadataObject(
+    callMeta.directRecipient ||
+      callMeta.direct_recipient ||
+      callMeta.recipient ||
+      callMeta.target,
+  );
+  const outboundCandidate = stringValue(
+    run?.destination_phone,
+    run?.target_phone,
+    call?.destination_phone,
+    call?.target_phone,
+    call?.to,
+    callMeta.destination_phone,
+    callMeta.target_phone,
+    callMeta.to,
+    callMeta.to_phone,
+    directRecipient.phone,
+  );
+  if (outboundCandidate) return cleanPhone(outboundCandidate);
+  return cleanPhone(
+    stringValue(
+      call?.caller_phone,
+      call?.from,
+      callMeta.caller_phone,
+      callMeta.from,
+      callMeta.from_phone,
+    ),
+  );
+}
+
+function nameFromCallOrRun(call = null, run = null) {
+  const callMeta = metadataObject(call?.metadata || call?.call_metadata);
+  const directRecipient = metadataObject(
+    callMeta.directRecipient ||
+      callMeta.direct_recipient ||
+      callMeta.recipient ||
+      callMeta.target,
+  );
+  const value = stringValue(
+    run?.target_name,
+    call?.target_name,
+    call?.recipient_name,
+    call?.caller_name,
+    callMeta.target_name,
+    callMeta.recipient_name,
+    callMeta.caller_name,
+    directRecipient.name,
+  );
+  return value && !/^unknown caller$/i.test(value) ? value : "Rerun recipient";
+}
+
+function leadIdFromCallOrRun(call = null, run = null) {
+  const callMeta = metadataObject(call?.metadata || call?.call_metadata);
+  const id = stringValue(
+    run?.lead_id,
+    call?.lead_id,
+    callMeta.lead_id,
+    callMeta.leadId,
+  );
+  return isUuid(id) ? id : null;
+}
+
+function voiceAgentFromCallOrRun(call = null, run = null) {
+  const callMeta = metadataObject(call?.metadata || call?.call_metadata);
+  const id = stringValue(
+    run?.voice_agent_id,
+    call?.voice_agent_id,
+    callMeta.voice_agent_id,
+    callMeta.voiceAgentId,
+  );
+  return isUuid(id) ? id : null;
+}
+
+function scheduleStartParts(body = {}, timezone = "America/New_York") {
+  const explicitDate = stringValue(
+    body.startLocalDate,
+    body.start_local_date,
+    body.date,
+  );
+  const explicitTime = stringValue(body.startTime, body.start_time, body.time);
+  if (explicitDate && explicitTime)
+    return { date: explicitDate, time: explicitTime };
+  const iso = stringValue(
+    body.startAt,
+    body.start_at,
+    body.scheduledFor,
+    body.scheduled_for,
+  );
+  const date = iso ? new Date(iso) : new Date(Date.now() + 5 * 60 * 1000);
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const parts = Object.fromEntries(
+    formatter.formatToParts(date).map((part) => [part.type, part.value]),
+  );
+  const hour = String(parts.hour === "24" ? "00" : parts.hour).padStart(2, "0");
+  return {
+    date: `${parts.year}-${parts.month}-${parts.day}`,
+    time: `${hour}:${parts.minute}`,
+  };
+}
+
+function buildCandidate(call = null, run = null) {
+  const category = categoryFromCallOrRun(call, run);
+  const phone = phoneFromCallOrRun(call, run);
+  const leadId = leadIdFromCallOrRun(call, run);
+  const voiceAgentId = voiceAgentFromCallOrRun(call, run);
+  return {
+    callId: call?.id || run?.call_record_id || null,
+    runId: run?.id || null,
+    sourceScheduleId: run?.schedule_id || null,
+    leadId,
+    voiceAgentId,
+    phone,
+    name: nameFromCallOrRun(call, run),
+    category,
+    status: call?.status || run?.status || "",
+    tags: safeTags(call?.tags),
+    eligible: isE164(phone) && isRerunEligibleCategory(category),
+  };
+}
+
+function filterAndDedupeRerunCandidates(candidates, body = {}) {
+  const includeProtected =
+    body.includeProtected === true || body.include_protected === true;
+  const eligibleOnly =
+    body.eligibleOnly !== false && body.eligible_only !== false;
+  const categories = normalizeRerunCategoryList(
+    body.categories ||
+      body.callCategories ||
+      body.call_categories ||
+      body.callCategory ||
+      body.call_category,
+  );
+  const requestedTags = safeTags(body.tags || body.tag || []);
+  const maxRecipients = Math.min(
+    500,
+    Math.max(1, Number(body.maxRecipients || body.max_recipients || 250)),
+  );
+  const seen = new Set();
+  const result = [];
+  for (const candidate of candidates || []) {
+    const category = normalizeRerunCategory(candidate.category);
+    if (!candidate.phone || !isE164(candidate.phone)) continue;
+    if (categories.length && !categories.includes(category)) continue;
+    if (
+      eligibleOnly &&
+      !isRerunEligibleCategory(category, { includeProtected })
+    )
+      continue;
+    if (!includeProtected && RERUN_PROTECTED_CATEGORIES.has(category)) continue;
+    if (
+      requestedTags.length &&
+      !requestedTags.some((tag) => candidate.tags.includes(tag))
+    )
+      continue;
+    const key = candidate.leadId
+      ? `lead:${candidate.leadId}`
+      : `phone:${candidate.phone}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({
+      ...candidate,
+      category,
+      eligible: isRerunEligibleCategory(category, { includeProtected }),
+    });
+    if (result.length >= maxRecipients) break;
+  }
+  return result;
+}
+
+async function loadCallsByIdsOrSids(
+  db,
+  organizationId,
+  { callIds = [], callSids = [] } = {},
+) {
+  const byId = new Map();
+  const bySid = new Map();
+  const ids = [...new Set((callIds || []).filter(isUuid))];
+  if (ids.length) {
+    const { data, error } = await db
+      .from("call_records")
+      .select("*")
+      .eq("organization_id", organizationId)
+      .in("id", ids);
+    if (error) throw error;
+    for (const call of data || []) {
+      byId.set(call.id, call);
+      if (call.twilio_call_sid) bySid.set(call.twilio_call_sid, call);
+      if (call.provider_call_id) bySid.set(call.provider_call_id, call);
+    }
+  }
+  const sids = [...new Set((callSids || []).filter(Boolean))].filter(
+    (sid) => !bySid.has(sid),
+  );
+  if (sids.length) {
+    const { data, error } = await db
+      .from("call_records")
+      .select("*")
+      .eq("organization_id", organizationId)
+      .or(
+        `twilio_call_sid.in.(${sids.join(",")}),provider_call_id.in.(${sids.join(",")})`,
+      );
+    if (!error) {
+      for (const call of data || []) {
+        byId.set(call.id, call);
+        if (call.twilio_call_sid) bySid.set(call.twilio_call_sid, call);
+        if (call.provider_call_id) bySid.set(call.provider_call_id, call);
+      }
+    }
+  }
+  return { byId, bySid };
+}
+
+async function loadRerunCandidates(db, organizationId, body = {}) {
+  const sourceScheduleId = stringValue(
+    body.scheduleId,
+    body.schedule_id,
+    body.campaignId,
+    body.campaign_id,
+  );
+  if (sourceScheduleId && isUuid(sourceScheduleId)) {
+    const [
+      { data: schedule, error: scheduleError },
+      { data: runs, error: runsError },
+    ] = await Promise.all([
+      db
+        .from("lead_outreach_schedules")
+        .select("*")
+        .eq("id", sourceScheduleId)
+        .eq("organization_id", organizationId)
+        .maybeSingle(),
+      db
+        .from("lead_outreach_runs")
+        .select("*")
+        .eq("schedule_id", sourceScheduleId)
+        .eq("organization_id", organizationId)
+        .order("scheduled_for", { ascending: false })
+        .limit(1000),
+    ]);
+    if (scheduleError) throw scheduleError;
+    if (runsError) throw runsError;
+    if (!schedule) {
+      const err = new Error("Source campaign was not found.");
+      err.statusCode = 404;
+      throw err;
+    }
+    const callIds = (runs || [])
+      .map((run) => run.call_record_id)
+      .filter(Boolean);
+    const callSids = (runs || [])
+      .map((run) => run.twilio_call_sid)
+      .filter(Boolean);
+    const { byId, bySid } = await loadCallsByIdsOrSids(db, organizationId, {
+      callIds,
+      callSids,
+    });
+    const candidates = (runs || []).map((run) => {
+      const call =
+        byId.get(run.call_record_id) || bySid.get(run.twilio_call_sid) || null;
+      return buildCandidate(call, run);
+    });
+    return {
+      sourceSchedule: schedule,
+      rawCandidates: candidates,
+      candidates: filterAndDedupeRerunCandidates(candidates, body),
+    };
+  }
+
+  let q = db
+    .from("call_records")
+    .select("*")
+    .eq("organization_id", organizationId)
+    .order("created_at", { ascending: false })
+    .limit(
+      Math.min(
+        1000,
+        Math.max(1, Number(body.scanLimit || body.scan_limit || 500)),
+      ),
+    );
+
+  const callIds = normalizeArray(
+    body.callIds || body.call_ids || body.callId || body.call_id,
+  ).filter(isUuid);
+  if (callIds.length) q = q.in("id", callIds);
+  const voiceAgentId = stringValue(body.voiceAgentId, body.voice_agent_id);
+  if (voiceAgentId && voiceAgentId !== "all")
+    q = q.eq("voice_agent_id", voiceAgentId);
+  const status = stringValue(body.status);
+  if (status && status !== "all") q = q.eq("status", status);
+  const tag = stringValue(body.tag);
+  if (tag && tag !== "all") q = q.contains("tags", [tag.toLowerCase()]);
+  const category = normalizeRerunCategory(
+    stringValue(body.callCategory, body.call_category, body.category),
+  );
+  if (category && category !== "unknown" && category !== "all")
+    q = q.eq("call_category", category);
+
+  const { data: calls, error } = await q;
+  if (error) throw error;
+  const callRecordIds = (calls || []).map((call) => call.id).filter(Boolean);
+  const callSids = (calls || [])
+    .map((call) => call.twilio_call_sid || call.provider_call_id)
+    .filter(Boolean);
+  const runByCallId = new Map();
+  const runBySid = new Map();
+  if (callRecordIds.length) {
+    const { data: runs } = await db
+      .from("lead_outreach_runs")
+      .select("*")
+      .eq("organization_id", organizationId)
+      .in("call_record_id", callRecordIds);
+    for (const run of runs || []) {
+      if (run.call_record_id) runByCallId.set(run.call_record_id, run);
+      if (run.twilio_call_sid) runBySid.set(run.twilio_call_sid, run);
+    }
+  }
+  if (callSids.length) {
+    const { data: runs } = await db
+      .from("lead_outreach_runs")
+      .select("*")
+      .eq("organization_id", organizationId)
+      .in("twilio_call_sid", callSids);
+    for (const run of runs || []) {
+      if (run.call_record_id) runByCallId.set(run.call_record_id, run);
+      if (run.twilio_call_sid) runBySid.set(run.twilio_call_sid, run);
+    }
+  }
+  const candidates = (calls || []).map((call) =>
+    buildCandidate(
+      call,
+      runByCallId.get(call.id) ||
+        runBySid.get(call.twilio_call_sid) ||
+        runBySid.get(call.provider_call_id) ||
+        null,
+    ),
+  );
+  return {
+    sourceSchedule: null,
+    rawCandidates: candidates,
+    candidates: filterAndDedupeRerunCandidates(candidates, body),
+  };
+}
+
+function summarizeRerunCandidates(rawCandidates = [], candidates = []) {
+  const byCategory = {};
+  const skippedByCategory = {};
+  for (const candidate of rawCandidates) {
+    const key = normalizeRerunCategory(candidate.category);
+    byCategory[key] = (byCategory[key] || 0) + 1;
+  }
+  const selected = new Set(
+    candidates.map(
+      (candidate) => candidate.callId || candidate.runId || candidate.phone,
+    ),
+  );
+  for (const candidate of rawCandidates) {
+    const key = candidate.callId || candidate.runId || candidate.phone;
+    if (selected.has(key)) continue;
+    const category = normalizeRerunCategory(candidate.category);
+    skippedByCategory[category] = (skippedByCategory[category] || 0) + 1;
+  }
+  return {
+    totalScanned: rawCandidates.length,
+    selectedCount: candidates.length,
+    byCategory,
+    skippedByCategory,
+    eligibleCategories: [...RERUN_ELIGIBLE_CATEGORIES],
+    protectedCategories: [...RERUN_PROTECTED_CATEGORIES],
+  };
+}
+
+async function buildRerunSchedulePayload(
+  db,
+  organizationId,
+  req,
+  body = {},
+  { sourceSchedule = null, candidates = [] } = {},
+) {
+  if (!candidates.length) {
+    const err = new Error("No rerun-eligible recipients matched this filter.");
+    err.statusCode = 400;
+    err.code = "NO_RERUN_RECIPIENTS";
+    throw err;
+  }
+  const candidateAgents = [
+    ...new Set(candidates.map((item) => item.voiceAgentId).filter(Boolean)),
+  ];
+  const requestedAgentId = stringValue(
+    body.voiceAgentId,
+    body.voice_agent_id,
+    sourceSchedule?.voice_agent_id,
+  );
+  const voiceAgentId =
+    requestedAgentId ||
+    (candidateAgents.length === 1 ? candidateAgents[0] : "");
+  if (!voiceAgentId || !isUuid(voiceAgentId)) {
+    const err = new Error(
+      "Select one voice agent before creating a rerun campaign.",
+    );
+    err.statusCode = 400;
+    err.code = "VOICE_AGENT_REQUIRED";
+    throw err;
+  }
+  if (candidateAgents.length > 1 && !requestedAgentId && !sourceSchedule) {
+    const err = new Error(
+      "This filtered group contains multiple agents. Filter by one agent first.",
+    );
+    err.statusCode = 400;
+    err.code = "MULTIPLE_AGENTS_SELECTED";
+    throw err;
+  }
+  const agent = await ensureAgent(db, organizationId, voiceAgentId);
+  if (!agent) {
+    const err = new Error("Voice agent not found.");
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const fromNumberId = stringValue(
+    body.fromNumberId,
+    body.from_number_id,
+    sourceSchedule?.from_number_id,
+  );
+  const fromNumber = cleanPhone(
+    stringValue(body.fromNumber, body.from_number, sourceSchedule?.from_number),
+  );
+  const number = await ensureFromNumber(db, organizationId, {
+    fromNumberId,
+    fromNumber,
+    voiceAgentId,
+  });
+  if (!number) {
+    const err = new Error(
+      "A configured from-number is required before creating a rerun campaign.",
+    );
+    err.statusCode = 404;
+    err.code = "FROM_NUMBER_NOT_FOUND";
+    throw err;
+  }
+
+  const timezone =
+    stringValue(
+      body.timezone,
+      sourceSchedule?.timezone,
+      req.organization?.timezone,
+      "America/New_York",
+    ) || "America/New_York";
+  const start = scheduleStartParts(body, timezone);
+  const leadIds = [
+    ...new Set(candidates.map((item) => item.leadId).filter(isUuid)),
+  ];
+  const loadedLeads = await loadLeads(db, organizationId, leadIds);
+  const loadedLeadIds = new Set(loadedLeads.map((lead) => lead.id));
+  const directRecipients = candidates
+    .filter(
+      (candidate) => !candidate.leadId || !loadedLeadIds.has(candidate.leadId),
+    )
+    .map((candidate) => ({
+      name: candidate.name || "Rerun recipient",
+      phone: candidate.phone,
+      metadata: {
+        rerun: true,
+        sourceCallId: candidate.callId,
+        sourceRunId: candidate.runId,
+        sourceScheduleId:
+          candidate.sourceScheduleId || sourceSchedule?.id || null,
+        previousCategory: candidate.category,
+      },
+    }));
+  const scheduleType = "one_time";
+  const scheduleBody = {
+    scheduleType,
+    startLocalDate: start.date,
+    startTime: start.time,
+    timezone,
+  };
+  const generation = buildOccurrenceGeneration(scheduleBody, {
+    timezone,
+    scheduleType,
+    leads: loadedLeads,
+    directRecipients,
+  });
+  const callPurpose = stringValue(
+    body.callPurpose,
+    body.call_purpose,
+    sourceSchedule?.call_purpose,
+    "Follow up with recipients who were not fully reached in the previous campaign.",
+  );
+  const customInstructions = stringValue(
+    body.customInstructions,
+    body.custom_instructions,
+    sourceSchedule?.custom_instructions,
+  );
+  const name = stringValue(
+    body.name,
+    sourceSchedule?.name ? `${sourceSchedule.name} rerun` : "Rerun campaign",
+  );
+  return {
+    scheduleRow: {
+      organization_id: organizationId,
+      voice_agent_id: voiceAgentId,
+      from_number_id: number.id,
+      from_number:
+        number.phone_number || fromNumber || agent.twilio_phone_number || "",
+      lead_id:
+        leadIds.length === 1 && directRecipients.length === 0
+          ? leadIds[0]
+          : null,
+      lead_ids: leadIds,
+      direct_recipients: directRecipients,
+      target_type:
+        directRecipients.length && leadIds.length
+          ? "lead_list"
+          : directRecipients.length
+            ? "direct_numbers"
+            : leadIds.length === 1
+              ? "lead"
+              : "lead_list",
+      name,
+      call_purpose: callPurpose,
+      custom_instructions: customInstructions,
+      schedule_type: scheduleType,
+      start_at: new Date(generation.firstRunAt).toISOString(),
+      timezone,
+      days_of_week: [],
+      times_per_day: [start.time],
+      max_calls_per_day: Math.max(
+        1,
+        Number(
+          body.maxCallsPerDay ||
+            body.max_calls_per_day ||
+            sourceSchedule?.max_calls_per_day ||
+            100,
+        ),
+      ),
+      max_attempts_per_lead: Math.max(
+        1,
+        Number(body.maxAttemptsPerLead || body.max_attempts_per_lead || 1),
+      ),
+      retry_delay_minutes: Math.max(
+        1,
+        Number(
+          body.retryDelayMinutes ||
+            body.retry_delay_minutes ||
+            sourceSchedule?.retry_delay_minutes ||
+            60,
+        ),
+      ),
+      voicemail_behavior: stringValue(
+        body.voicemailBehavior,
+        body.voicemail_behavior,
+        sourceSchedule?.voicemail_behavior,
+        "hangup",
+      ),
+      status: "active",
+      is_active: true,
+      windows: [{ weekdays: [], date: start.date, time: start.time }],
+      extra_context: customInstructions || callPurpose,
+      progress: {},
+      metadata: {
+        createdBy: req.user?.id || null,
+        scheduleVersion: 1,
+        rerun: true,
+        rerunOfScheduleId: sourceSchedule?.id || null,
+        rerunFilter: {
+          callIds: normalizeArray(body.callIds || body.call_ids || []),
+          scheduleId: stringValue(
+            body.scheduleId,
+            body.schedule_id,
+            body.campaignId,
+            body.campaign_id,
+            sourceSchedule?.id,
+          ),
+          voiceAgentId,
+          categories: normalizeRerunCategoryList(
+            body.categories ||
+              body.callCategories ||
+              body.callCategory ||
+              body.call_category,
+          ),
+          tag: stringValue(body.tag),
+          eligibleOnly:
+            body.eligibleOnly !== false && body.eligible_only !== false,
+        },
+        rerunSummary: summarizeRerunCandidates(candidates, candidates),
+        sourceRecipients: candidates.map((candidate) => ({
+          callId: candidate.callId,
+          runId: candidate.runId,
+          leadId: candidate.leadId,
+          phone: candidate.phone,
+          name: candidate.name,
+          previousCategory: candidate.category,
+        })),
+        scheduleConfig: scheduleConfigFromBody(scheduleBody, scheduleType),
+        recurrenceRule: {
+          type: generation.scheduleType,
+          timezone: generation.timezone,
+          totalRuns: generation.totalRuns,
+          firstRunAt: generation.firstRunAt,
+          lastRunAt: generation.lastRunAt,
+          preview: generation.preview,
+        },
+        generation: {
+          totalRuns: generation.totalRuns,
+          firstRunAt: generation.firstRunAt,
+          lastRunAt: generation.lastRunAt,
+        },
+      },
+    },
+    generation,
+    leadIds,
+    directRecipients,
+    candidates,
+  };
+}
+
+async function previewRerunCampaign(req, res, sourceScheduleId = null) {
+  const db = getSupabase();
+  const body = { ...(req.body || {}) };
+  if (sourceScheduleId) body.scheduleId = sourceScheduleId;
+  const loaded = await loadRerunCandidates(db, req.orgId, body);
+  const summary = summarizeRerunCandidates(
+    loaded.rawCandidates,
+    loaded.candidates,
+  );
+  let creationPreview = null;
+  if (loaded.candidates.length) {
+    try {
+      const payload = await buildRerunSchedulePayload(
+        db,
+        req.orgId,
+        req,
+        body,
+        loaded,
+      );
+      creationPreview = {
+        name: payload.scheduleRow.name,
+        voiceAgentId: payload.scheduleRow.voice_agent_id,
+        fromNumber: payload.scheduleRow.from_number,
+        startAt: payload.scheduleRow.start_at,
+        timezone: payload.scheduleRow.timezone,
+        recipientCount: loaded.candidates.length,
+        generatedRuns: payload.generation.totalRuns,
+        preview: payload.generation.preview,
+      };
+    } catch (error) {
+      creationPreview = {
+        error: error.message || "Could not build rerun preview.",
+      };
+    }
+  }
+  res.json({
+    success: true,
+    summary,
+    candidates: loaded.candidates,
+    preview: creationPreview,
+  });
+}
+
+async function createRerunCampaign(req, res, sourceScheduleId = null) {
+  const db = getSupabase();
+  const body = { ...(req.body || {}) };
+  if (sourceScheduleId) body.scheduleId = sourceScheduleId;
+  const loaded = await loadRerunCandidates(db, req.orgId, body);
+  const payload = await buildRerunSchedulePayload(
+    db,
+    req.orgId,
+    req,
+    body,
+    loaded,
+  );
+  const { data: schedule, error } = await db
+    .from("lead_outreach_schedules")
+    .insert(payload.scheduleRow)
+    .select()
+    .single();
+  if (error) throw error;
+  const rows = buildRunRowsFromOccurrences({
+    organizationId: req.orgId,
+    schedule,
+    occurrences: payload.generation.occurrences,
+  }).map((row) => {
+    const matching = payload.candidates.find((candidate) =>
+      candidate.leadId && row.lead_id
+        ? candidate.leadId === row.lead_id
+        : candidate.phone === row.destination_phone,
+    );
+    return {
+      ...row,
+      attempt_number: 1,
+      outcome_metadata: {
+        ...(row.outcome_metadata || {}),
+        rerun: true,
+        sourceScheduleId:
+          matching?.sourceScheduleId || loaded.sourceSchedule?.id || null,
+        sourceCallId: matching?.callId || null,
+        sourceRunId: matching?.runId || null,
+        previousCategory: matching?.category || null,
+      },
+    };
+  });
+  const generated = await insertRunRows(db, req.orgId, schedule, rows);
+  res.status(201).json({
+    success: true,
+    schedule: serializeSchedule(schedule),
+    generatedRuns: generated.inserted,
+    candidates: payload.candidates,
+    summary: summarizeRerunCandidates(loaded.rawCandidates, loaded.candidates),
+    preview: {
+      firstRunAt: payload.generation.firstRunAt,
+      lastRunAt: payload.generation.lastRunAt,
+      totalRuns: payload.generation.totalRuns,
+    },
+  });
+}
+
 function maxGeneratedRuns() {
   const parsed = parseInt(
     String(process.env.MAX_GENERATED_RUNS_PER_SCHEDULE || "1000"),
@@ -279,60 +1171,6 @@ function buildOccurrenceGeneration(
     maxGeneratedRuns: maxGeneratedRuns(),
     minLeadSeconds: minScheduleLeadSeconds(),
   });
-}
-
-const WEEKDAY_CODES = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
-
-function weekdayCodeForLocalDate(localDate) {
-  const [year, month, day] = String(localDate || "")
-    .split("-")
-    .map(Number);
-  if (!year || !month || !day) return null;
-  return WEEKDAY_CODES[
-    new Date(Date.UTC(year, month - 1, day, 12, 0, 0)).getUTCDay()
-  ];
-}
-
-function exactWindowsFromGeneration(generation = {}) {
-  const windows = [];
-  const seen = new Set();
-  for (const occurrence of generation.occurrences || []) {
-    const localDate = occurrence.localDate || occurrence.local_date || null;
-    const time = String(
-      occurrence.localTime || occurrence.local_time || "",
-    ).slice(0, 5);
-    if (!localDate || !/^\d{2}:\d{2}$/.test(time)) continue;
-    const key = `${localDate}|${time}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const weekday = weekdayCodeForLocalDate(localDate);
-    windows.push({
-      date: localDate,
-      localDate,
-      weekdays: weekday ? [weekday] : [],
-      time,
-    });
-  }
-  return windows;
-}
-
-function storedWindowsForSchedule({
-  generation,
-  scheduleType,
-  fallbackDays = [],
-  fallbackTimes = [],
-}) {
-  if (
-    ["one_time", "one_time_batch"].includes(
-      String(scheduleType || generation?.scheduleType || ""),
-    )
-  ) {
-    return exactWindowsFromGeneration(generation);
-  }
-  return fallbackTimes.map((time) => ({
-    weekdays: fallbackDays.length ? fallbackDays : [],
-    time,
-  }));
 }
 
 function buildRunRowsFromOccurrences({
@@ -714,6 +1552,38 @@ function buildScheduleStatusResponse(schedule, runs) {
 }
 
 router.post(
+  "/rerun-preview",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => previewRerunCampaign(req, res)),
+);
+
+router.post(
+  "/rerun",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => createRerunCampaign(req, res)),
+);
+
+router.post(
+  "/schedules/:id/rerun-preview",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) =>
+    previewRerunCampaign(req, res, req.params.id),
+  ),
+);
+
+router.post(
+  "/schedules/:id/rerun",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) =>
+    createRerunCampaign(req, res, req.params.id),
+  ),
+);
+
+router.post(
   "/schedules/preview",
   requireAuth,
   requireAdmin,
@@ -744,8 +1614,8 @@ router.post(
     }
     const timezone =
       String(
-        body.timezone || req.organization?.timezone || "America/Chicago",
-      ).trim() || "America/Chicago";
+        body.timezone || req.organization?.timezone || "America/New_York",
+      ).trim() || "America/New_York";
     const scheduleType = normalizeScheduleType(
       body.scheduleType || body.schedule_type,
     );
@@ -812,8 +1682,8 @@ router.post(
     const status = normalizeScheduleStatus(body.status || "active", "active");
     const timezone =
       String(
-        body.timezone || req.organization?.timezone || "America/Chicago",
-      ).trim() || "America/Chicago";
+        body.timezone || req.organization?.timezone || "America/New_York",
+      ).trim() || "America/New_York";
     let startAt = resolveStartAt(body, timezone);
     let timesPerDay = normalizeTimesPerDay(
       body.timesPerDay || body.times_per_day,
@@ -895,28 +1765,6 @@ router.post(
           .filter(Boolean),
       ),
     ].sort();
-    const storedWindows = storedWindowsForSchedule({
-      generation,
-      scheduleType,
-      fallbackDays: daysOfWeek,
-      fallbackTimes: timesPerDay,
-    });
-    const generatedLocalDates = [
-      ...new Set(
-        (generation.occurrences || [])
-          .map((item) => item.localDate)
-          .filter(Boolean),
-      ),
-    ].sort();
-    const storedDaysOfWeek = daysOfWeek.length
-      ? daysOfWeek
-      : [
-          ...new Set(
-            storedWindows
-              .flatMap((window) => window.weekdays || [])
-              .filter(Boolean),
-          ),
-        ];
 
     const targetType =
       directRecipients.length && leadIds.length
@@ -965,7 +1813,7 @@ router.post(
       schedule_type: scheduleType,
       start_at: new Date(startAt).toISOString(),
       timezone,
-      days_of_week: storedDaysOfWeek,
+      days_of_week: daysOfWeek,
       times_per_day: timesPerDay,
       max_calls_per_day: Math.max(
         1,
@@ -990,20 +1838,19 @@ router.post(
       ),
       status,
       is_active: status === "active",
-      windows: storedWindows,
+      windows: timesPerDay.map((time) => ({
+        weekdays: daysOfWeek.length
+          ? daysOfWeek
+          : ["mon", "tue", "wed", "thu", "fri"],
+        time,
+      })),
       extra_context: String(body.customInstructions || body.callPurpose || ""),
       progress: {},
       metadata: {
         createdBy: req.user?.id || null,
         scheduleVersion: 1,
         directRecipients,
-        scheduleDates: generatedLocalDates,
-        scheduleWindows: storedWindows,
-        scheduleConfig: {
-          ...scheduleConfigFromBody(body, scheduleType),
-          scheduleDates: generatedLocalDates,
-          scheduleWindows: storedWindows,
-        },
+        scheduleConfig: scheduleConfigFromBody(body, scheduleType),
         recurrenceRule: {
           type: generation.scheduleType,
           timezone: generation.timezone,
@@ -1208,10 +2055,10 @@ router.patch(
     }
     const patchTimezone = String(body.timezone || "").trim();
     if (body.timezone !== undefined)
-      updates.timezone = patchTimezone || "America/Chicago";
+      updates.timezone = patchTimezone || "America/New_York";
     const resolvedStartAt = resolveStartAt(
       body,
-      patchTimezone || "America/Chicago",
+      patchTimezone || "America/New_York",
     );
     if (resolvedStartAt) updates.start_at = resolvedStartAt;
     if (body.daysOfWeek !== undefined || body.days_of_week !== undefined)

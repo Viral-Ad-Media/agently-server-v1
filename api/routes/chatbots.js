@@ -184,6 +184,9 @@ router.patch(
         });
       }
       updates.knowledge_base_id = requestedKnowledgeBaseId;
+      // Once a chatbot is assigned to a Knowledge Base, legacy JSON FAQs are
+      // cleared so the deployed widget cannot answer from stale unscoped data.
+      updates.faqs = [];
     }
 
     const { data: chatbot, error } = await db

@@ -130,6 +130,24 @@ router.patch(
       updates.escalation_phone = body.escalationPhone;
     if (body.voicemailFallback !== undefined)
       updates.voicemail_fallback = body.voicemailFallback;
+    if (body.voicemailBehavior !== undefined)
+      updates.voicemail_behavior = body.voicemailBehavior;
+    if (body.voicemailMessage !== undefined)
+      updates.voicemail_message = body.voicemailMessage || "";
+    if (body.voicemailCallbackDelayMinutes !== undefined)
+      updates.voicemail_callback_delay_minutes =
+        Number(body.voicemailCallbackDelayMinutes) || 60;
+    if (body.voicemailMaxRedialAttempts !== undefined)
+      updates.voicemail_max_redial_attempts =
+        Number(body.voicemailMaxRedialAttempts) || 1;
+    if (body.voicemailSettings !== undefined)
+      updates.voicemail_settings = body.voicemailSettings || {};
+    if (body.callScreeningEnabled !== undefined)
+      updates.call_screening_enabled = body.callScreeningEnabled !== false;
+    if (body.callScreeningMessage !== undefined)
+      updates.call_screening_message = body.callScreeningMessage || "";
+    if (body.callScreeningSettings !== undefined)
+      updates.call_screening_settings = body.callScreeningSettings || {};
     if (body.dataCaptureFields !== undefined)
       updates.data_capture_fields = body.dataCaptureFields;
     if (body.rules !== undefined) updates.rules = body.rules;
