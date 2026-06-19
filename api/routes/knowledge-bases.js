@@ -90,6 +90,268 @@ async function loadKnowledgeBaseDetails(db, organizationId, knowledgeBaseId) {
   });
 }
 
+function isMissingDeleteTableError(error) {
+  const msg = String(error?.message || error || "").toLowerCase();
+  return (
+    error?.code === "42P01" ||
+    msg.includes("does not exist") ||
+    msg.includes("schema cache") ||
+    msg.includes("could not find the table") ||
+    msg.includes("could not find")
+  );
+}
+
+async function countKnowledgeBaseRows(
+  db,
+  { organizationId, knowledgeBaseId, table, label },
+) {
+  try {
+    const { count, error } = await db
+      .from(table)
+      .select("id", { count: "exact", head: true })
+      .eq("organization_id", organizationId)
+      .eq("knowledge_base_id", knowledgeBaseId);
+    if (error) {
+      if (!isMissingDeleteTableError(error)) {
+        console.warn(
+          `[knowledge-bases] ${label} count:`,
+          error.message || error,
+        );
+      }
+      return 0;
+    }
+    return count || 0;
+  } catch (error) {
+    if (!isMissingDeleteTableError(error)) {
+      console.warn(`[knowledge-bases] ${label} count:`, error.message || error);
+    }
+    return 0;
+  }
+}
+
+async function deleteKnowledgeBaseRows(
+  db,
+  { organizationId, knowledgeBaseId, table, label },
+) {
+  try {
+    const { error } = await db
+      .from(table)
+      .delete()
+      .eq("organization_id", organizationId)
+      .eq("knowledge_base_id", knowledgeBaseId);
+    if (error) {
+      if (isMissingDeleteTableError(error)) return;
+      throw error;
+    }
+  } catch (error) {
+    if (isMissingDeleteTableError(error)) return;
+    console.error(
+      `[knowledge-bases] ${label} delete failed:`,
+      error.message || error,
+    );
+    throw error;
+  }
+}
+
+async function loadKnowledgeBaseDeleteStatus(
+  db,
+  organizationId,
+  knowledgeBaseId,
+) {
+  const base = await verifyKnowledgeBase(db, {
+    organizationId,
+    knowledgeBaseId,
+  });
+  if (!base?.id) return null;
+
+  const [voiceAgents, chatbots, agentLinks, chatbotLinks] = await Promise.all([
+    safeDb(
+      "delete check voice agents",
+      () =>
+        db
+          .from("voice_agents")
+          .select("id,name,knowledge_base_id")
+          .eq("organization_id", organizationId),
+      [],
+    ),
+    safeDb(
+      "delete check chatbots",
+      () =>
+        db
+          .from("chatbots")
+          .select("id,name,knowledge_base_id")
+          .eq("organization_id", organizationId),
+      [],
+    ),
+    safeDb(
+      "delete check voice links",
+      () =>
+        db
+          .from("agent_knowledge_base_links")
+          .select("voice_agent_id")
+          .eq("organization_id", organizationId)
+          .eq("knowledge_base_id", knowledgeBaseId),
+      [],
+    ),
+    safeDb(
+      "delete check chatbot links",
+      () =>
+        db
+          .from("chatbot_knowledge_base_links")
+          .select("chatbot_id")
+          .eq("organization_id", organizationId)
+          .eq("knowledge_base_id", knowledgeBaseId),
+      [],
+    ),
+  ]);
+
+  const voiceById = new Map(
+    (voiceAgents || []).map((agent) => [agent.id, agent]),
+  );
+  const chatbotById = new Map(
+    (chatbots || []).map((chatbot) => [chatbot.id, chatbot]),
+  );
+  const voiceIds = new Set(
+    [
+      ...(voiceAgents || [])
+        .filter((agent) => agent.knowledge_base_id === knowledgeBaseId)
+        .map((agent) => agent.id),
+      ...(agentLinks || [])
+        .map((link) => link.voice_agent_id)
+        .filter((id) => {
+          const direct = voiceById.get(id)?.knowledge_base_id || null;
+          return !direct || direct === knowledgeBaseId;
+        }),
+    ].filter(Boolean),
+  );
+  const chatbotIds = new Set(
+    [
+      ...(chatbots || [])
+        .filter((chatbot) => chatbot.knowledge_base_id === knowledgeBaseId)
+        .map((chatbot) => chatbot.id),
+      ...(chatbotLinks || [])
+        .map((link) => link.chatbot_id)
+        .filter((id) => {
+          const direct = chatbotById.get(id)?.knowledge_base_id || null;
+          return !direct || direct === knowledgeBaseId;
+        }),
+    ].filter(Boolean),
+  );
+
+  const attachedVoiceAgents = [...voiceIds].map((id) => {
+    const agent = voiceById.get(id) || {};
+    return {
+      id,
+      name: cleanText(agent.name) || `Voice agent ${String(id).slice(0, 8)}`,
+      type: "voice_agent",
+      assignmentType:
+        agent.knowledge_base_id === knowledgeBaseId ? "direct" : "link",
+    };
+  });
+  const attachedChatbots = [...chatbotIds].map((id) => {
+    const chatbot = chatbotById.get(id) || {};
+    return {
+      id,
+      name: cleanText(chatbot.name) || `Chatbot ${String(id).slice(0, 8)}`,
+      type: "chatbot",
+      assignmentType:
+        chatbot.knowledge_base_id === knowledgeBaseId ? "direct" : "link",
+    };
+  });
+
+  const [sourceCount, chunkCount, productCount, faqCount] = await Promise.all([
+    countKnowledgeBaseRows(db, {
+      organizationId,
+      knowledgeBaseId,
+      table: "knowledge_sources",
+      label: "sources",
+    }),
+    countKnowledgeBaseRows(db, {
+      organizationId,
+      knowledgeBaseId,
+      table: "knowledge_chunks",
+      label: "chunks",
+    }),
+    countKnowledgeBaseRows(db, {
+      organizationId,
+      knowledgeBaseId,
+      table: "scraped_products",
+      label: "products",
+    }),
+    countKnowledgeBaseRows(db, {
+      organizationId,
+      knowledgeBaseId,
+      table: "faqs",
+      label: "FAQs",
+    }),
+  ]);
+
+  const blockers = {
+    voiceAgents: attachedVoiceAgents,
+    chatbots: attachedChatbots,
+  };
+  const blockerCount = attachedVoiceAgents.length + attachedChatbots.length;
+  return {
+    knowledgeBase: serializeKnowledgeBase(base, {
+      linkedVoiceAgentIds: attachedVoiceAgents.map((agent) => agent.id),
+      linkedChatbotIds: attachedChatbots.map((chatbot) => chatbot.id),
+    }),
+    canDelete: blockerCount === 0,
+    blockerCount,
+    blockers,
+    cleanup: {
+      sources: sourceCount,
+      chunks: chunkCount,
+      products: productCount,
+      faqs: faqCount,
+    },
+  };
+}
+
+async function deleteKnowledgeBaseData(
+  db,
+  { organizationId, knowledgeBaseId },
+) {
+  // Delete scoped knowledge first so no scraped data, FAQs, or source rows remain
+  // if the knowledge base itself is removed successfully.
+  await deleteKnowledgeBaseRows(db, {
+    organizationId,
+    knowledgeBaseId,
+    table: "scraped_products",
+    label: "products",
+  });
+  await deleteKnowledgeBaseRows(db, {
+    organizationId,
+    knowledgeBaseId,
+    table: "knowledge_chunks",
+    label: "chunks",
+  });
+  await deleteKnowledgeBaseRows(db, {
+    organizationId,
+    knowledgeBaseId,
+    table: "faqs",
+    label: "FAQs",
+  });
+  await deleteKnowledgeBaseRows(db, {
+    organizationId,
+    knowledgeBaseId,
+    table: "knowledge_sources",
+    label: "sources",
+  });
+  await deleteKnowledgeBaseRows(db, {
+    organizationId,
+    knowledgeBaseId,
+    table: "agent_knowledge_base_links",
+    label: "voice agent links",
+  });
+  await deleteKnowledgeBaseRows(db, {
+    organizationId,
+    knowledgeBaseId,
+    table: "chatbot_knowledge_base_links",
+    label: "chatbot links",
+  });
+}
+
 router.get(
   "/",
   requireAuth,
@@ -293,46 +555,95 @@ router.patch(
   }),
 );
 
+router.get(
+  "/:id/delete-check",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const status = await loadKnowledgeBaseDeleteStatus(
+      db,
+      req.orgId,
+      req.params.id,
+    );
+    if (!status) {
+      return res
+        .status(404)
+        .json({ error: { message: "Knowledge base not found." } });
+    }
+    res.json(status);
+  }),
+);
+
 router.delete(
   "/:id",
   requireAuth,
   requireAdmin,
   asyncHandler(async (req, res) => {
     const db = getSupabase();
-    const details = await loadKnowledgeBaseDetails(
+    const status = await loadKnowledgeBaseDeleteStatus(
       db,
       req.orgId,
       req.params.id,
     );
-    if (!details) {
+    if (!status) {
       return res
         .status(404)
         .json({ error: { message: "Knowledge base not found." } });
     }
-    if (details.isPrimary) {
-      return res.status(400).json({
-        error: { message: "The primary knowledge base cannot be deleted." },
-      });
-    }
-    if (details.agentCount || details.chatbotCount) {
-      return res.status(400).json({
+
+    if (!status.canDelete) {
+      return res.status(409).json({
         error: {
           message:
-            "Unassign all voice agents and chatbots from this knowledge base before deleting it.",
+            "This knowledge base is still assigned to active agents. Reassign those agents to another knowledge base or delete the agents first.",
+          details: status,
         },
       });
     }
-    const { error } = await db
+
+    const { data: replacement } = await db
       .from("knowledge_bases")
-      .delete()
-      .eq("id", req.params.id)
-      .eq("organization_id", req.orgId);
-    if (error) {
-      return res.status(500).json({
+      .select("id")
+      .eq("organization_id", req.orgId)
+      .neq("id", req.params.id)
+      .order("is_primary", { ascending: false })
+      .order("created_at", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+
+    try {
+      await deleteKnowledgeBaseData(db, {
+        organizationId: req.orgId,
+        knowledgeBaseId: req.params.id,
+      });
+
+      const { error } = await db
+        .from("knowledge_bases")
+        .delete()
+        .eq("id", req.params.id)
+        .eq("organization_id", req.orgId);
+      if (error) throw error;
+
+      if (replacement?.id) {
+        await db
+          .from("knowledge_bases")
+          .update({ is_primary: true, updated_at: new Date().toISOString() })
+          .eq("id", replacement.id)
+          .eq("organization_id", req.orgId);
+      }
+
+      res.json({
+        success: true,
+        deletedId: req.params.id,
+        cleanup: status.cleanup,
+        replacementPrimaryKnowledgeBaseId: replacement?.id || null,
+      });
+    } catch (error) {
+      res.status(500).json({
         error: { message: error.message || "Failed to delete knowledge base." },
       });
     }
-    res.json({ success: true });
   }),
 );
 
@@ -540,6 +851,7 @@ async function performKnowledgeSourceSync({
       pagesDiscovered: result.pagesDiscovered || 0,
       productsFound: result.productsFound || 0,
       productsStored: result.productsStored || 0,
+      scrapeReport: result.scrapeReport || null,
       strategy: result.strategy || "scraper-v2",
       source: serializeKnowledgeSource(updatedSource || source),
       result,
@@ -668,7 +980,7 @@ function serializeFaqRow(row) {
     knowledgeBaseId: row.knowledge_base_id || null,
     knowledgeSourceId: row.knowledge_source_id || null,
     voiceAgentId: row.voice_agent_id || null,
-    chatbotId: row.chatbot_id || null,
+    chatbotId: null,
     sourceType: row.source_type || "manual",
     metadata: row.metadata || {},
     createdAt: row.created_at || null,
@@ -704,7 +1016,7 @@ router.get(
     const { data, error } = await db
       .from("faqs")
       .select(
-        "id,question,answer,voice_agent_id,chatbot_id,knowledge_base_id,knowledge_source_id,source_type,metadata,created_at,updated_at",
+        "id,question,answer,voice_agent_id,knowledge_base_id,knowledge_source_id,source_type,metadata,created_at,updated_at",
       )
       .eq("organization_id", req.orgId)
       .eq("knowledge_base_id", req.params.id)
@@ -746,9 +1058,13 @@ router.put(
     }
 
     const faqs = normalizeFaqPayload(req.body?.faqs);
-    const chatbotId = isUuid(req.body?.chatbotId || req.body?.chatbot_id || "")
-      ? String(req.body.chatbotId || req.body.chatbot_id)
-      : null;
+    const sourceEditor = isUuid(
+      req.body?.chatbotId || req.body?.chatbot_id || "",
+    )
+      ? "chatbot_page"
+      : isUuid(req.body?.voiceAgentId || req.body?.voice_agent_id || "")
+        ? "voice_agent_page"
+        : "knowledge_base_page";
     const voiceAgentId = isUuid(
       req.body?.voiceAgentId || req.body?.voice_agent_id || "",
     )
@@ -767,18 +1083,13 @@ router.put(
       const rows = faqs.map((faq) => ({
         organization_id: req.orgId,
         knowledge_base_id: req.params.id,
-        chatbot_id: chatbotId,
         voice_agent_id: voiceAgentId,
         question: faq.question,
         answer: faq.answer,
         source_type: "knowledge_base_manual",
         metadata: {
           source: "knowledge_base_manual_editor",
-          updatedFrom: chatbotId
-            ? "chatbot_page"
-            : voiceAgentId
-              ? "voice_agent_page"
-              : "knowledge_base_page",
+          updatedFrom: sourceEditor,
         },
       }));
       const { error: insertError } = await db.from("faqs").insert(rows);
@@ -792,7 +1103,7 @@ router.put(
     const { data, error } = await db
       .from("faqs")
       .select(
-        "id,question,answer,voice_agent_id,chatbot_id,knowledge_base_id,knowledge_source_id,source_type,metadata,created_at,updated_at",
+        "id,question,answer,voice_agent_id,knowledge_base_id,knowledge_source_id,source_type,metadata,created_at,updated_at",
       )
       .eq("organization_id", req.orgId)
       .eq("knowledge_base_id", req.params.id)

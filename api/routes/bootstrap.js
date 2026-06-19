@@ -19,6 +19,7 @@ const {
   ensureDefaultKnowledgeBaseForOrg,
   listKnowledgeBasesForOrg,
   getAssignedKnowledgeBaseIdsForVoiceAgent,
+  getAssignedKnowledgeBaseIdsForChatbot,
 } = require("../../lib/knowledge-bases");
 
 const router = express.Router();
@@ -118,7 +119,25 @@ router.get(
       }),
     );
 
-    const chatbots = (chatbotsResult.data || []).map(serializeChatbot);
+    const chatbots = await Promise.all(
+      (chatbotsResult.data || []).map(async (chatbot) => {
+        const serialized = serializeChatbot(chatbot);
+        if (!serialized.knowledgeBaseId) {
+          const knowledgeBaseIds = await getAssignedKnowledgeBaseIdsForChatbot(
+            db,
+            {
+              organizationId: orgId,
+              chatbotId: chatbot.id,
+              voiceAgentId: chatbot.voice_agent_id || null,
+              organization: org,
+            },
+          );
+          if (knowledgeBaseIds.length)
+            serialized.knowledgeBaseId = knowledgeBaseIds[0];
+        }
+        return serialized;
+      }),
+    );
     const members = (membersResult.data || []).map(serializeUser);
     const invoices = (invoicesResult.data || []).map(serializeInvoice);
     const leads = leadsResult.data || [];
