@@ -4,7 +4,11 @@ const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
 const { requireAuth } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
-const { generateFaqsFromWebsite } = require("../../lib/openai");
+const {
+  generateFaqsFromWebsite,
+  generateFaqsFromKnowledgeContent,
+} = require("../../lib/openai");
+const { scrapeAndStore } = require("../../lib/scraper.service");
 const { serializeAgent } = require("../../lib/serializers");
 const {
   ensureDefaultKnowledgeBaseForOrg,
@@ -51,8 +55,86 @@ router.post(
         .status(400)
         .json({ error: { message: "Website URL is required." } });
     }
-    const faqs = await generateFaqsFromWebsite(website);
-    res.json({ website, faqs });
+
+    const db = getSupabase();
+    const orgId = req.orgId;
+    const org = {
+      ...(req.organization || {}),
+      id: orgId,
+      website,
+    };
+
+    try {
+      const knowledgeBase = await ensureDefaultKnowledgeBaseForOrg(db, org);
+      const knowledgeSource = knowledgeBase?.id
+        ? await findOrCreateKnowledgeSource(db, {
+            organizationId: orgId,
+            knowledgeBaseId: knowledgeBase.id,
+            url: website,
+            title: `${req.organization?.name || "Onboarding"} Website`,
+            isPrimary: true,
+          })
+        : null;
+
+      const scrapeResult = await scrapeAndStore({
+        url: website,
+        organizationId: orgId,
+        knowledgeBaseId: knowledgeBase?.id || null,
+        knowledgeSourceId: knowledgeSource?.id || null,
+      });
+
+      let chunksQuery = db
+        .from("knowledge_chunks")
+        .select(
+          "source_url, source_title, content, compact_summary, token_count, chunk_index",
+        )
+        .eq("organization_id", orgId)
+        .order("chunk_index", { ascending: true })
+        .limit(40);
+      if (knowledgeBase?.id)
+        chunksQuery = chunksQuery.eq("knowledge_base_id", knowledgeBase.id);
+      if (knowledgeSource?.id)
+        chunksQuery = chunksQuery.eq("knowledge_source_id", knowledgeSource.id);
+
+      const { data: chunks, error: chunksError } = await chunksQuery;
+      if (chunksError) throw chunksError;
+
+      const faqs = await generateFaqsFromKnowledgeContent({
+        website,
+        chunks: chunks || [],
+        scrapeReport: scrapeResult.scrapeReport || null,
+      });
+
+      return res.json({
+        website,
+        faqs,
+        knowledgeBaseId: knowledgeBase?.id || null,
+        knowledgeSourceId: knowledgeSource?.id || null,
+        scrape: {
+          strategy: scrapeResult.strategy || "scraper-v2",
+          pagesScraped: scrapeResult.pagesScraped || 0,
+          pagesDiscovered: scrapeResult.pagesDiscovered || 0,
+          chunksStored: scrapeResult.chunksStored || 0,
+          productsFound: scrapeResult.productsFound || 0,
+          productsStored: scrapeResult.productsStored || 0,
+          scrapeReport: scrapeResult.scrapeReport || null,
+        },
+      });
+    } catch (err) {
+      console.warn(
+        "[onboarding] detailed scraper failed; falling back to direct FAQ generation:",
+        err.message,
+      );
+      const faqs = await generateFaqsFromWebsite(website);
+      return res.json({
+        website,
+        faqs,
+        scrape: {
+          strategy: "legacy-fallback",
+          error: err.message || String(err),
+        },
+      });
+    }
   }),
 );
 
