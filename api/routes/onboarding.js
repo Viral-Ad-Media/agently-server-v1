@@ -4,11 +4,7 @@ const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
 const { requireAuth } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
-const {
-  generateFaqsFromWebsite,
-  generateFaqsFromKnowledgeContent,
-} = require("../../lib/openai");
-const { scrapeAndStore } = require("../../lib/scraper.service");
+const { generateFaqsFromWebsite } = require("../../lib/openai");
 const { serializeAgent } = require("../../lib/serializers");
 const {
   ensureDefaultKnowledgeBaseForOrg,
@@ -44,6 +40,149 @@ function normalizeVoice(v) {
   return process.env.DEFAULT_AGENT_VOICE || VALID_VOICES[0] || "Domi";
 }
 
+const LEGACY_VOICE_FALLBACK = {
+  Domi: "Zephyr",
+  Bella: "Kore",
+  Josh: "Puck",
+  Arnold: "Charon",
+  "Wavenet-F": "Kore",
+  "Wavenet-D": "Puck",
+  "Polly-Joanna": "Kore",
+  "Polly-Matthew": "Puck",
+};
+
+function extractMissingColumn(error) {
+  const message = `${error?.message || ""} ${error?.details || ""} ${error?.hint || ""}`;
+  const quoted = message.match(/['"]([a-zA-Z0-9_]+)['"]\s+column/i);
+  if (quoted?.[1]) return quoted[1];
+  const direct = message.match(
+    /column\s+["']?([a-zA-Z0-9_]+)["']?\s+does not exist/i,
+  );
+  if (direct?.[1]) return direct[1];
+  const pgrst = message.match(
+    /Could not find the ['"]([a-zA-Z0-9_]+)['"] column/i,
+  );
+  if (pgrst?.[1]) return pgrst[1];
+  return null;
+}
+
+function isVoiceConstraintError(error) {
+  const message =
+    `${error?.message || ""} ${error?.details || ""} ${error?.hint || ""}`.toLowerCase();
+  return (
+    message.includes("voice") &&
+    (message.includes("check") ||
+      message.includes("constraint") ||
+      message.includes("violates"))
+  );
+}
+
+function buildMinimalAgentPayload(payload) {
+  return {
+    organization_id: payload.organization_id,
+    name: payload.name || "Maya",
+    direction: payload.direction || "inbound",
+    voice: payload.voice || "Zephyr",
+    language: payload.language || "English",
+    greeting:
+      payload.greeting ||
+      "Hello, thank you for calling. How can I help you today?",
+    tone: payload.tone || "Professional",
+    business_hours: payload.business_hours || "9am-5pm Monday-Friday",
+    escalation_phone: payload.escalation_phone || "",
+    voicemail_fallback: payload.voicemail_fallback ?? true,
+    data_capture_fields: payload.data_capture_fields || [
+      "name",
+      "phone",
+      "email",
+      "reason",
+    ],
+    rules: payload.rules || {
+      autoBook: false,
+      autoEscalate: true,
+      captureAllLeads: true,
+    },
+    is_active: payload.is_active ?? true,
+  };
+}
+
+async function insertVoiceAgentSafely(db, payload) {
+  let current = { ...payload };
+  const warnings = [];
+
+  for (let attempt = 0; attempt < 14; attempt += 1) {
+    const { data, error } = await db
+      .from("voice_agents")
+      .insert(current)
+      .select()
+      .single();
+
+    if (!error && data) return { data, warnings };
+
+    if (isVoiceConstraintError(error) && current.voice !== "Zephyr") {
+      const previousVoice = current.voice;
+      current.voice = LEGACY_VOICE_FALLBACK[previousVoice] || "Zephyr";
+      warnings.push(
+        `Voice ${previousVoice} was not accepted by the current DB constraint. Retried with ${current.voice}.`,
+      );
+      continue;
+    }
+
+    const missingColumn = extractMissingColumn(error);
+    if (
+      missingColumn &&
+      Object.prototype.hasOwnProperty.call(current, missingColumn)
+    ) {
+      delete current[missingColumn];
+      warnings.push(
+        `Removed unsupported voice_agents.${missingColumn} during onboarding retry.`,
+      );
+      continue;
+    }
+
+    const minimal = buildMinimalAgentPayload(payload);
+    if (
+      JSON.stringify(Object.keys(current).sort()) !==
+      JSON.stringify(Object.keys(minimal).sort())
+    ) {
+      current = minimal;
+      warnings.push(
+        "Retried voice agent creation with the core schema payload.",
+      );
+      continue;
+    }
+
+    throw error;
+  }
+
+  throw new Error("Unable to create voice agent after schema-safe retries.");
+}
+
+async function insertFaqsSafely(db, rows) {
+  if (!rows.length) return [];
+  let currentRows = rows.map((row) => ({ ...row }));
+
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const { data, error } = await db.from("faqs").insert(currentRows).select();
+    if (!error) return data || [];
+
+    const missingColumn = extractMissingColumn(error);
+    if (missingColumn) {
+      currentRows = currentRows.map((row) => {
+        const next = { ...row };
+        delete next[missingColumn];
+        return next;
+      });
+      continue;
+    }
+
+    console.warn("FAQ insert warning (non-fatal):", error?.message || error);
+    return [];
+  }
+
+  return [];
+}
+
 // ── POST /api/onboarding/faqs ────────────────────────────────
 router.post(
   "/faqs",
@@ -55,86 +194,8 @@ router.post(
         .status(400)
         .json({ error: { message: "Website URL is required." } });
     }
-
-    const db = getSupabase();
-    const orgId = req.orgId;
-    const org = {
-      ...(req.organization || {}),
-      id: orgId,
-      website,
-    };
-
-    try {
-      const knowledgeBase = await ensureDefaultKnowledgeBaseForOrg(db, org);
-      const knowledgeSource = knowledgeBase?.id
-        ? await findOrCreateKnowledgeSource(db, {
-            organizationId: orgId,
-            knowledgeBaseId: knowledgeBase.id,
-            url: website,
-            title: `${req.organization?.name || "Onboarding"} Website`,
-            isPrimary: true,
-          })
-        : null;
-
-      const scrapeResult = await scrapeAndStore({
-        url: website,
-        organizationId: orgId,
-        knowledgeBaseId: knowledgeBase?.id || null,
-        knowledgeSourceId: knowledgeSource?.id || null,
-      });
-
-      let chunksQuery = db
-        .from("knowledge_chunks")
-        .select(
-          "source_url, source_title, content, compact_summary, token_count, chunk_index",
-        )
-        .eq("organization_id", orgId)
-        .order("chunk_index", { ascending: true })
-        .limit(40);
-      if (knowledgeBase?.id)
-        chunksQuery = chunksQuery.eq("knowledge_base_id", knowledgeBase.id);
-      if (knowledgeSource?.id)
-        chunksQuery = chunksQuery.eq("knowledge_source_id", knowledgeSource.id);
-
-      const { data: chunks, error: chunksError } = await chunksQuery;
-      if (chunksError) throw chunksError;
-
-      const faqs = await generateFaqsFromKnowledgeContent({
-        website,
-        chunks: chunks || [],
-        scrapeReport: scrapeResult.scrapeReport || null,
-      });
-
-      return res.json({
-        website,
-        faqs,
-        knowledgeBaseId: knowledgeBase?.id || null,
-        knowledgeSourceId: knowledgeSource?.id || null,
-        scrape: {
-          strategy: scrapeResult.strategy || "scraper-v2",
-          pagesScraped: scrapeResult.pagesScraped || 0,
-          pagesDiscovered: scrapeResult.pagesDiscovered || 0,
-          chunksStored: scrapeResult.chunksStored || 0,
-          productsFound: scrapeResult.productsFound || 0,
-          productsStored: scrapeResult.productsStored || 0,
-          scrapeReport: scrapeResult.scrapeReport || null,
-        },
-      });
-    } catch (err) {
-      console.warn(
-        "[onboarding] detailed scraper failed; falling back to direct FAQ generation:",
-        err.message,
-      );
-      const faqs = await generateFaqsFromWebsite(website);
-      return res.json({
-        website,
-        faqs,
-        scrape: {
-          strategy: "legacy-fallback",
-          error: err.message || String(err),
-        },
-      });
-    }
+    const faqs = await generateFaqsFromWebsite(website);
+    res.json({ website, faqs });
   }),
 );
 
@@ -163,7 +224,7 @@ router.post(
         website: profile.website || "",
         location: profile.location || "",
         timezone: profile.timezone || "America/Chicago",
-        onboarded: true,
+        onboarded: false,
         updated_at: new Date().toISOString(),
       })
       .eq("id", orgId);
@@ -250,17 +311,28 @@ router.post(
     };
     if (knowledgeBase?.id) agentPayload.knowledge_base_id = knowledgeBase.id;
 
-    const { data: agentRow, error: agentErr } = await db
-      .from("voice_agents")
-      .insert(agentPayload)
-      .select()
-      .single();
-
-    if (agentErr || !agentRow) {
+    let agentRow;
+    let agentCreateWarnings = [];
+    try {
+      const result = await insertVoiceAgentSafely(db, agentPayload);
+      agentRow = result.data;
+      agentCreateWarnings = result.warnings || [];
+      if (agentCreateWarnings.length) {
+        console.warn(
+          "[onboarding] voice agent created with schema-safe retries:",
+          agentCreateWarnings,
+        );
+      }
+    } catch (agentErr) {
       console.error("Voice agent creation error:", agentErr);
       return res.status(500).json({
         error: {
-          message: "Failed to create AI voice agent. Please try again.",
+          message:
+            "We could not create your first agent because the live database schema rejected the agent record. Please apply the latest voice_agents migration or contact support.",
+          details:
+            process.env.NODE_ENV !== "production"
+              ? agentErr?.message || String(agentErr)
+              : undefined,
         },
       });
     }
@@ -278,31 +350,32 @@ router.post(
     const faqs = agentConfig.faqs || [];
     let insertedFaqs = [];
     if (faqs.length > 0) {
-      const { data: faqData } = await db
-        .from("faqs")
-        .insert(
-          faqs.map((f) => {
-            const row = {
-              organization_id: orgId,
-              voice_agent_id: agentRow.id,
-              question: f.question,
-              answer: f.answer,
-              source_type: "onboarding",
-            };
-            if (knowledgeBase?.id) row.knowledge_base_id = knowledgeBase.id;
-            if (primaryKnowledgeSource?.id)
-              row.knowledge_source_id = primaryKnowledgeSource.id;
-            return row;
-          }),
-        )
-        .select();
-      insertedFaqs = faqData || [];
+      insertedFaqs = await insertFaqsSafely(
+        db,
+        faqs.map((f) => {
+          const row = {
+            organization_id: orgId,
+            voice_agent_id: agentRow.id,
+            question: f.question,
+            answer: f.answer,
+            source_type: "onboarding",
+          };
+          if (knowledgeBase?.id) row.knowledge_base_id = knowledgeBase.id;
+          if (primaryKnowledgeSource?.id)
+            row.knowledge_source_id = primaryKnowledgeSource.id;
+          return row;
+        }),
+      );
     }
 
-    // Set as active agent
+    // Set as active agent and mark onboarding complete only after the agent exists.
     await db
       .from("organizations")
-      .update({ active_voice_agent_id: agentRow.id })
+      .update({
+        active_voice_agent_id: agentRow.id,
+        onboarded: true,
+        updated_at: new Date().toISOString(),
+      })
       .eq("id", orgId);
 
     // Create default chatbot (non-blocking — don't fail onboarding if this fails)
@@ -352,7 +425,12 @@ router.post(
       .select("*")
       .eq("id", orgId)
       .single();
-    res.json(updatedOrg);
+    res.json({
+      ...updatedOrg,
+      onboardingAgentCreated: true,
+      onboardingWarnings: agentCreateWarnings,
+      onboardingFaqsCreated: insertedFaqs.length,
+    });
   }),
 );
 
