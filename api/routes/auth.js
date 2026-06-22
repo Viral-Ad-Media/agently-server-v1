@@ -6,7 +6,11 @@ const { v4: uuidv4 } = require("uuid");
 const { getSupabase } = require("../../lib/supabase");
 const { signToken } = require("../../lib/auth");
 const { serializeUser } = require("../../lib/serializers");
-const { sendMagicLinkEmail, sendWelcomeEmail } = require("../../lib/email");
+const {
+  sendMagicLinkEmail,
+  sendPasswordResetEmail,
+  sendWelcomeEmail,
+} = require("../../lib/email");
 const { requireAuth } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 
@@ -355,6 +359,203 @@ router.post(
     });
 
     return res.json({ token: authToken, user: serializeUser(user) });
+  }),
+);
+
+// ─────────────────────────────────────────────────────────────
+// POST /api/auth/password-reset/request
+// Body: { email: string }
+// Sends a one-time password reset link when the account exists.
+// Always returns a generic response to avoid leaking registered emails.
+// ─────────────────────────────────────────────────────────────
+router.post(
+  "/password-reset/request",
+  asyncHandler(async (req, res) => {
+    const { email } = req.body || {};
+
+    if (!email) {
+      return res.status(400).json({ error: { message: "Email is required." } });
+    }
+
+    const normalizedEmail = String(email).toLowerCase().trim();
+    const genericResponse = {
+      message:
+        "If an Agently account exists for this email, password reset instructions have been sent.",
+      email: normalizedEmail,
+      resetUrl: null,
+    };
+
+    const db = getSupabase();
+
+    const { data: user } = await db
+      .from("users")
+      .select("id, name, email, password_hash, organization_id")
+      .eq("email", normalizedEmail)
+      .single();
+
+    if (!user) {
+      return res.json(genericResponse);
+    }
+
+    const org = await getUserOrganization(db, user.organization_id);
+    if (isOrganizationDeletionRequested(org)) {
+      return res.json(genericResponse);
+    }
+
+    const token = uuidv4().replace(/-/g, "") + uuidv4().replace(/-/g, "");
+    const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+
+    await db
+      .from("password_reset_tokens")
+      .update({ used: true })
+      .eq("email", normalizedEmail)
+      .eq("used", false);
+
+    const { error: insertError } = await db
+      .from("password_reset_tokens")
+      .insert({
+        email: normalizedEmail,
+        token,
+        expires_at: expiresAt,
+      });
+
+    if (insertError) {
+      console.error(
+        "[password-reset/request] token insert failed:",
+        insertError,
+      );
+      return res.status(500).json({
+        error: {
+          message:
+            "Password reset is not configured yet. Please contact support.",
+        },
+      });
+    }
+
+    const appUrl = (process.env.APP_URL || "http://localhost:3000").replace(
+      /\/$/,
+      "",
+    );
+    const resetUrl = `${appUrl}/#/forgot-password?resetToken=${token}`;
+
+    try {
+      await sendPasswordResetEmail(
+        normalizedEmail,
+        resetUrl,
+        user.name || "there",
+      );
+    } catch (emailErr) {
+      console.warn("[password-reset/request] email failed:", emailErr.message);
+    }
+
+    return res.json({
+      ...genericResponse,
+      resetUrl: process.env.NODE_ENV !== "production" ? resetUrl : null,
+    });
+  }),
+);
+
+// ─────────────────────────────────────────────────────────────
+// POST /api/auth/password-reset/confirm
+// Body: { token: string, password: string }
+// ─────────────────────────────────────────────────────────────
+router.post(
+  "/password-reset/confirm",
+  asyncHandler(async (req, res) => {
+    const { token, password } = req.body || {};
+
+    if (!token || !password) {
+      return res.status(400).json({
+        error: { message: "Reset token and new password are required." },
+      });
+    }
+
+    if (String(password).length < 8) {
+      return res.status(400).json({
+        error: { message: "Password must be at least 8 characters." },
+      });
+    }
+
+    const db = getSupabase();
+
+    const { data: record, error } = await db
+      .from("password_reset_tokens")
+      .select("*")
+      .eq("token", token)
+      .eq("used", false)
+      .single();
+
+    if (error || !record) {
+      return res.status(400).json({
+        error: { message: "Invalid or already-used password reset link." },
+      });
+    }
+
+    if (new Date(record.expires_at) < new Date()) {
+      await db
+        .from("password_reset_tokens")
+        .update({ used: true })
+        .eq("id", record.id);
+      return res.status(400).json({
+        error: {
+          message:
+            "This password reset link has expired. Please request a new one.",
+        },
+      });
+    }
+
+    const { data: user } = await db
+      .from("users")
+      .select("id, organization_id")
+      .eq("email", record.email)
+      .single();
+
+    if (!user) {
+      await db
+        .from("password_reset_tokens")
+        .update({ used: true })
+        .eq("id", record.id);
+      return res.status(400).json({
+        error: { message: "Invalid password reset link." },
+      });
+    }
+
+    const org = await getUserOrganization(db, user.organization_id);
+    if (isOrganizationDeletionRequested(org)) {
+      return res.status(403).json({
+        error: {
+          message:
+            "This organization is pending deletion. Access has been disabled while the deletion request is processed.",
+        },
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(String(password), 12);
+
+    const { error: updateError } = await db
+      .from("users")
+      .update({ password_hash: passwordHash })
+      .eq("id", user.id);
+
+    if (updateError) {
+      console.error(
+        "[password-reset/confirm] password update failed:",
+        updateError,
+      );
+      return res.status(500).json({
+        error: { message: "Unable to update password. Please try again." },
+      });
+    }
+
+    await db
+      .from("password_reset_tokens")
+      .update({ used: true })
+      .eq("id", record.id);
+
+    return res.json({
+      success: true,
+      message: "Password updated. You can now sign in with your new password.",
+    });
   }),
 );
 
