@@ -26,6 +26,64 @@ function isOrganizationDeletionRequested(org) {
   return deletion && deletion.requested === true;
 }
 
+function resolveFrontendBaseUrl() {
+  const rawCandidates = [
+    process.env.FRONTEND_URL,
+    process.env.PUBLIC_APP_URL,
+    process.env.APP_URL,
+    process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null,
+    "http://localhost:3000",
+  ];
+
+  for (const rawCandidate of rawCandidates) {
+    if (!rawCandidate) continue;
+
+    const pieces = String(rawCandidate)
+      .split(/[\s,]+/)
+      .map((piece) => piece.trim())
+      .filter(Boolean);
+
+    for (const piece of pieces) {
+      const normalized = piece
+        .replace(/^https\/\//i, "https://")
+        .replace(/^http\/\//i, "http://")
+        .replace(/\/+$/, "");
+
+      try {
+        const url = new URL(normalized);
+        if (url.protocol === "http:" || url.protocol === "https:") {
+          return `${url.protocol}//${url.host}${url.pathname}`.replace(
+            /\/+$/,
+            "",
+          );
+        }
+      } catch {
+        // Keep scanning for the first valid frontend URL.
+      }
+    }
+  }
+
+  return "http://localhost:3000";
+}
+
+function buildHashRouteUrl(path, params = {}) {
+  const baseUrl = resolveFrontendBaseUrl();
+  const search = new URLSearchParams(params).toString();
+  const cleanPath = String(path || "/").startsWith("/")
+    ? String(path || "/")
+    : `/${path}`;
+  return `${baseUrl}/#${cleanPath}${search ? `?${search}` : ""}`;
+}
+
+function buildDirectRouteUrl(path, params = {}) {
+  const baseUrl = resolveFrontendBaseUrl();
+  const search = new URLSearchParams(params).toString();
+  const cleanPath = String(path || "/").startsWith("/")
+    ? String(path || "/")
+    : `/${path}`;
+  return `${baseUrl}${cleanPath}${search ? `?${search}` : ""}`;
+}
+
 async function getUserOrganization(db, organizationId) {
   if (!organizationId) return null;
   const { data: org } = await db
@@ -233,8 +291,7 @@ router.post(
       expires_at: expiresAt,
     });
 
-    const appUrl = (process.env.APP_URL || "http://localhost:3000").trim();
-    const magicLinkUrl = `${appUrl}/#/login?magic=${token}`;
+    const magicLinkUrl = buildHashRouteUrl("/login", { magic: token });
 
     // Send the email — non-blocking
     try {
@@ -432,17 +489,19 @@ router.post(
       });
     }
 
-    const appUrl = (process.env.APP_URL || "http://localhost:3000").replace(
-      /\/$/,
-      "",
-    );
-    const resetUrl = `${appUrl}/#/forgot-password?resetToken=${token}`;
+    const resetUrl = buildHashRouteUrl("/forgot-password", {
+      resetToken: token,
+    });
+    const fallbackResetUrl = buildDirectRouteUrl("/forgot-password", {
+      resetToken: token,
+    });
 
     try {
       await sendPasswordResetEmail(
         normalizedEmail,
         resetUrl,
         user.name || "there",
+        fallbackResetUrl,
       );
     } catch (emailErr) {
       console.warn("[password-reset/request] email failed:", emailErr.message);
