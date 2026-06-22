@@ -535,29 +535,43 @@ router.patch(
 router.post(
   "/contact",
   asyncHandler(async (req, res) => {
-    const { name, email, subject, message } = req.body;
+    const { name, email, subject, message } = req.body || {};
+    const cleanName = String(name || "").trim();
+    const cleanEmail = String(email || "")
+      .toLowerCase()
+      .trim();
+    const cleanSubject = String(subject || "Website inquiry").trim();
+    const cleanMessage = String(message || "").trim();
 
-    if (!name || !email || !message) {
+    if (!cleanName || !cleanEmail || !cleanMessage) {
       return res
         .status(400)
         .json({ error: { message: "Name, email, and message are required." } });
     }
 
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      return res
+        .status(400)
+        .json({ error: { message: "Please enter a valid email address." } });
+    }
+
     const db = getSupabase();
 
     await db.from("contact_submissions").insert({
-      name: name.trim(),
-      email: email.toLowerCase().trim(),
-      subject: subject || "",
-      message: message.trim(),
+      name: cleanName,
+      email: cleanEmail,
+      subject: cleanSubject,
+      message: cleanMessage,
       type: "contact",
     });
 
-    try {
-      await sendContactEmail({ name, email, subject, message });
-    } catch (e) {
-      console.warn("Contact email failed:", e.message);
-    }
+    await sendContactEmail({
+      name: cleanName,
+      email: cleanEmail,
+      subject: cleanSubject,
+      message: cleanMessage,
+      type: "contact",
+    });
 
     res.json({
       success: true,
@@ -593,6 +607,7 @@ router.post(
         message: `Company: ${companyName}\nVolume: ${expectedVolume}\n${message || ""}`,
         companyName,
         expectedVolume,
+        type: "sales",
       });
     } catch (e) {
       console.warn("Sales contact email failed:", e.message);
