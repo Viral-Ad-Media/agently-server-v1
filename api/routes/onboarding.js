@@ -40,6 +40,122 @@ function normalizeVoice(v) {
   return process.env.DEFAULT_AGENT_VOICE || VALID_VOICES[0] || "Domi";
 }
 
+const LOCATION_TIMEZONE_RULES = [
+  {
+    match: /\b(houston|texas|dallas|austin|san antonio|fort worth)\b/i,
+    timezone: "America/Chicago",
+  },
+  {
+    match:
+      /\b(new york|brooklyn|queens|manhattan|new jersey|florida|miami|atlanta|georgia|boston|massachusetts|washington,?\s*dc|philadelphia|pennsylvania)\b/i,
+    timezone: "America/New_York",
+  },
+  {
+    match:
+      /\b(chicago|illinois|wisconsin|minnesota|louisiana|oklahoma|kansas|missouri|tennessee)\b/i,
+    timezone: "America/Chicago",
+  },
+  {
+    match: /\b(denver|colorado|utah|wyoming|montana|new mexico)\b/i,
+    timezone: "America/Denver",
+  },
+  {
+    match:
+      /\b(los angeles|california|san francisco|seattle|washington|oregon|portland|las vegas|nevada)\b/i,
+    timezone: "America/Los_Angeles",
+  },
+  { match: /\b(phoenix|arizona)\b/i, timezone: "America/Phoenix" },
+  { match: /\b(lagos|nigeria)\b/i, timezone: "Africa/Lagos" },
+  { match: /\b(accra|ghana)\b/i, timezone: "Africa/Accra" },
+  { match: /\b(london|united kingdom|england)\b/i, timezone: "Europe/London" },
+];
+
+function isValidTimezone(timezone) {
+  try {
+    if (!timezone || typeof timezone !== "string") return false;
+    new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format(new Date());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function inferTimezoneFromLocation(location) {
+  const text = String(location || "").trim();
+  if (!text) return null;
+  const rule = LOCATION_TIMEZONE_RULES.find((item) => item.match.test(text));
+  return rule?.timezone || null;
+}
+
+function resolveOnboardingTimezone(profile = {}) {
+  const locationTimezone = inferTimezoneFromLocation(profile.location);
+  const submittedTimezone = String(profile.timezone || "").trim();
+
+  // A selected business location is more reliable than the browser/device timezone.
+  // This prevents a Nigerian admin creating a Houston workspace from storing Africa/Lagos.
+  if (locationTimezone) return locationTimezone;
+  if (isValidTimezone(submittedTimezone)) return submittedTimezone;
+  return "America/Chicago";
+}
+
+function buildCoreAgentPayload(payload) {
+  return {
+    organization_id: payload.organization_id,
+    name: payload.name || "Maya",
+    direction: payload.direction || "inbound",
+    voice: payload.voice || "Zephyr",
+    language: payload.language || "English",
+    greeting:
+      payload.greeting ||
+      "Hello, thank you for calling. How can I help you today?",
+    tone: payload.tone || "Professional",
+    business_hours: payload.business_hours || "9am-5pm Monday-Friday",
+    escalation_phone: payload.escalation_phone || "",
+    voicemail_fallback: payload.voicemail_fallback ?? true,
+    data_capture_fields: payload.data_capture_fields || [
+      "name",
+      "phone",
+      "email",
+      "reason",
+    ],
+    rules: payload.rules || {
+      autoBook: false,
+      autoEscalate: true,
+      captureAllLeads: true,
+    },
+    is_active: payload.is_active ?? true,
+  };
+}
+
+async function updateVoiceAgentOptionalFieldsSafely(db, agentId, updates) {
+  let current = { ...updates };
+  const warnings = [];
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    if (!Object.keys(current).length) return warnings;
+    const { error } = await db
+      .from("voice_agents")
+      .update(current)
+      .eq("id", agentId);
+    if (!error) return warnings;
+    const missingColumn = extractMissingColumn(error);
+    if (
+      missingColumn &&
+      Object.prototype.hasOwnProperty.call(current, missingColumn)
+    ) {
+      delete current[missingColumn];
+      warnings.push(
+        `Skipped unsupported voice_agents.${missingColumn} during optional onboarding update.`,
+      );
+      continue;
+    }
+    warnings.push(
+      `Optional voice agent update skipped: ${error?.message || String(error)}`,
+    );
+    return warnings;
+  }
+  return warnings;
+}
+
 const LEGACY_VOICE_FALLBACK = {
   Domi: "Zephyr",
   Bella: "Kore",
@@ -107,8 +223,10 @@ function buildMinimalAgentPayload(payload) {
 }
 
 async function insertVoiceAgentSafely(db, payload) {
-  let current = { ...payload };
-  const warnings = [];
+  let current = buildCoreAgentPayload(payload);
+  const warnings = [
+    "Started onboarding agent creation with core schema payload to avoid live DB drift.",
+  ];
 
   for (let attempt = 0; attempt < 14; attempt += 1) {
     const { data, error } = await db
@@ -215,6 +333,8 @@ router.post(
     const db = getSupabase();
     const orgId = req.orgId;
 
+    const resolvedTimezone = resolveOnboardingTimezone(profile);
+
     // Update org profile
     await db
       .from("organizations")
@@ -223,7 +343,7 @@ router.post(
         industry: profile.industry || "",
         website: profile.website || "",
         location: profile.location || "",
-        timezone: profile.timezone || "America/Chicago",
+        timezone: resolvedTimezone,
         onboarded: false,
         updated_at: new Date().toISOString(),
       })
@@ -235,7 +355,7 @@ router.post(
       industry: profile.industry || "",
       website: profile.website || "",
       location: profile.location || "",
-      timezone: profile.timezone || "America/Chicago",
+      timezone: resolvedTimezone,
     };
     const knowledgeBase = await ensureDefaultKnowledgeBaseForOrg(
       db,
@@ -317,9 +437,27 @@ router.post(
       const result = await insertVoiceAgentSafely(db, agentPayload);
       agentRow = result.data;
       agentCreateWarnings = result.warnings || [];
+      const optionalWarnings = await updateVoiceAgentOptionalFieldsSafely(
+        db,
+        agentRow.id,
+        {
+          voicemail_behavior: agentPayload.voicemail_behavior,
+          voicemail_message: agentPayload.voicemail_message,
+          voicemail_callback_delay_minutes:
+            agentPayload.voicemail_callback_delay_minutes,
+          voicemail_max_redial_attempts:
+            agentPayload.voicemail_max_redial_attempts,
+          voicemail_settings: agentPayload.voicemail_settings,
+          call_screening_enabled: agentPayload.call_screening_enabled,
+          call_screening_message: agentPayload.call_screening_message,
+          call_screening_settings: agentPayload.call_screening_settings,
+          ...(knowledgeBase?.id ? { knowledge_base_id: knowledgeBase.id } : {}),
+        },
+      );
+      agentCreateWarnings = [...agentCreateWarnings, ...optionalWarnings];
       if (agentCreateWarnings.length) {
         console.warn(
-          "[onboarding] voice agent created with schema-safe retries:",
+          "[onboarding] voice agent created with schema-safe compatibility warnings:",
           agentCreateWarnings,
         );
       }
@@ -338,12 +476,19 @@ router.post(
     }
 
     if (knowledgeBase?.id) {
-      await assignVoiceAgentKnowledgeBase(db, {
-        organizationId: orgId,
-        agentId: agentRow.id,
-        knowledgeBaseId: knowledgeBase.id,
-      });
-      agentRow.knowledge_base_id = knowledgeBase.id;
+      try {
+        await assignVoiceAgentKnowledgeBase(db, {
+          organizationId: orgId,
+          agentId: agentRow.id,
+          knowledgeBaseId: knowledgeBase.id,
+        });
+        agentRow.knowledge_base_id = knowledgeBase.id;
+      } catch (kbAssignErr) {
+        console.warn(
+          "[onboarding] Knowledge Base assignment skipped:",
+          kbAssignErr?.message || kbAssignErr,
+        );
+      }
     }
 
     // Insert FAQs

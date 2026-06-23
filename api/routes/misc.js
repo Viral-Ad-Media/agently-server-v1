@@ -535,43 +535,29 @@ router.patch(
 router.post(
   "/contact",
   asyncHandler(async (req, res) => {
-    const { name, email, subject, message } = req.body || {};
-    const cleanName = String(name || "").trim();
-    const cleanEmail = String(email || "")
-      .toLowerCase()
-      .trim();
-    const cleanSubject = String(subject || "Website inquiry").trim();
-    const cleanMessage = String(message || "").trim();
+    const { name, email, subject, message } = req.body;
 
-    if (!cleanName || !cleanEmail || !cleanMessage) {
+    if (!name || !email || !message) {
       return res
         .status(400)
         .json({ error: { message: "Name, email, and message are required." } });
     }
 
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
-      return res
-        .status(400)
-        .json({ error: { message: "Please enter a valid email address." } });
-    }
-
     const db = getSupabase();
 
     await db.from("contact_submissions").insert({
-      name: cleanName,
-      email: cleanEmail,
-      subject: cleanSubject,
-      message: cleanMessage,
+      name: name.trim(),
+      email: email.toLowerCase().trim(),
+      subject: subject || "",
+      message: message.trim(),
       type: "contact",
     });
 
-    await sendContactEmail({
-      name: cleanName,
-      email: cleanEmail,
-      subject: cleanSubject,
-      message: cleanMessage,
-      type: "contact",
-    });
+    try {
+      await sendContactEmail({ name, email, subject, message });
+    } catch (e) {
+      console.warn("Contact email failed:", e.message);
+    }
 
     res.json({
       success: true,
@@ -607,7 +593,6 @@ router.post(
         message: `Company: ${companyName}\nVolume: ${expectedVolume}\n${message || ""}`,
         companyName,
         expectedVolume,
-        type: "sales",
       });
     } catch (e) {
       console.warn("Sales contact email failed:", e.message);
@@ -765,6 +750,122 @@ router.post(
       deletionRequested: true,
       scheduledDeletionAt,
       accessDisabled: true,
+    });
+  }),
+);
+
+// ── GET /api/dashboard/metrics ───────────────────────────────
+// Live dashboard metrics used by the frontend cards. Kept defensive because
+// some tenant databases may be ahead/behind local migrations.
+router.get(
+  "/dashboard/metrics",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const orgId = req.orgId;
+
+    const safeRows = async (table, select = "*") => {
+      const { data, error } = await db
+        .from(table)
+        .select(select)
+        .eq("organization_id", orgId);
+      if (error) {
+        console.warn(
+          `[dashboard/metrics] ${table} unavailable:`,
+          error.message,
+        );
+        return [];
+      }
+      return Array.isArray(data) ? data : [];
+    };
+
+    const [leads, chatMessages, calls, chunks] = await Promise.all([
+      safeRows("leads", "id,status,source,created_at"),
+      safeRows("chat_messages", "id,role,sender,source,created_at"),
+      safeRows(
+        "call_records",
+        "id,duration,duration_seconds,recording_duration,status,outcome,created_at,timestamp",
+      ),
+      safeRows("knowledge_chunks", "id,content,created_at"),
+    ]);
+
+    const normalizeSource = (row) =>
+      String(row.source || row.lead_source || row.channel || "").toLowerCase();
+    const sourceIncludes = (row, value) => normalizeSource(row).includes(value);
+    const statusIs = (row, value) =>
+      String(row.status || "").toLowerCase() === value;
+    const durationSeconds = (row) => {
+      const value = Number(
+        row.duration || row.duration_seconds || row.recording_duration || 0,
+      );
+      return Number.isFinite(value) ? Math.max(0, value) : 0;
+    };
+
+    const chatbotLeadsCaptured = leads.filter((lead) => {
+      const source = normalizeSource(lead);
+      return (
+        source.includes("chat") ||
+        source.includes("bot") ||
+        source.includes("widget") ||
+        source.includes("messenger")
+      );
+    }).length;
+    const callLeadsCaptured = leads.filter((lead) => {
+      const source = normalizeSource(lead);
+      return (
+        source.includes("call") ||
+        source.includes("voice") ||
+        source.includes("phone") ||
+        source.includes("twilio")
+      );
+    }).length;
+    const convertedLeads = leads.filter((lead) =>
+      ["closed", "converted", "won"].includes(
+        String(lead.status || "").toLowerCase(),
+      ),
+    ).length;
+    const chatbotMessagesAnswered = chatMessages.filter((message) =>
+      ["assistant", "bot", "agent"].includes(
+        String(message.role || message.sender || "").toLowerCase(),
+      ),
+    ).length;
+    const totalCallSeconds = calls.reduce(
+      (sum, call) => sum + durationSeconds(call),
+      0,
+    );
+    const estimatedStorageBytes = chunks.reduce(
+      (sum, chunk) =>
+        sum + Buffer.byteLength(String(chunk.content || ""), "utf8"),
+      0,
+    );
+
+    res.json({
+      success: true,
+      organizationId: orgId,
+      metrics: {
+        usage: {
+          totalCallSeconds,
+          totalCallMinutes: totalCallSeconds / 60,
+        },
+        chatbot: {
+          messagesAnswered: chatbotMessagesAnswered,
+          totalMessages: chatMessages.length,
+          leadsCaptured: chatbotLeadsCaptured,
+        },
+        leads: {
+          totalCaptured: leads.length,
+          totalLeads: leads.length,
+          converted: convertedLeads,
+          chatbotLeadsCaptured,
+          chatbotLeads: chatbotLeadsCaptured,
+          callLeadsCaptured,
+          callLeads: callLeadsCaptured,
+        },
+        knowledge: {
+          chunks: chunks.length,
+          estimatedStorageBytes,
+        },
+      },
     });
   }),
 );
