@@ -253,10 +253,28 @@ router.patch(
       agent.knowledge_base_id = requestedKnowledgeBaseId;
     }
 
-    const { data: faqs } = await db
+    const assignedKnowledgeBaseIds =
+      await getAssignedKnowledgeBaseIdsForVoiceAgent(db, {
+        organizationId: req.orgId,
+        agentId: id,
+        organization: req.organization,
+      });
+    let faqsQuery = db
       .from("faqs")
       .select("*")
-      .eq("voice_agent_id", id);
+      .eq("organization_id", req.orgId);
+    if (assignedKnowledgeBaseIds.length) {
+      faqsQuery = faqsQuery
+        .in("knowledge_base_id", assignedKnowledgeBaseIds)
+        .or(`voice_agent_id.eq.${id},voice_agent_id.is.null`);
+    } else {
+      faqsQuery = faqsQuery
+        .eq("voice_agent_id", id)
+        .is("knowledge_base_id", null);
+    }
+    const { data: faqs } = await faqsQuery.order("created_at", {
+      ascending: true,
+    });
     res.json(serializeAgent(agent, faqs || []));
   }),
 );
@@ -306,10 +324,28 @@ router.post(
       .select("*")
       .eq("id", id)
       .single();
-    const { data: faqs } = await db
+    const assignedKnowledgeBaseIds =
+      await getAssignedKnowledgeBaseIdsForVoiceAgent(db, {
+        organizationId: req.orgId,
+        agentId: id,
+        organization: req.organization,
+      });
+    let faqsQuery = db
       .from("faqs")
       .select("*")
-      .eq("voice_agent_id", id);
+      .eq("organization_id", req.orgId);
+    if (assignedKnowledgeBaseIds.length) {
+      faqsQuery = faqsQuery
+        .in("knowledge_base_id", assignedKnowledgeBaseIds)
+        .or(`voice_agent_id.eq.${id},voice_agent_id.is.null`);
+    } else {
+      faqsQuery = faqsQuery
+        .eq("voice_agent_id", id)
+        .is("knowledge_base_id", null);
+    }
+    const { data: faqs } = await faqsQuery.order("created_at", {
+      ascending: true,
+    });
     res.json(serializeAgent(updated, faqs || []));
   }),
 );

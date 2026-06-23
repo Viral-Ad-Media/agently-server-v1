@@ -90,9 +90,15 @@ async function loadActiveAgent(db, org) {
     agentId,
     organization: org,
   });
-  let faqsQuery = db.from("faqs").select("*").eq("voice_agent_id", agentId);
+  let faqsQuery = db.from("faqs").select("*").eq("organization_id", org.id);
   if (knowledgeBaseIds.length) {
-    faqsQuery = faqsQuery.in("knowledge_base_id", knowledgeBaseIds);
+    faqsQuery = faqsQuery
+      .in("knowledge_base_id", knowledgeBaseIds)
+      .or(`voice_agent_id.eq.${agentId},voice_agent_id.is.null`);
+  } else {
+    faqsQuery = faqsQuery
+      .eq("voice_agent_id", agentId)
+      .is("knowledge_base_id", null);
   }
   const { data: faqs } = await faqsQuery.order("created_at", {
     ascending: true,

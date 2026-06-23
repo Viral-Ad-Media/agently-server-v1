@@ -780,7 +780,10 @@ router.get(
     };
 
     const [leads, chatMessages, calls, chunks] = await Promise.all([
-      safeRows("leads", "id,status,source,created_at"),
+      safeRows(
+        "leads",
+        "id,status,source,lead_source,channel,metadata,created_at",
+      ),
       safeRows("chat_messages", "id,role,sender,source,created_at"),
       safeRows(
         "call_records",
@@ -789,8 +792,19 @@ router.get(
       safeRows("knowledge_chunks", "id,content,created_at"),
     ]);
 
-    const normalizeSource = (row) =>
-      String(row.source || row.lead_source || row.channel || "").toLowerCase();
+    const normalizeSource = (row) => {
+      const metadata =
+        row && typeof row.metadata === "object" ? row.metadata : {};
+      return String(
+        row.source ||
+          row.lead_source ||
+          row.channel ||
+          metadata.source ||
+          metadata.channel ||
+          metadata.capture_source ||
+          "",
+      ).toLowerCase();
+    };
     const sourceIncludes = (row, value) => normalizeSource(row).includes(value);
     const statusIs = (row, value) =>
       String(row.status || "").toLowerCase() === value;
