@@ -51,6 +51,7 @@ function requireInternalBillingAccess(req, res, next) {
   const provided = String(
     req.headers["x-internal-billing-key"] ||
       req.headers["x-agently-internal-key"] ||
+      (req.method === "GET" ? req.query?.key : "") ||
       "",
   ).trim();
 
@@ -1170,6 +1171,281 @@ router.get("/customer-margin-overview", async (req, res, next) => {
       source: "billing_admin_customer_margin_overview",
       rows: data || [],
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+function htmlEscape(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;");
+}
+
+async function loadWalletConsoleData({ organizationId = null } = {}) {
+  const sb = getSupabase();
+
+  let orgQuery = sb
+    .from("organizations")
+    .select("id,name,plan,metadata,created_at")
+    .order("created_at", { ascending: false })
+    .limit(250);
+  if (organizationId) orgQuery = orgQuery.eq("id", organizationId);
+  const { data: orgs, error: orgError } = await orgQuery;
+  if (orgError) throw orgError;
+
+  let walletQuery = sb
+    .from("billing_admin_wallet_overview")
+    .select("*")
+    .limit(500);
+  if (organizationId)
+    walletQuery = walletQuery.eq("organization_id", organizationId);
+  const { data: wallets } = await walletQuery;
+
+  let marginQuery = sb
+    .from("billing_admin_customer_margin_overview")
+    .select("*")
+    .limit(500);
+  if (organizationId)
+    marginQuery = marginQuery.eq("organization_id", organizationId);
+  const { data: margins } = await marginQuery;
+
+  let eventQuery = sb
+    .from("billing_usage_events")
+    .select(
+      "id,organization_id,provider,service,event_type,unit,quantity,estimated_cost_usd,occurred_at,billable",
+    )
+    .order("occurred_at", { ascending: false })
+    .limit(30);
+  if (organizationId)
+    eventQuery = eventQuery.eq("organization_id", organizationId);
+  const { data: recentEvents } = await eventQuery;
+
+  let txQuery = sb
+    .from("billing_wallet_transactions")
+    .select(
+      "id,organization_id,transaction_type,amount_usd,balance_after_usd,source,created_at,metadata",
+    )
+    .order("created_at", { ascending: false })
+    .limit(30);
+  if (organizationId) txQuery = txQuery.eq("organization_id", organizationId);
+  const { data: recentTransactions } = await txQuery;
+
+  let chargeQuery = sb
+    .from("billing_customer_usage_charges")
+    .select(
+      "id,organization_id,provider,service,event_type,unit,quantity,internal_cost_usd,customer_charge_usd,gross_profit_usd,gross_margin_percent,wallet_transaction_id,created_at",
+    )
+    .order("created_at", { ascending: false })
+    .limit(30);
+  if (organizationId)
+    chargeQuery = chargeQuery.eq("organization_id", organizationId);
+  const { data: recentCharges } = await chargeQuery;
+
+  return {
+    organizationId,
+    organizations: orgs || [],
+    wallets: wallets || [],
+    margins: margins || [],
+    recentEvents: recentEvents || [],
+    recentTransactions: recentTransactions || [],
+    recentCharges: recentCharges || [],
+    env: {
+      autoChargeWalletEnabled: parseBool(
+        process.env.BILLING_AUTO_CHARGE_WALLET,
+      ),
+      reconcileEnabled: parseBool(process.env.USAGE_RECONCILE_ENABLED),
+    },
+  };
+}
+
+router.get("/wallet-console-data", async (req, res, next) => {
+  try {
+    const organizationId = cleanOrgId(
+      req.query.organizationId || req.query.organization_id,
+    );
+    const data = await loadWalletConsoleData({ organizationId });
+    res.json(data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post(
+  "/wallets/:organizationId/manual-credit",
+  async (req, res, next) => {
+    try {
+      const organizationId = cleanOrgId(
+        req.params.organizationId ||
+          req.body?.organizationId ||
+          req.body?.organization_id,
+      );
+      const amountUsd = Number(req.body?.amountUsd ?? req.body?.amount_usd);
+      if (!organizationId)
+        return res
+          .status(400)
+          .json({ error: { message: "organizationId is required." } });
+      if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
+        return res
+          .status(400)
+          .json({ error: { message: "amountUsd must be greater than zero." } });
+      }
+      const sb = getSupabase();
+      const { data, error } = await sb.rpc("billing_admin_top_up_wallet", {
+        p_organization_id: organizationId,
+        p_amount_usd: amountUsd,
+        p_source: req.body?.source || "manual_backend_credit",
+        p_external_id:
+          req.body?.externalId ||
+          req.body?.external_id ||
+          `manual-credit-${Date.now()}`,
+        p_metadata: {
+          manual_backend_credit: true,
+          note:
+            req.body?.note ||
+            "Internal admin credit. Replace with payment gateway webhook in production.",
+          ...(req.body?.metadata || {}),
+        },
+      });
+      if (error) throw error;
+      res.json({
+        ok: true,
+        source: "billing_admin_top_up_wallet",
+        transaction: data,
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+router.post("/simulate-usage-charge", async (req, res, next) => {
+  try {
+    const organizationId = cleanOrgId(
+      req.body?.organizationId || req.body?.organization_id,
+    );
+    if (!organizationId)
+      return res
+        .status(400)
+        .json({ error: { message: "organizationId is required." } });
+
+    const provider = String(req.body?.provider || "twilio")
+      .trim()
+      .toLowerCase();
+    const service = String(req.body?.service || "voice")
+      .trim()
+      .toLowerCase();
+    const eventType = String(
+      req.body?.eventType || req.body?.event_type || "manual_test_usage",
+    )
+      .trim()
+      .toLowerCase();
+    const unit = String(req.body?.unit || "minutes")
+      .trim()
+      .toLowerCase();
+    const quantity = Number(req.body?.quantity ?? 1);
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      return res
+        .status(400)
+        .json({ error: { message: "quantity must be greater than zero." } });
+    }
+
+    const event = await insertUsageEvent({
+      organizationId,
+      provider,
+      service,
+      eventType,
+      source: "manual_backend_usage_simulation",
+      externalId:
+        req.body?.externalId ||
+        req.body?.external_id ||
+        `manual-usage-${Date.now()}`,
+      unit,
+      quantity,
+      estimatedCostUsd:
+        req.body?.estimatedCostUsd === undefined &&
+        req.body?.estimated_cost_usd === undefined
+          ? undefined
+          : Number(req.body?.estimatedCostUsd ?? req.body?.estimated_cost_usd),
+      metadata: {
+        manual_simulation: true,
+        apply_wallet_requested:
+          req.body?.applyWallet !== false && req.body?.apply_wallet !== false,
+        note:
+          req.body?.note ||
+          "Manual usage event used to verify wallet debit and margin tracking.",
+        ...(req.body?.metadata || {}),
+      },
+    });
+
+    let charge = null;
+    if (
+      req.body?.applyWallet !== false &&
+      req.body?.apply_wallet !== false &&
+      event?.id
+    ) {
+      const sb = getSupabase();
+      const { data, error } = await sb.rpc("billing_admin_charge_usage_event", {
+        p_usage_event_id: event.id,
+        p_apply_wallet: true,
+        p_force: false,
+      });
+      if (error) throw error;
+      charge = data || null;
+    }
+
+    res.json({ ok: true, event, charge });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get("/wallet-console", async (req, res, next) => {
+  try {
+    const key = String(req.query?.key || "").trim();
+    const data = await loadWalletConsoleData({
+      organizationId: cleanOrgId(
+        req.query.organizationId || req.query.organization_id,
+      ),
+    });
+    const orgOptions = data.organizations
+      .map(
+        (org) =>
+          `<option value="${htmlEscape(org.id)}">${htmlEscape(org.name || org.id)} · ${htmlEscape(org.plan || org.metadata?.subscription_plan || "unknown")}</option>`,
+      )
+      .join("");
+    res.setHeader("content-type", "text/html; charset=utf-8");
+    res.send(`<!doctype html>
+<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Agently Internal Wallet Console</title>
+<style>
+body{font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif;background:#f7f4eb;color:#232f3e;margin:0;padding:28px} .wrap{max-width:1180px;margin:auto} .card{background:white;border:1px solid rgba(35,47,62,.12);border-radius:22px;padding:20px;margin:14px 0;box-shadow:0 12px 35px rgba(35,47,62,.06)} h1{font-size:30px;margin:0 0 8px} h2{font-size:18px;margin:0 0 12px} label{font-size:11px;text-transform:uppercase;letter-spacing:.16em;font-weight:800;color:rgba(35,47,62,.55);display:block;margin-bottom:6px} input,select{width:100%;box-sizing:border-box;border:1px solid rgba(35,47,62,.16);border-radius:14px;padding:12px;background:#fffaf1;color:#232f3e;font-weight:700} button{border:0;background:#ff5527;color:white;border-radius:14px;padding:12px 16px;font-weight:900;cursor:pointer} button.dark{background:#232f3e}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.muted{color:rgba(35,47,62,.58);font-size:13px}.pill{display:inline-flex;border-radius:999px;background:#fff0e9;color:#ff5527;padding:6px 10px;font-size:11px;font-weight:900;text-transform:uppercase;letter-spacing:.12em} table{width:100%;border-collapse:collapse;font-size:13px}td,th{border-bottom:1px solid rgba(35,47,62,.08);padding:9px;text-align:left}pre{white-space:pre-wrap;background:#232f3e;color:#fffaf1;border-radius:16px;padding:14px;max-height:280px;overflow:auto}.ok{color:#0f9f6e;font-weight:900}.bad{color:#d92d20;font-weight:900}
+</style></head><body><div class="wrap">
+<span class="pill">Internal only</span><h1>Agently Wallet + Usage Console</h1>
+<p class="muted">Use this to manually credit any organization, simulate usage deduction, and inspect backend cost/profit. Do not expose this URL or key to tenants.</p>
+<div class="card"><h2>Environment</h2><p>Auto wallet charge: <b class="${data.env.autoChargeWalletEnabled ? "ok" : "bad"}">${data.env.autoChargeWalletEnabled ? "ON" : "OFF"}</b> · Reconcile enabled: <b>${data.env.reconcileEnabled ? "ON" : "OFF"}</b></p><p class="muted">For real service usage to deduct automatically, set <b>BILLING_AUTO_CHARGE_WALLET=true</b>.</p></div>
+<div class="card"><h2>Select organization</h2><div class="grid"><div><label>Organization</label><select id="org">${orgOptions}</select></div><div style="align-self:end"><button class="dark" onclick="reloadOrg()">Load organization</button></div></div></div>
+<div class="grid"><div class="card"><h2>Add manual credit</h2><label>Amount USD</label><input id="creditAmount" type="number" step="0.01" value="10"/><br/><br/><button onclick="credit()">Add credit</button></div>
+<div class="card"><h2>Simulate usage + wallet debit</h2><div class="grid"><div><label>Provider</label><input id="provider" value="twilio"/></div><div><label>Service</label><input id="service" value="voice"/></div><div><label>Unit</label><input id="unit" value="minutes"/></div><div><label>Quantity</label><input id="qty" type="number" step="0.01" value="1"/></div></div><br/><button onclick="simulate()">Create usage and deduct wallet</button></div></div>
+<div class="card"><h2>Current wallet / margin</h2><div id="summary" class="muted">Loading...</div></div>
+<div class="card"><h2>Recent charges</h2><div id="charges"></div></div>
+<div class="card"><h2>Recent wallet transactions</h2><div id="tx"></div></div>
+<div class="card"><h2>Result</h2><pre id="out">Ready.</pre></div>
+</div><script>
+const KEY=${JSON.stringify(key)};
+function headers(){return {'content-type':'application/json','x-internal-billing-key':KEY};}
+function org(){return document.getElementById('org').value;}
+function money(v){return '$'+Number(v||0).toFixed(2)}
+function table(rows, cols){ if(!rows||!rows.length) return '<p class="muted">No rows yet.</p>'; return '<table><thead><tr>'+cols.map(c=>'<th>'+c[0]+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr>'+cols.map(c=>'<td>'+String(c[1](r)??'')+'</td>').join('')+'</tr>').join('')+'</tbody></table>';}
+async function load(){const r=await fetch('/api/billing-usage/wallet-console-data?organizationId='+encodeURIComponent(org()),{headers:headers()}); const d=await r.json(); if(!r.ok) throw new Error(d?.error?.message||'Load failed'); render(d)}
+function render(d){const w=(d.wallets||[])[0]||{}; const m=(d.margins||[])[0]||{}; document.getElementById('summary').innerHTML='<div class="grid"><div><b>Wallet balance</b><br>'+money(w.wallet_balance_usd||w.balance_usd)+'</div><div><b>Total customer charges</b><br>'+money(m.total_customer_charge_usd)+'</div><div><b>Internal cost</b><br>'+money(m.total_internal_cost_usd)+'</div><div><b>Gross profit</b><br>'+money(m.total_gross_profit_usd)+'</div></div>'; document.getElementById('charges').innerHTML=table(d.recentCharges,[['When',r=>new Date(r.created_at).toLocaleString()],['Provider',r=>r.provider+'/'+r.service],['Qty',r=>Number(r.quantity||0)+' '+(r.unit||'')],['Customer charge',r=>money(r.customer_charge_usd)],['Internal cost',r=>money(r.internal_cost_usd)],['Profit',r=>money(r.gross_profit_usd)]]); document.getElementById('tx').innerHTML=table(d.recentTransactions,[['When',r=>new Date(r.created_at).toLocaleString()],['Type',r=>r.transaction_type],['Amount',r=>money(r.amount_usd)],['Balance after',r=>money(r.balance_after_usd)],['Source',r=>r.source]]);}
+async function credit(){const amountUsd=Number(document.getElementById('creditAmount').value||0); const r=await fetch('/api/billing-usage/wallets/'+encodeURIComponent(org())+'/manual-credit',{method:'POST',headers:headers(),body:JSON.stringify({amountUsd})}); const d=await r.json(); document.getElementById('out').textContent=JSON.stringify(d,null,2); await load();}
+async function simulate(){const body={organizationId:org(),provider:document.getElementById('provider').value,service:document.getElementById('service').value,unit:document.getElementById('unit').value,quantity:Number(document.getElementById('qty').value||1),applyWallet:true}; const r=await fetch('/api/billing-usage/simulate-usage-charge',{method:'POST',headers:headers(),body:JSON.stringify(body)}); const d=await r.json(); document.getElementById('out').textContent=JSON.stringify(d,null,2); await load();}
+function reloadOrg(){location.href='/api/billing-usage/wallet-console?key='+encodeURIComponent(KEY)+'&organizationId='+encodeURIComponent(org())}
+document.getElementById('org').value=${JSON.stringify(data.organizationId || data.organizations[0]?.id || "")}; load().catch(e=>document.getElementById('out').textContent=e.message); setInterval(()=>load().catch(()=>{}),8000);
+</script></body></html>`);
   } catch (err) {
     next(err);
   }

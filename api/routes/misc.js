@@ -111,6 +111,34 @@ async function loadCustomerWalletSummary(db, organizationId, limit = 8) {
       metadata: tx.metadata || {},
     }));
 
+    const { data: chargeRows } = await db
+      .from("billing_customer_usage_charges")
+      .select(
+        "id,provider,service,event_type,unit,quantity,internal_cost_usd,customer_charge_usd,gross_profit_usd,gross_margin_percent,wallet_transaction_id,created_at,metadata",
+      )
+      .eq("organization_id", organizationId)
+      .order("created_at", { ascending: false })
+      .limit(Math.min(Math.max(Number(limit) || 8, 1), 25));
+
+    const recentUsageCharges = (chargeRows || []).map((charge) => ({
+      id: charge.id,
+      provider: charge.provider || "usage",
+      service: charge.service || "usage",
+      eventType: charge.event_type || "usage",
+      unit: charge.unit || "unit",
+      quantity: Number(charge.quantity || 0),
+      customerChargeUsd: Number(charge.customer_charge_usd || 0),
+      walletTransactionId: charge.wallet_transaction_id || null,
+      createdAt: charge.created_at,
+      metadata: charge.metadata || {},
+    }));
+
+    wallet.recentUsageCharges = recentUsageCharges;
+    wallet.totalUsageChargesUsd = recentUsageCharges.reduce(
+      (sum, charge) => sum + Number(charge.customerChargeUsd || 0),
+      0,
+    );
+
     return wallet;
   } catch (err) {
     return {
