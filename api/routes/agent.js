@@ -348,7 +348,11 @@ router.post(
         .json({ error: { message: "No website URL provided or configured." } });
     }
 
-    const faqs = await generateFaqsFromWebsite(targetWebsite);
+    const faqs = await generateFaqsFromWebsite(targetWebsite, {
+      organizationId: req.orgId,
+      userId: req.user?.id,
+      metadata: { route: "agent.faqs.sync" },
+    });
     const agentId = await resolveFaqAgentId(db, req);
     if (!agentId) {
       return res.status(404).json({

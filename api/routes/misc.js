@@ -17,6 +17,110 @@ const {
 
 const router = express.Router();
 
+function parseBillingDemoBool(value) {
+  return ["1", "true", "yes", "on"].includes(String(value || "").toLowerCase());
+}
+
+async function loadCustomerWalletSummary(db, organizationId, limit = 8) {
+  const emptyWallet = {
+    enabled: true,
+    currency: "USD",
+    balanceUsd: 0,
+    minimumRechargeUsd: 30,
+    status: "not_created",
+    latestTransactionAt: null,
+    recentTransactions: [],
+  };
+
+  if (!organizationId) return emptyWallet;
+
+  try {
+    let wallet = null;
+    const { data: walletRows, error: walletViewError } = await db
+      .from("billing_admin_wallet_overview")
+      .select("*")
+      .eq("organization_id", organizationId)
+      .limit(1);
+
+    if (!walletViewError && Array.isArray(walletRows) && walletRows.length) {
+      const row = walletRows[0];
+      wallet = {
+        enabled: true,
+        walletId: row.wallet_id || row.id || null,
+        currency: row.currency || "USD",
+        balanceUsd: Number(row.wallet_balance_usd ?? row.balance_usd ?? 0),
+        minimumRechargeUsd: Number(row.minimum_recharge_usd ?? 30),
+        status: row.wallet_status || row.status || "active",
+        totalCreditsUsd: Number(
+          row.total_credit_usd ?? row.total_credits_usd ?? 0,
+        ),
+        totalDebitsUsd: Number(
+          row.total_debit_usd ?? row.total_debits_usd ?? 0,
+        ),
+        latestTransactionAt: row.latest_transaction_at || null,
+        recentTransactions: [],
+      };
+    }
+
+    if (!wallet) {
+      const { data: rawWallet } = await db
+        .from("billing_wallets")
+        .select(
+          "id,currency,balance_usd,minimum_recharge_usd,status,updated_at",
+        )
+        .eq("organization_id", organizationId)
+        .maybeSingle();
+      wallet = rawWallet
+        ? {
+            enabled: true,
+            walletId: rawWallet.id,
+            currency: rawWallet.currency || "USD",
+            balanceUsd: Number(rawWallet.balance_usd || 0),
+            minimumRechargeUsd: Number(rawWallet.minimum_recharge_usd || 30),
+            status: rawWallet.status || "active",
+            latestTransactionAt: rawWallet.updated_at || null,
+            recentTransactions: [],
+          }
+        : emptyWallet;
+    }
+
+    const { data: txRows } = await db
+      .from("billing_wallet_transactions")
+      .select(
+        "id,transaction_type,amount_usd,balance_before_usd,balance_after_usd,source,external_id,created_at,metadata",
+      )
+      .eq("organization_id", organizationId)
+      .order("created_at", { ascending: false })
+      .limit(Math.min(Math.max(Number(limit) || 8, 1), 25));
+
+    wallet.recentTransactions = (txRows || []).map((tx) => ({
+      id: tx.id,
+      type: tx.transaction_type,
+      amountUsd: Number(tx.amount_usd || 0),
+      balanceBeforeUsd:
+        tx.balance_before_usd === null
+          ? null
+          : Number(tx.balance_before_usd || 0),
+      balanceAfterUsd:
+        tx.balance_after_usd === null
+          ? null
+          : Number(tx.balance_after_usd || 0),
+      source: tx.source || "wallet",
+      externalId: tx.external_id || null,
+      createdAt: tx.created_at,
+      metadata: tx.metadata || {},
+    }));
+
+    return wallet;
+  } catch (err) {
+    return {
+      ...emptyWallet,
+      enabled: false,
+      warning: `Wallet tables/views are not available yet: ${err.message || String(err)}`,
+    };
+  }
+}
+
 // ============================================================
 // TEAM
 // ============================================================
@@ -195,6 +299,11 @@ router.post(
         req.organization.name,
         role,
         magicLinkUrl,
+        {
+          organizationId: req.orgId,
+          userId: req.user?.id,
+          route: "team.invite",
+        },
       );
     } catch (e) {
       console.warn("Invite email failed:", e.message);
@@ -288,6 +397,8 @@ router.get(
       .filter((invoice) => invoice.status !== "Paid")
       .reduce((sum, invoice) => sum + Number(invoice.amount || 0), 0);
 
+    const wallet = await loadCustomerWalletSummary(db, req.orgId, 8);
+
     const plan = org?.plan || req.organization?.plan || "Starter";
     const minuteLimit =
       plan === "Starter" ? 500 : Number(org?.minute_limit || 2500);
@@ -316,6 +427,79 @@ router.get(
         pendingAmount,
         invoiceCount: serializedInvoices.length,
       },
+      wallet: {
+        ...wallet,
+        demoTopUpEnabled: parseBillingDemoBool(
+          process.env.BILLING_DEMO_TOPUP_ENABLED,
+        ),
+      },
+    });
+  }),
+);
+
+// ── POST /api/billing/wallet/demo-top-up ─────────────────────
+router.post(
+  "/billing/wallet/demo-top-up",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    if (!parseBillingDemoBool(process.env.BILLING_DEMO_TOPUP_ENABLED)) {
+      return res.status(403).json({
+        error: {
+          message:
+            "Demo wallet top-up is disabled. Set BILLING_DEMO_TOPUP_ENABLED=true on the backend to use this manual test mode.",
+        },
+      });
+    }
+
+    const amountUsd = Number(req.body?.amountUsd ?? req.body?.amount_usd ?? 30);
+    if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
+      return res
+        .status(400)
+        .json({ error: { message: "amountUsd must be greater than zero." } });
+    }
+    if (amountUsd > 500) {
+      return res.status(400).json({
+        error: { message: "Demo wallet top-up is capped at $500 per request." },
+      });
+    }
+
+    const db = getSupabase();
+    const { data, error } = await db.rpc("billing_admin_top_up_wallet", {
+      p_organization_id: req.orgId,
+      p_amount_usd: amountUsd,
+      p_source: "manual_demo_top_up",
+      p_external_id: req.body?.externalId || `demo-top-up-${Date.now()}`,
+      p_metadata: {
+        manual_demo: true,
+        performed_by_user_id: req.user?.id || null,
+        performed_by_user_email: req.user?.email || null,
+        note: "Manual wallet credit used for billing-system demonstration. Replace with payment-gateway webhook when live.",
+        ...(req.body?.metadata || {}),
+      },
+    });
+
+    if (error) {
+      return res.status(500).json({
+        error: {
+          message:
+            error.message ||
+            "Unable to add demo wallet credit. Confirm the V41 wallet migration has been run.",
+        },
+      });
+    }
+
+    const wallet = await loadCustomerWalletSummary(db, req.orgId, 8);
+    res.json({
+      success: true,
+      source: "billing_admin_top_up_wallet",
+      mode: "manual_demo_top_up",
+      transaction: data,
+      wallet: {
+        ...wallet,
+        demoTopUpEnabled: true,
+      },
+      note: "This simulates a real top-up. It is not payment-verified and should be replaced by gateway webhook crediting before production billing.",
     });
   }),
 );
@@ -554,7 +738,10 @@ router.post(
     });
 
     try {
-      await sendContactEmail({ name, email, subject, message });
+      await sendContactEmail(
+        { name, email, subject, message },
+        { route: "contact.form" },
+      );
     } catch (e) {
       console.warn("Contact email failed:", e.message);
     }

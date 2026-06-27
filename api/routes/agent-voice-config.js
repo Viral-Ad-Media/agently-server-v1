@@ -568,6 +568,13 @@ router.post(
       modelId: body.modelId || body.model_id || voice.modelId,
       outputFormat: body.outputFormat || body.output_format,
       voiceSettings: settings,
+      usageContext: {
+        organizationId: req.orgId,
+        userId: req.user?.id,
+        voiceAgentId: agent.id,
+        service: "voice_preview",
+        route: "agent_voice_config.test_voice",
+      },
     });
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("X-Voice-Provider", "elevenlabs");

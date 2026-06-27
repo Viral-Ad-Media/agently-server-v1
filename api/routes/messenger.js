@@ -6,6 +6,7 @@ const { requireAuth } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 const { generateChatResponse } = require("../../lib/openai");
 const { serializeMessage } = require("../../lib/serializers");
+const { logChatbotConversationUsage } = require("../../lib/billing-limits");
 const {
   loadChatbotContext,
   loadVoiceContext,
@@ -104,6 +105,12 @@ router.post(
       message.trim(),
       history || [],
       systemPrompt,
+      {
+        organizationId: orgId,
+        userId: req.user?.id,
+        chatbotId: chatbotId || null,
+        metadata: { route: "messenger.messages" },
+      },
     );
 
     const { data: aiMsg } = await db
@@ -128,6 +135,24 @@ router.post(
         })
         .catch(() => {});
     }
+
+    await logChatbotConversationUsage({
+      organizationId: orgId,
+      userId: req.user?.id,
+      chatbotId: chatbotId || unresolvedChatbotId || null,
+      messageId: aiMsg?.id || null,
+      metadata: {
+        route: "messenger.messages",
+        user_message_id: userMsg?.id || null,
+        assistant_message_id: aiMsg?.id || null,
+        unanswered: isUnanswered(aiText),
+      },
+    }).catch((err) => {
+      console.warn(
+        "[billing] chatbot conversation usage log skipped",
+        err.message || String(err),
+      );
+    });
 
     const { data: updatedHistory } = await (chatbotId
       ? db

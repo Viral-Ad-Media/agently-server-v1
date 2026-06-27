@@ -58,6 +58,11 @@ const {
   updateCallRecordById,
   finalizeUsage,
 } = require("../../lib/call-records");
+const {
+  logTwilioCallUsage,
+  logStorageUsage,
+  logOpenAIUsage,
+} = require("../../lib/usage-ledger");
 const { mapTwilioError } = require("../../lib/twilio-errors");
 const { checkOpenAIRealtimeProvider } = require("../../lib/ai-provider-health");
 const voiceBehavior = require("../../lib/voice-behavior");
@@ -1313,6 +1318,37 @@ router.post(
           },
           generalColumnsPatch,
         );
+
+        if (terminalStatuses.has(normalizedStatus)) {
+          try {
+            const db = getSupabase();
+            const { data: usageRecord } = await db
+              .from("call_records")
+              .select("id, organization_id, voice_agent_id")
+              .eq("twilio_call_sid", CallSid)
+              .maybeSingle();
+            await logTwilioCallUsage({
+              organizationId: usageRecord?.organization_id || null,
+              callId: usageRecord?.id || null,
+              voiceAgentId: usageRecord?.voice_agent_id || null,
+              accountSid: req.body?.AccountSid || req.body?.accountSid || "",
+              callSid: CallSid,
+              direction: req.body?.Direction || direction || "",
+              status: CallStatus,
+              durationSeconds,
+              price: req.body?.Price,
+              priceUnit: req.body?.PriceUnit,
+              from: req.body?.From || "",
+              to: To || req.body?.To || "",
+              metadata: { raw_status_callback: req.body || {} },
+            });
+          } catch (usageErr) {
+            console.warn("[usage-ledger] Twilio call usage log skipped", {
+              callSid: CallSid,
+              error: usageErr.message || String(usageErr),
+            });
+          }
+        }
       } catch (err) {
         console.warn(
           "[Twilio call-status] general call record update skipped",
@@ -1621,6 +1657,28 @@ router.post(
           });
 
           try {
+            await logStorageUsage({
+              organizationId: callRecord.organization_id,
+              service: "call_recording",
+              bytes: downloaded.buffer.length,
+              metadata: {
+                bucket: upload.bucket,
+                storage_path: upload.storagePath,
+                call_record_id: callRecord.id,
+                call_sid: CallSid,
+                recording_sid: RecordingSid,
+                mime_type: downloaded.mimeType,
+              },
+            });
+          } catch (usageErr) {
+            console.warn("[usage-ledger] recording storage log skipped", {
+              callSid: CallSid,
+              recordingSid: RecordingSid,
+              error: usageErr.message || String(usageErr),
+            });
+          }
+
+          try {
             const tx = await transcribeRecordingWithOpenAI({
               buffer: downloaded.buffer,
               filename: `${RecordingSid}.mp3`,
@@ -1638,6 +1696,31 @@ router.post(
               completed_at: new Date().toISOString(),
               skipped: Boolean(tx.skipped),
             };
+            try {
+              await logOpenAIUsage({
+                organizationId: callRecord.organization_id,
+                service: "call_transcription",
+                eventType: "openai_transcription",
+                model:
+                  tx.model ||
+                  process.env.OPENAI_TRANSCRIPTION_MODEL ||
+                  "gpt-4o-mini-transcribe",
+                callId: callRecord.id,
+                inputTokens: 0,
+                outputTokens: 0,
+                metadata: {
+                  call_sid: CallSid,
+                  recording_sid: RecordingSid,
+                  note: "Transcription models may not expose token usage. Reconcile against OpenAI exports if exact usage is required.",
+                },
+              });
+            } catch (usageErr) {
+              console.warn("[usage-ledger] transcription usage log skipped", {
+                callSid: CallSid,
+                recordingSid: RecordingSid,
+                error: usageErr.message || String(usageErr),
+              });
+            }
             if (tx.text) {
               const existingTranscript = transcriptToText(
                 callRecord.transcript,

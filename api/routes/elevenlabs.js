@@ -134,6 +134,13 @@ async function sendPreviewAudio(
     modelId: modelId || voice.modelId,
     outputFormat,
     voiceSettings: normalizeVoiceSettings(voiceSettings || {}),
+    usageContext: {
+      organizationId: req.orgId,
+      userId: req.user?.id,
+      service: "voice_preview",
+      route: "elevenlabs.preview",
+      metadata: { endpoint: req.originalUrl || req.path },
+    },
   });
 
   res.setHeader("Cache-Control", "no-store");

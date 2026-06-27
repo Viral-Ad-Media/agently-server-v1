@@ -443,6 +443,11 @@ async function maybeSendUnreadThresholdEmail(db, req, metrics) {
       req.user.name,
       req.organization.name,
       metrics.unread,
+      {
+        organizationId: req.orgId,
+        userId: req.user?.id,
+        route: "notifications.digest",
+      },
     );
     await db.from("tenant_notifications").insert({
       organization_id: req.orgId,
