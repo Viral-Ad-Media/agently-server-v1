@@ -362,13 +362,41 @@ function mediaStreamUrl(params) {
   const wsBase = WS_URL();
   const url = new URL("/api/twilio/media-stream", wsBase);
   const includeQueryParams =
-    String(process.env.TWILIO_STREAM_QUERY_PARAMS || "false")
+    String(process.env.TWILIO_STREAM_QUERY_PARAMS || "true")
       .trim()
-      .toLowerCase() === "true";
+      .toLowerCase() !== "false";
   if (includeQueryParams) {
+    // Twilio sends <Parameter> values inside the stream start event, but the
+    // realtime server needs the critical IDs before the first audio packet so it
+    // can load the correct agent and Knowledge Base without a silent delay.
+    const criticalKeys = new Set([
+      "orgId",
+      "organizationId",
+      "agentId",
+      "callRecordId",
+      "callSid",
+      "direction",
+      "leadId",
+      "scheduleId",
+      "recipientName",
+      "targetName",
+      "callPurpose",
+      "openingGreeting",
+      "greetingMessage",
+      "agentName",
+      "organizationName",
+      "openAiVoice",
+      "selectedVoiceId",
+      "selectedVoiceName",
+    ]);
     Object.entries(params || {}).forEach(([key, value]) => {
+      if (!criticalKeys.has(key)) return;
       if (value === undefined || value === null || value === "") return;
-      url.searchParams.set(key, String(value));
+      const clean = String(value);
+      url.searchParams.set(
+        key,
+        clean.length > 900 ? clean.slice(0, 900) : clean,
+      );
     });
   }
   return url.toString();
