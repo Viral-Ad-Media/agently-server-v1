@@ -5,6 +5,9 @@ const { getSupabase } = require("../../lib/supabase");
 const { requireAuth, requireAdmin } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 const {
+  ensureWalletCreditOrRespond,
+} = require("../../lib/billing-credit-enforcement");
+const {
   cleanText,
   normalizeUrl,
   domainFromUrl,
@@ -884,6 +887,12 @@ router.post(
   requireAuth,
   requireAdmin,
   asyncHandler(async (req, res) => {
+    const creditAllowed = await ensureWalletCreditOrRespond(req, res, {
+      organizationId: req.orgId,
+      action: "knowledge_sync",
+    });
+    if (creditAllowed !== true) return;
+
     const db = getSupabase();
     const base = await verifyKnowledgeBase(db, {
       organizationId: req.orgId,

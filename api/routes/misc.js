@@ -21,6 +21,13 @@ function parseBillingDemoBool(value) {
   return ["1", "true", "yes", "on"].includes(String(value || "").toLowerCase());
 }
 
+function currentCreditEnforcementMode() {
+  const mode = String(
+    process.env.BILLING_CREDIT_ENFORCEMENT_MODE || "observe",
+  ).toLowerCase();
+  return ["observe", "warn", "block"].includes(mode) ? mode : "observe";
+}
+
 async function loadCustomerWalletSummary(db, organizationId, limit = 8) {
   const emptyWallet = {
     enabled: true,
@@ -460,6 +467,20 @@ router.get(
         demoTopUpEnabled: parseBillingDemoBool(
           process.env.BILLING_DEMO_TOPUP_ENABLED,
         ),
+        creditEnforcementMode: currentCreditEnforcementMode(),
+        autoChargeWalletEnabled: parseBillingDemoBool(
+          process.env.BILLING_AUTO_CHARGE_WALLET,
+        ),
+        minimums: {
+          callUsd: Number(process.env.BILLING_MIN_CALL_CREDIT_USD || 1),
+          chatUsd: Number(process.env.BILLING_MIN_CHAT_CREDIT_USD || 0.05),
+          voicePreviewUsd: Number(
+            process.env.BILLING_MIN_VOICE_PREVIEW_CREDIT_USD || 0.05,
+          ),
+          knowledgeSyncUsd: Number(
+            process.env.BILLING_MIN_KNOWLEDGE_SYNC_CREDIT_USD || 0.25,
+          ),
+        },
       },
     });
   }),

@@ -5,6 +5,10 @@ const { getSupabase } = require("../../lib/supabase");
 const { asyncHandler } = require("../../middleware/error");
 const { getOpenAI } = require("../../lib/openai-client");
 const {
+  getWalletCreditStatus,
+  insufficientCreditPayload,
+} = require("../../lib/billing-credit-enforcement");
+const {
   loadChatbotContext,
   buildAssistantPrompt,
   generateGroundedChatResponse,
@@ -28,6 +32,30 @@ const LANG_NAMES = {
   nl: "Dutch",
 };
 const rateLimitMap = new Map();
+
+async function findChatbotOrganizationId(chatbotId) {
+  if (!chatbotId) return null;
+  try {
+    const { data } = await getSupabase()
+      .from("chatbots")
+      .select("organization_id")
+      .eq("id", chatbotId)
+      .maybeSingle();
+    return data?.organization_id || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function enforcePublicChatbotCredit(res, chatbotId, action) {
+  const organizationId = await findChatbotOrganizationId(chatbotId);
+  const status = await getWalletCreditStatus({ organizationId, action });
+  if (status.shouldBlock) {
+    res.status(402).json(insufficientCreditPayload(status));
+    return false;
+  }
+  return true;
+}
 function isRateLimited(key) {
   const now = Date.now(),
     windowMs = 60000,
@@ -166,6 +194,8 @@ router.post(
         response:
           "I'm receiving many messages right now. Please try again in a moment.",
       });
+    if (!(await enforcePublicChatbotCredit(res, chatbotId, "chatbot_message")))
+      return;
     let result;
     try {
       result = await generateGroundedChatResponse({
@@ -336,6 +366,8 @@ router.post(
       return res
         .status(400)
         .json({ error: { message: "chatbotId is required." } });
+    if (!(await enforcePublicChatbotCredit(res, chatbotId, "voice_call")))
+      return;
     if (isRateLimited(`voice:${chatbotId}`))
       return res
         .status(429)
@@ -433,6 +465,11 @@ router.post(
     const { chatbotId, text } = req.body || {};
     if (!text)
       return res.status(400).json({ error: { message: "text is required." } });
+    if (
+      chatbotId &&
+      !(await enforcePublicChatbotCredit(res, chatbotId, "voice_preview"))
+    )
+      return;
     let voice = "alloy";
     if (chatbotId) {
       try {

@@ -1085,6 +1085,92 @@ router.post("/wallets/:organizationId/top-up", async (req, res, next) => {
   }
 });
 
+router.patch("/wallets/:organizationId/balance", async (req, res, next) => {
+  try {
+    const organizationId = cleanOrgId(
+      req.params.organizationId ||
+        req.body?.organizationId ||
+        req.body?.organization_id,
+    );
+    const mode = String(
+      req.body?.mode ||
+        req.body?.adjustmentMode ||
+        req.body?.adjustment_mode ||
+        "set_balance",
+    ).toLowerCase();
+    const amountUsd = Number(
+      req.body?.amountUsd ??
+        req.body?.amount_usd ??
+        req.body?.balanceUsd ??
+        req.body?.balance_usd ??
+        0,
+    );
+    if (!organizationId)
+      return res
+        .status(400)
+        .json({ error: { message: "organizationId is required." } });
+    if (!Number.isFinite(amountUsd)) {
+      return res
+        .status(400)
+        .json({ error: { message: "amountUsd must be a valid number." } });
+    }
+    const sb = getSupabase();
+    const { data, error } = await sb.rpc(
+      "billing_admin_adjust_wallet_balance",
+      {
+        p_organization_id: organizationId,
+        p_mode: mode,
+        p_amount_usd: amountUsd,
+        p_source: req.body?.source || "manual_admin_balance_adjustment",
+        p_external_id: req.body?.externalId || req.body?.external_id || null,
+        p_metadata: req.body?.metadata || {},
+      },
+    );
+    if (error) throw error;
+
+    const { data: walletRows } = await sb
+      .from("billing_admin_wallet_enforcement_status")
+      .select("*")
+      .eq("organization_id", organizationId)
+      .limit(1);
+
+    res.json({
+      ok: true,
+      source: "billing_admin_adjust_wallet_balance",
+      transaction: data,
+      wallet: Array.isArray(walletRows) ? walletRows[0] || null : null,
+      examples: {
+        setToFive: `PATCH /api/billing-usage/wallets/${organizationId}/balance { mode: 'set_balance', amountUsd: 5 }`,
+        clearToZero: `PATCH /api/billing-usage/wallets/${organizationId}/balance { mode: 'clear', amountUsd: 0 }`,
+        addTen: `PATCH /api/billing-usage/wallets/${organizationId}/balance { mode: 'top_up', amountUsd: 10 }`,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get("/wallet-enforcement-status", async (req, res, next) => {
+  try {
+    const sb = getSupabase();
+    let query = sb.from("billing_admin_wallet_enforcement_status").select("*");
+    const organizationId = cleanOrgId(
+      req.query.organizationId || req.query.organization_id,
+    );
+    if (organizationId) query = query.eq("organization_id", organizationId);
+    const { data, error } = await query
+      .order("wallet_balance_usd", { ascending: true })
+      .limit(500);
+    if (error) throw error;
+    res.json({
+      source: "billing_admin_wallet_enforcement_status",
+      rows: data || [],
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post("/charge-usage-event", async (req, res, next) => {
   try {
     const usageEventId = cleanOrgId(
@@ -1256,6 +1342,11 @@ async function loadWalletConsoleData({ organizationId = null } = {}) {
       autoChargeWalletEnabled: parseBool(
         process.env.BILLING_AUTO_CHARGE_WALLET,
       ),
+      creditEnforcementMode: String(
+        process.env.BILLING_CREDIT_ENFORCEMENT_MODE || "observe",
+      ),
+      minCallCreditUsd: Number(process.env.BILLING_MIN_CALL_CREDIT_USD || 1),
+      minChatCreditUsd: Number(process.env.BILLING_MIN_CHAT_CREDIT_USD || 0.05),
       reconcileEnabled: parseBool(process.env.USAGE_RECONCILE_ENABLED),
     },
   };
@@ -1314,6 +1405,70 @@ router.post(
         ok: true,
         source: "billing_admin_top_up_wallet",
         transaction: data,
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+router.patch(
+  "/wallets/:organizationId/manual-balance",
+  async (req, res, next) => {
+    try {
+      const organizationId = cleanOrgId(
+        req.params.organizationId ||
+          req.body?.organizationId ||
+          req.body?.organization_id,
+      );
+      const mode = String(req.body?.mode || "set_balance")
+        .trim()
+        .toLowerCase();
+      const amountUsd = Number(
+        req.body?.amountUsd ??
+          req.body?.amount_usd ??
+          req.body?.balanceUsd ??
+          req.body?.balance_usd ??
+          0,
+      );
+      if (!organizationId)
+        return res
+          .status(400)
+          .json({ error: { message: "organizationId is required." } });
+      if (!Number.isFinite(amountUsd))
+        return res
+          .status(400)
+          .json({ error: { message: "amountUsd must be a valid number." } });
+      const sb = getSupabase();
+      const { data, error } = await sb.rpc(
+        "billing_admin_adjust_wallet_balance",
+        {
+          p_organization_id: organizationId,
+          p_mode: mode,
+          p_amount_usd: amountUsd,
+          p_source: req.body?.source || "manual_backend_wallet_console",
+          p_external_id:
+            req.body?.externalId ||
+            req.body?.external_id ||
+            `manual-balance-${Date.now()}`,
+          p_metadata: {
+            manual_backend_adjustment: true,
+            note: req.body?.note || "Internal admin wallet balance adjustment.",
+            ...(req.body?.metadata || {}),
+          },
+        },
+      );
+      if (error) throw error;
+      const { data: statusRows } = await sb
+        .from("billing_admin_wallet_enforcement_status")
+        .select("*")
+        .eq("organization_id", organizationId)
+        .limit(1);
+      res.json({
+        ok: true,
+        source: "billing_admin_adjust_wallet_balance",
+        transaction: data,
+        wallet: statusRows?.[0] || null,
       });
     } catch (err) {
       next(err);
@@ -1427,7 +1582,7 @@ body{font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif;background:#f
 <p class="muted">Use this to manually credit any organization, simulate usage deduction, and inspect backend cost/profit. Do not expose this URL or key to tenants.</p>
 <div class="card"><h2>Environment</h2><p>Auto wallet charge: <b class="${data.env.autoChargeWalletEnabled ? "ok" : "bad"}">${data.env.autoChargeWalletEnabled ? "ON" : "OFF"}</b> · Reconcile enabled: <b>${data.env.reconcileEnabled ? "ON" : "OFF"}</b></p><p class="muted">For real service usage to deduct automatically, set <b>BILLING_AUTO_CHARGE_WALLET=true</b>.</p></div>
 <div class="card"><h2>Select organization</h2><div class="grid"><div><label>Organization</label><select id="org">${orgOptions}</select></div><div style="align-self:end"><button class="dark" onclick="reloadOrg()">Load organization</button></div></div></div>
-<div class="grid"><div class="card"><h2>Add manual credit</h2><label>Amount USD</label><input id="creditAmount" type="number" step="0.01" value="10"/><br/><br/><button onclick="credit()">Add credit</button></div>
+<div class="grid"><div class="card"><h2>Wallet balance controls</h2><label>Amount / target balance USD</label><input id="creditAmount" type="number" step="0.01" value="10"/><br/><br/><button onclick="credit()">Add credit</button> <button onclick="setBalance()">Set balance</button> <button onclick="clearBalance()">Clear to $0</button><p class="muted">Use Add credit for top-ups. Use Set balance when you need to change $10 to exactly $5. Use Clear for a $0 default tenant.</p></div>
 <div class="card"><h2>Simulate usage + wallet debit</h2><div class="grid"><div><label>Provider</label><input id="provider" value="twilio"/></div><div><label>Service</label><input id="service" value="voice"/></div><div><label>Unit</label><input id="unit" value="minutes"/></div><div><label>Quantity</label><input id="qty" type="number" step="0.01" value="1"/></div></div><br/><button onclick="simulate()">Create usage and deduct wallet</button></div></div>
 <div class="card"><h2>Current wallet / margin</h2><div id="summary" class="muted">Loading...</div></div>
 <div class="card"><h2>Recent charges</h2><div id="charges"></div></div>
@@ -1442,6 +1597,8 @@ function table(rows, cols){ if(!rows||!rows.length) return '<p class="muted">No 
 async function load(){const r=await fetch('/api/billing-usage/wallet-console-data?organizationId='+encodeURIComponent(org()),{headers:headers()}); const d=await r.json(); if(!r.ok) throw new Error(d?.error?.message||'Load failed'); render(d)}
 function render(d){const w=(d.wallets||[])[0]||{}; const m=(d.margins||[])[0]||{}; document.getElementById('summary').innerHTML='<div class="grid"><div><b>Wallet balance</b><br>'+money(w.wallet_balance_usd||w.balance_usd)+'</div><div><b>Total customer charges</b><br>'+money(m.total_customer_charge_usd)+'</div><div><b>Internal cost</b><br>'+money(m.total_internal_cost_usd)+'</div><div><b>Gross profit</b><br>'+money(m.total_gross_profit_usd)+'</div></div>'; document.getElementById('charges').innerHTML=table(d.recentCharges,[['When',r=>new Date(r.created_at).toLocaleString()],['Provider',r=>r.provider+'/'+r.service],['Qty',r=>Number(r.quantity||0)+' '+(r.unit||'')],['Customer charge',r=>money(r.customer_charge_usd)],['Internal cost',r=>money(r.internal_cost_usd)],['Profit',r=>money(r.gross_profit_usd)]]); document.getElementById('tx').innerHTML=table(d.recentTransactions,[['When',r=>new Date(r.created_at).toLocaleString()],['Type',r=>r.transaction_type],['Amount',r=>money(r.amount_usd)],['Balance after',r=>money(r.balance_after_usd)],['Source',r=>r.source]]);}
 async function credit(){const amountUsd=Number(document.getElementById('creditAmount').value||0); const r=await fetch('/api/billing-usage/wallets/'+encodeURIComponent(org())+'/manual-credit',{method:'POST',headers:headers(),body:JSON.stringify({amountUsd})}); const d=await r.json(); document.getElementById('out').textContent=JSON.stringify(d,null,2); await load();}
+async function setBalance(){const amountUsd=Number(document.getElementById('creditAmount').value||0); const r=await fetch('/api/billing-usage/wallets/'+encodeURIComponent(org())+'/manual-balance',{method:'PATCH',headers:headers(),body:JSON.stringify({mode:'set_balance',amountUsd})}); const d=await r.json(); document.getElementById('out').textContent=JSON.stringify(d,null,2); await load();}
+async function clearBalance(){const r=await fetch('/api/billing-usage/wallets/'+encodeURIComponent(org())+'/manual-balance',{method:'PATCH',headers:headers(),body:JSON.stringify({mode:'clear',amountUsd:0})}); const d=await r.json(); document.getElementById('out').textContent=JSON.stringify(d,null,2); await load();}
 async function simulate(){const body={organizationId:org(),provider:document.getElementById('provider').value,service:document.getElementById('service').value,unit:document.getElementById('unit').value,quantity:Number(document.getElementById('qty').value||1),applyWallet:true}; const r=await fetch('/api/billing-usage/simulate-usage-charge',{method:'POST',headers:headers(),body:JSON.stringify(body)}); const d=await r.json(); document.getElementById('out').textContent=JSON.stringify(d,null,2); await load();}
 function reloadOrg(){location.href='/api/billing-usage/wallet-console?key='+encodeURIComponent(KEY)+'&organizationId='+encodeURIComponent(org())}
 document.getElementById('org').value=${JSON.stringify(data.organizationId || data.organizations[0]?.id || "")}; load().catch(e=>document.getElementById('out').textContent=e.message); setInterval(()=>load().catch(()=>{}),8000);
@@ -1557,6 +1714,16 @@ router.get("/admin-queries", (_req, res) => {
         "SELECT public.billing_admin_recalculate_customer_charges('YOUR_ORG_UUID', NULL, NULL, false, false, 5000);",
       walletOverview:
         "SELECT * FROM billing_admin_wallet_overview WHERE organization_id = 'YOUR_ORG_UUID';",
+      walletEnforcementStatus:
+        "SELECT * FROM billing_admin_wallet_enforcement_status WHERE organization_id = 'YOUR_ORG_UUID';",
+      setWalletToFive:
+        "SELECT public.billing_admin_adjust_wallet_balance('YOUR_ORG_UUID', 'set_balance', 5, 'manual_backend_set_balance');",
+      clearWalletToZero:
+        "SELECT public.billing_admin_adjust_wallet_balance('YOUR_ORG_UUID', 'clear', 0, 'manual_backend_clear_balance');",
+      addWalletTen:
+        "SELECT public.billing_admin_adjust_wallet_balance('YOUR_ORG_UUID', 'top_up', 10, 'manual_backend_top_up');",
+      debitWalletTwo:
+        "SELECT public.billing_admin_adjust_wallet_balance('YOUR_ORG_UUID', 'debit', 2, 'manual_backend_debit');",
       customerMarginOverview:
         "SELECT * FROM billing_admin_customer_margin_overview WHERE organization_id = 'YOUR_ORG_UUID';",
       customerRatesEndpoint: "GET /api/billing-usage/customer-rates",
@@ -1565,6 +1732,10 @@ router.get("/admin-queries", (_req, res) => {
         "GET /api/billing-usage/wallets?organizationId=YOUR_ORG_UUID",
       walletTopUpEndpoint:
         "POST /api/billing-usage/wallets/YOUR_ORG_UUID/top-up",
+      walletSetBalanceEndpoint:
+        "PATCH /api/billing-usage/wallets/YOUR_ORG_UUID/manual-balance { mode: 'set_balance', amountUsd: 5 }",
+      walletClearEndpoint:
+        "PATCH /api/billing-usage/wallets/YOUR_ORG_UUID/manual-balance { mode: 'clear', amountUsd: 0 }",
       chargeUsageEventEndpoint: "POST /api/billing-usage/charge-usage-event",
       recalculateCustomerChargesEndpoint:
         "POST /api/billing-usage/recalculate-customer-charges",

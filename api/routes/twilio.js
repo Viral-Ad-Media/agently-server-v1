@@ -33,6 +33,11 @@ const { getSupabase } = require("../../lib/supabase");
 const { requireAuth, requireAdmin } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 const {
+  ensureWalletCreditOrRespond,
+  getWalletCreditStatus,
+  creditStatusToTwimlMessage,
+} = require("../../lib/billing-credit-enforcement");
+const {
   listSupportedCountries,
   searchAvailableNumbers,
   purchasePhoneNumber,
@@ -844,6 +849,16 @@ async function handleInboundVoice(req, res) {
     if (!agent) {
       res.setHeader("Content-Type", "text/xml");
       return res.send(hangupTwiml());
+    }
+
+    const creditStatus = await getWalletCreditStatus({
+      organizationId: agent.organization_id,
+      action: "inbound_call",
+    });
+    const creditBlockMessage = creditStatusToTwimlMessage(creditStatus);
+    if (creditBlockMessage) {
+      res.setHeader("Content-Type", "text/xml");
+      return res.send(hangupTwiml(creditBlockMessage));
     }
 
     const record = await createCallRecord({
@@ -3067,6 +3082,12 @@ router.post(
     }
     const { callPurpose, callPurposeWarning } = purpose;
 
+    const creditAllowed = await ensureWalletCreditOrRespond(req, res, {
+      organizationId,
+      action: "outbound_call",
+    });
+    if (creditAllowed !== true) return;
+
     if (!isE164(toPhone))
       return res.status(400).json({
         error: {
@@ -5027,6 +5048,12 @@ router.post(
       });
     }
     const { callPurpose, callPurposeWarning } = purpose;
+
+    const creditAllowed = await ensureWalletCreditOrRespond(req, res, {
+      organizationId: req.orgId,
+      action: "outbound_call",
+    });
+    if (creditAllowed !== true) return;
 
     if (!toPhone)
       return res

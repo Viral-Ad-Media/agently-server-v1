@@ -8,6 +8,9 @@ const { generateChatResponse } = require("../../lib/openai");
 const { serializeMessage } = require("../../lib/serializers");
 const { logChatbotConversationUsage } = require("../../lib/billing-limits");
 const {
+  ensureWalletCreditOrRespond,
+} = require("../../lib/billing-credit-enforcement");
+const {
   loadChatbotContext,
   loadVoiceContext,
 } = require("../../lib/context-builder");
@@ -45,6 +48,12 @@ router.post(
 
     const db = getSupabase();
     const orgId = req.orgId;
+
+    const creditAllowed = await ensureWalletCreditOrRespond(req, res, {
+      organizationId: orgId,
+      action: "chatbot_message",
+    });
+    if (creditAllowed !== true) return;
 
     let historyQuery = db
       .from("chat_messages")
@@ -207,6 +216,11 @@ router.post(
   requireAuth,
   asyncHandler(async (req, res) => {
     const { voice, text } = req.body;
+    const creditAllowed = await ensureWalletCreditOrRespond(req, res, {
+      organizationId: req.orgId,
+      action: "voice_preview",
+    });
+    if (creditAllowed !== true) return;
     if (!voice || !text) {
       return res
         .status(400)
