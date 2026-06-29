@@ -3384,11 +3384,11 @@ router.post(
         to: toPhone,
         twimlUrl,
         statusCallbackUrl: `${base}/api/twilio/call-status`,
-        machineDetection: process.env.OUTBOUND_MACHINE_DETECTION || "Enable",
+        machineDetection: process.env.OUTBOUND_MACHINE_DETECTION ?? "",
         record: callRecordingEnabled(),
       });
       console.log("[outbound-call] machineDetection enabled", {
-        value: process.env.OUTBOUND_MACHINE_DETECTION || "Enable",
+        value: process.env.OUTBOUND_MACHINE_DETECTION ?? "disabled",
         asyncAmd:
           String(process.env.OUTBOUND_ASYNC_AMD || "true").toLowerCase() !==
           "false",
@@ -5272,11 +5272,11 @@ router.post(
       to: toPhone,
       twimlUrl,
       statusCallbackUrl: `${apiBase}/api/twilio/call-status`,
-      machineDetection: process.env.OUTBOUND_MACHINE_DETECTION || "Enable",
+      machineDetection: process.env.OUTBOUND_MACHINE_DETECTION ?? "",
       record: callRecordingEnabled(),
     });
     console.log("[outbound-call] machineDetection enabled", {
-      value: process.env.OUTBOUND_MACHINE_DETECTION || "Enable",
+      value: process.env.OUTBOUND_MACHINE_DETECTION ?? "disabled",
     });
     console.log("[outbound-call] callSid", result.callSid);
 

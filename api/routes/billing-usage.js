@@ -1347,6 +1347,12 @@ async function loadWalletConsoleData({ organizationId = null } = {}) {
       ),
       minCallCreditUsd: Number(process.env.BILLING_MIN_CALL_CREDIT_USD || 1),
       minChatCreditUsd: Number(process.env.BILLING_MIN_CHAT_CREDIT_USD || 0.05),
+      maxNegativeBalanceUsd: Number(
+        process.env.BILLING_MAX_NEGATIVE_BALANCE_USD || 1,
+      ),
+      hardStopBalanceUsd: -Number(
+        process.env.BILLING_MAX_NEGATIVE_BALANCE_USD || 1,
+      ),
       reconcileEnabled: parseBool(process.env.USAGE_RECONCILE_ENABLED),
     },
   };
@@ -1580,7 +1586,7 @@ body{font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif;background:#f
 </style></head><body><div class="wrap">
 <span class="pill">Internal only</span><h1>Agently Wallet + Usage Console</h1>
 <p class="muted">Use this to manually credit any organization, simulate usage deduction, and inspect backend cost/profit. Do not expose this URL or key to tenants.</p>
-<div class="card"><h2>Environment</h2><p>Auto wallet charge: <b class="${data.env.autoChargeWalletEnabled ? "ok" : "bad"}">${data.env.autoChargeWalletEnabled ? "ON" : "OFF"}</b> · Reconcile enabled: <b>${data.env.reconcileEnabled ? "ON" : "OFF"}</b></p><p class="muted">For real service usage to deduct automatically, set <b>BILLING_AUTO_CHARGE_WALLET=true</b>.</p></div>
+<div class="card"><h2>Environment</h2><p>Auto wallet charge: <b class="${data.env.autoChargeWalletEnabled ? "ok" : "bad"}">${data.env.autoChargeWalletEnabled ? "ON" : "OFF"}</b> · Credit enforcement: <b>${htmlEscape(data.env.creditEnforcementMode || "observe")}</b> · Hard stop: <b>-$${Number(data.env.maxNegativeBalanceUsd || 1).toFixed(2)}</b> · Reconcile enabled: <b>${data.env.reconcileEnabled ? "ON" : "OFF"}</b></p><p class="muted">For real service usage to deduct automatically, set <b>BILLING_AUTO_CHARGE_WALLET=true</b>. For strict service blocking, set <b>BILLING_CREDIT_ENFORCEMENT_MODE=block</b>. The negative hard stop blocks even in observe/warn.</p></div>
 <div class="card"><h2>Select organization</h2><div class="grid"><div><label>Organization</label><select id="org">${orgOptions}</select></div><div style="align-self:end"><button class="dark" onclick="reloadOrg()">Load organization</button></div></div></div>
 <div class="grid"><div class="card"><h2>Wallet balance controls</h2><label>Amount / target balance USD</label><input id="creditAmount" type="number" step="0.01" value="10"/><br/><br/><button onclick="credit()">Add credit</button> <button onclick="setBalance()">Set balance</button> <button onclick="clearBalance()">Clear to $0</button><p class="muted">Use Add credit for top-ups. Use Set balance when you need to change $10 to exactly $5. Use Clear for a $0 default tenant.</p></div>
 <div class="card"><h2>Simulate usage + wallet debit</h2><div class="grid"><div><label>Provider</label><input id="provider" value="twilio"/></div><div><label>Service</label><input id="service" value="voice"/></div><div><label>Unit</label><input id="unit" value="minutes"/></div><div><label>Quantity</label><input id="qty" type="number" step="0.01" value="1"/></div></div><br/><button onclick="simulate()">Create usage and deduct wallet</button></div></div>

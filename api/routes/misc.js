@@ -28,6 +28,11 @@ function currentCreditEnforcementMode() {
   return ["observe", "warn", "block"].includes(mode) ? mode : "observe";
 }
 
+function maxNegativeBalanceUsd() {
+  const n = Number(process.env.BILLING_MAX_NEGATIVE_BALANCE_USD || 1);
+  return Number.isFinite(n) ? Math.max(0, n) : 1;
+}
+
 async function loadCustomerWalletSummary(db, organizationId, limit = 8) {
   const emptyWallet = {
     enabled: true,
@@ -480,6 +485,8 @@ router.get(
           knowledgeSyncUsd: Number(
             process.env.BILLING_MIN_KNOWLEDGE_SYNC_CREDIT_USD || 0.25,
           ),
+          maxNegativeBalanceUsd: maxNegativeBalanceUsd(),
+          hardStopBalanceUsd: -maxNegativeBalanceUsd(),
         },
       },
     });
