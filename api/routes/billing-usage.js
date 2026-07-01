@@ -2868,8 +2868,8 @@ router.post("/recalculate-customer-charges", async (req, res, next) => {
             req.body?.organization_id ||
             req.query.organizationId,
         ),
-        p_start: req.body?.start || req.query.start || null,
-        p_end: req.body?.end || req.query.end || null,
+        p_start_at: req.body?.start || req.query.start || null,
+        p_end_at: req.body?.end || req.query.end || null,
         p_apply_wallet: parseBool(
           req.body?.applyWallet ?? req.body?.apply_wallet,
         ),
