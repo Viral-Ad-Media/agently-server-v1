@@ -3448,6 +3448,10 @@ router.get(
             "SUPABASE_RATE_CARD_JSON",
             "RESEND_RATE_CARD_JSON",
           ],
+          internalRateCards: [
+            "Use VENDOR_RATE_CARD_JSON entries with provider=agently for crm.leads",
+            "Use VENDOR_RATE_CARD_JSON entries with provider=knowledge_base for knowledge.scraping",
+          ],
         },
         status,
       });
@@ -3666,7 +3670,7 @@ router.get(
         RESEND_API_KEY: "re_...",
         BILLING_TARGET_GROSS_MARGIN_PERCENT: "70",
         VENDOR_RATE_CARD_JSON:
-          '[{"provider":"openai","service":"realtime","eventType":"*","unit":"tokens","unitCostUsd":0.000001}]',
+          '[{"provider":"openai","service":"transcription","eventType":"transcription_minutes","unit":"minutes","unitCostUsd":0.006},{"provider":"agently","service":"leads","eventType":"lead_created_or_imported","unit":"lead","unitCostUsd":0.00001},{"provider":"knowledge_base","service":"scrape_sync","eventType":"sync_attempt","unit":"sync","unitCostUsd":0.01}]',
       },
     });
   },
