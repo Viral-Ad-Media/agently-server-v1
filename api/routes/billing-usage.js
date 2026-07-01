@@ -28,7 +28,6 @@ const {
   getEnforcementMode,
 } = require("../../lib/billing-entitlements");
 
-
 const {
   DEFAULT_PROVIDERS,
   runVendorRateSync,
@@ -248,7 +247,6 @@ async function syncTwilioProviderResources({
   return results;
 }
 
-
 const PRODUCTION_COST_SERVICE_CATALOG = [
   {
     provider: "agently",
@@ -261,10 +259,12 @@ const PRODUCTION_COST_SERVICE_CATALOG = [
     customerChargeType: "included_quota_or_per_lead",
     internalCostSource: "lead row count + Supabase storage rate cards",
     sourceOfTruth: "billing_usage_events + leads",
-    existingEndpoint: "automatic from Leads create/import routes + POST /api/billing-usage/reconcile/leads-storage",
+    existingEndpoint:
+      "automatic from Leads create/import routes + POST /api/billing-usage/reconcile/leads-storage",
     requiredEndpoint: "POST /api/billing-usage/reconcile/leads-storage",
     status: "implemented",
-    notes: "Lead growth is metered as CRM lead count plus Supabase storage bytes.",
+    notes:
+      "Lead growth is metered as CRM lead count plus Supabase storage bytes.",
   },
   {
     provider: "twilio",
@@ -275,12 +275,16 @@ const PRODUCTION_COST_SERVICE_CATALOG = [
     costType: "usage_time",
     chargeTiming: "per_call_or_reconciled",
     customerChargeType: "per_minute",
-    internalCostSource: "Twilio Calls API price, Twilio Usage Records API, or billing_rate_cards fallback",
-    sourceOfTruth: "billing_usage_events + call_records + Twilio reconciliation",
-    existingEndpoint: "POST /api/billing-usage/reconcile/twilio and GET /api/billing-usage/events",
+    internalCostSource:
+      "Twilio Calls API price, Twilio Usage Records API, or billing_rate_cards fallback",
+    sourceOfTruth:
+      "billing_usage_events + call_records + Twilio reconciliation",
+    existingEndpoint:
+      "POST /api/billing-usage/reconcile/twilio and GET /api/billing-usage/events",
     requiredEndpoint: "POST /api/billing-usage/reconcile/twilio?mode=calls",
     status: "implemented_partial",
-    notes: "Call usage exists, but accuracy depends on Twilio reconciliation and provider-resource mapping.",
+    notes:
+      "Call usage exists, but accuracy depends on Twilio reconciliation and provider-resource mapping.",
   },
   {
     provider: "twilio_or_supabase",
@@ -291,12 +295,15 @@ const PRODUCTION_COST_SERVICE_CATALOG = [
     costType: "usage_time_and_storage",
     chargeTiming: "per_recording_and_monthly_storage",
     customerChargeType: "usually_included_or_markup",
-    internalCostSource: "Twilio Recording resources / Usage Records API, or external object storage provider if offloaded",
+    internalCostSource:
+      "Twilio Recording resources / Usage Records API, or external object storage provider if offloaded",
     sourceOfTruth: "recording metadata on call_records + billing_usage_events",
-    existingEndpoint: "POST /api/billing-usage/reconcile/twilio-recordings and generic POST /api/billing-usage/events",
+    existingEndpoint:
+      "POST /api/billing-usage/reconcile/twilio-recordings and generic POST /api/billing-usage/events",
     requiredEndpoint: "POST /api/billing-usage/reconcile/twilio-recordings",
     status: "implemented",
-    notes: "If recordings remain in Twilio Cloud, Twilio is the recording/storage provider. If archived to Supabase/S3, storage must be charged under that provider too.",
+    notes:
+      "If recordings remain in Twilio Cloud, Twilio is the recording/storage provider. If archived to Supabase/S3, storage must be charged under that provider too.",
   },
   {
     provider: "twilio_or_openai",
@@ -307,12 +314,15 @@ const PRODUCTION_COST_SERVICE_CATALOG = [
     costType: "usage_time_or_token",
     chargeTiming: "per_transcript",
     customerChargeType: "included_or_per_minute",
-    internalCostSource: "Twilio transcription, OpenAI transcription/realtime tokens, or selected transcript provider",
+    internalCostSource:
+      "Twilio transcription, OpenAI transcription/realtime tokens, or selected transcript provider",
     sourceOfTruth: "billing_usage_events + call_records.transcription_status",
-    existingEndpoint: "POST /api/billing-usage/reconcile/transcripts and generic POST /api/billing-usage/events",
+    existingEndpoint:
+      "POST /api/billing-usage/reconcile/transcripts and generic POST /api/billing-usage/events",
     requiredEndpoint: "POST /api/billing-usage/reconcile/transcripts",
     status: "implemented",
-    notes: "Your schema stores transcript status on call_records, but billing needs provider-specific usage rows.",
+    notes:
+      "Your schema stores transcript status on call_records, but billing needs provider-specific usage rows.",
   },
   {
     provider: "resend",
@@ -325,7 +335,8 @@ const PRODUCTION_COST_SERVICE_CATALOG = [
     customerChargeType: "included_or_per_email",
     internalCostSource: "Resend API sends + billing_rate_cards",
     sourceOfTruth: "billing_usage_events",
-    existingEndpoint: "automatic via lib/email.js and GET /api/billing-usage/events",
+    existingEndpoint:
+      "automatic via lib/email.js and GET /api/billing-usage/events",
     requiredEndpoint: "already instrumented for app-sent emails",
     status: "implemented",
     notes: "Only emails sent through lib/email.js are logged automatically.",
@@ -339,12 +350,15 @@ const PRODUCTION_COST_SERVICE_CATALOG = [
     costType: "one_time_or_initial_charge",
     chargeTiming: "on_purchase",
     customerChargeType: "one_time_or_pass_through_markup",
-    internalCostSource: "Twilio IncomingPhoneNumber purchase response + Twilio Pricing API",
+    internalCostSource:
+      "Twilio IncomingPhoneNumber purchase response + Twilio Pricing API",
     sourceOfTruth: "twilio_phone_numbers + billing_usage_events",
-    existingEndpoint: "POST /api/billing-usage/record/twilio-number-purchase and generic POST /api/billing-usage/events",
+    existingEndpoint:
+      "POST /api/billing-usage/record/twilio-number-purchase and generic POST /api/billing-usage/events",
     requiredEndpoint: "POST /api/billing-usage/record/twilio-number-purchase",
     status: "implemented",
-    notes: "Number rows exist, but purchase cost must be written at purchase time so profit is accurate.",
+    notes:
+      "Number rows exist, but purchase cost must be written at purchase time so profit is accurate.",
   },
   {
     provider: "twilio",
@@ -355,12 +369,15 @@ const PRODUCTION_COST_SERVICE_CATALOG = [
     costType: "monthly_recurring_prorated",
     chargeTiming: "monthly_or_daily_prorated",
     customerChargeType: "monthly_number_fee_or_included",
-    internalCostSource: "Twilio Pricing API monthly price, twilio_phone_numbers metadata, or voice_agents.twilio_monthly_rental_usd",
+    internalCostSource:
+      "Twilio Pricing API monthly price, twilio_phone_numbers metadata, or voice_agents.twilio_monthly_rental_usd",
     sourceOfTruth: "twilio_phone_numbers + billing_usage_events",
-    existingEndpoint: "partial fallback in reports; no dedicated monthly rental ledger writer",
+    existingEndpoint:
+      "partial fallback in reports; no dedicated monthly rental ledger writer",
     requiredEndpoint: "POST /api/billing-usage/reconcile/twilio-number-rentals",
     status: "implemented",
-    notes: "Your schema has twilio_monthly_rental_usd on voice_agents, but billing should move to phone-number rows and usage events.",
+    notes:
+      "Your schema has twilio_monthly_rental_usd on voice_agents, but billing should move to phone-number rows and usage events.",
   },
   {
     provider: "elevenlabs",
@@ -371,12 +388,16 @@ const PRODUCTION_COST_SERVICE_CATALOG = [
     costType: "usage_metered",
     chargeTiming: "per_synthesis_or_call",
     customerChargeType: "included_in_call_minute_or_metered",
-    internalCostSource: "ElevenLabs usage analytics/API + usage-ledger logElevenLabsUsage",
+    internalCostSource:
+      "ElevenLabs usage analytics/API + usage-ledger logElevenLabsUsage",
     sourceOfTruth: "billing_usage_events",
-    existingEndpoint: "helper exists but not wired to every ElevenLabs runtime path",
-    requiredEndpoint: "POST /api/billing-usage/reconcile/elevenlabs and runtime websocket log on every synthesis",
+    existingEndpoint:
+      "helper exists but not wired to every ElevenLabs runtime path",
+    requiredEndpoint:
+      "POST /api/billing-usage/reconcile/elevenlabs and runtime websocket log on every synthesis",
     status: "implemented",
-    notes: "The ledger function exists, but the websocket/runtime ElevenLabs path needs to call it with org/call/voice metadata.",
+    notes:
+      "The ledger function exists, but the websocket/runtime ElevenLabs path needs to call it with org/call/voice metadata.",
   },
   {
     provider: "openai",
@@ -387,12 +408,16 @@ const PRODUCTION_COST_SERVICE_CATALOG = [
     costType: "token_based",
     chargeTiming: "per_session_or_response_usage_event",
     customerChargeType: "included_in_call_minute_or_metered",
-    internalCostSource: "OpenAI realtime response/session usage object + billing_rate_cards",
+    internalCostSource:
+      "OpenAI realtime response/session usage object + billing_rate_cards",
     sourceOfTruth: "billing_usage_events",
-    existingEndpoint: "runtime logging exists in openai-realtime-bridge; GET /api/billing-usage/events",
-    requiredEndpoint: "already instrumented where OpenAI usage events expose usage metadata",
+    existingEndpoint:
+      "runtime logging exists in openai-realtime-bridge; GET /api/billing-usage/events",
+    requiredEndpoint:
+      "already instrumented where OpenAI usage events expose usage metadata",
     status: "implemented_partial",
-    notes: "Accuracy depends on receiving realtime usage objects. Add fallback estimate by call duration when usage is missing.",
+    notes:
+      "Accuracy depends on receiving realtime usage objects. Add fallback estimate by call duration when usage is missing.",
   },
   {
     provider: "railway",
@@ -403,12 +428,16 @@ const PRODUCTION_COST_SERVICE_CATALOG = [
     costType: "compute_time",
     chargeTiming: "per_runtime_second_or_daily_allocation",
     customerChargeType: "included_in_call_minute_or_platform_fee",
-    internalCostSource: "Railway project/service usage export or estimated runtime seconds per call",
+    internalCostSource:
+      "Railway project/service usage export or estimated runtime seconds per call",
     sourceOfTruth: "billing_usage_events",
-    existingEndpoint: "runtime inserts exist in backend bridge; ws-server needs consistent logging",
-    requiredEndpoint: "POST /api/billing-usage/reconcile/railway-runtime or runtime event on call end",
+    existingEndpoint:
+      "runtime inserts exist in backend bridge; ws-server needs consistent logging",
+    requiredEndpoint:
+      "POST /api/billing-usage/reconcile/railway-runtime or runtime event on call end",
     status: "implemented",
-    notes: "Railway is account-level billing, so tenant attribution should be call-duration allocation unless Railway service-level export is imported.",
+    notes:
+      "Railway is account-level billing, so tenant attribution should be call-duration allocation unless Railway service-level export is imported.",
   },
   {
     provider: "supabase",
@@ -419,12 +448,16 @@ const PRODUCTION_COST_SERVICE_CATALOG = [
     costType: "storage_gb_hours_monthly",
     chargeTiming: "daily_snapshot_monthly_rollup",
     customerChargeType: "included_quota_or_overage",
-    internalCostSource: "tenant data size estimates + Supabase pricing/rate cards",
+    internalCostSource:
+      "tenant data size estimates + Supabase pricing/rate cards",
     sourceOfTruth: "billing_usage_events + estimateTenantStorageBytes",
-    existingEndpoint: "POST /api/billing-usage/reconcile/storage and /reconcile/storage-all",
-    requiredEndpoint: "already implemented for estimated tenant storage snapshots",
+    existingEndpoint:
+      "POST /api/billing-usage/reconcile/storage and /reconcile/storage-all",
+    requiredEndpoint:
+      "already implemented for estimated tenant storage snapshots",
     status: "implemented_estimate",
-    notes: "This estimates tenant DB/storage footprint from Agently tables. Supabase invoice is project-level, so exact tenant allocation needs snapshots.",
+    notes:
+      "This estimates tenant DB/storage footprint from Agently tables. Supabase invoice is project-level, so exact tenant allocation needs snapshots.",
   },
   {
     provider: "supabase",
@@ -435,12 +468,15 @@ const PRODUCTION_COST_SERVICE_CATALOG = [
     costType: "monthly_compute_allocation",
     chargeTiming: "monthly_prorated",
     customerChargeType: "platform_fee_or_included",
-    internalCostSource: "Supabase compute invoice allocated by tenant usage share",
+    internalCostSource:
+      "Supabase compute invoice allocated by tenant usage share",
     sourceOfTruth: "billing_usage_events or monthly admin allocation import",
     existingEndpoint: "missing dedicated endpoint",
-    requiredEndpoint: "POST /api/billing-usage/reconcile/supabase-compute-allocation",
+    requiredEndpoint:
+      "POST /api/billing-usage/reconcile/supabase-compute-allocation",
     status: "implemented",
-    notes: "Storage is estimated; compute/database subscription allocation still needs a monthly allocation event.",
+    notes:
+      "Storage is estimated; compute/database subscription allocation still needs a monthly allocation event.",
   },
   {
     provider: "knowledge_base",
@@ -453,10 +489,13 @@ const PRODUCTION_COST_SERVICE_CATALOG = [
     customerChargeType: "per_sync_or_included_quota",
     internalCostSource: "scraper runtime + OpenAI tokens + storage bytes",
     sourceOfTruth: "billing_usage_events + knowledge_sources/chunks/products",
-    existingEndpoint: "credit enforcement exists; detailed event ledger is partial",
-    requiredEndpoint: "POST /api/billing-usage/record/knowledge-sync-cost and automatic scrapeAndStore metering",
+    existingEndpoint:
+      "credit enforcement exists; detailed event ledger is partial",
+    requiredEndpoint:
+      "POST /api/billing-usage/record/knowledge-sync-cost and automatic scrapeAndStore metering",
     status: "implemented",
-    notes: "KB sync should write page count, chunk count, product count, storage bytes, and OpenAI/embedding token usage separately.",
+    notes:
+      "KB sync should write page count, chunk count, product count, storage bytes, and OpenAI/embedding token usage separately.",
   },
 ];
 
@@ -470,10 +509,11 @@ function dateRangeFromRequest(req) {
   const start =
     req.query.start ||
     req.body?.start ||
-    new Date(new Date(end).getTime() - Math.max(hours || 24, 1) * 60 * 60 * 1000).toISOString();
+    new Date(
+      new Date(end).getTime() - Math.max(hours || 24, 1) * 60 * 60 * 1000,
+    ).toISOString();
   return { start, end, hours: Math.max(hours || 24, 1) };
 }
-
 
 function estimatePayloadBytes(value) {
   try {
@@ -509,9 +549,14 @@ async function getCountSafe(sb, table, organizationId) {
   }
 }
 
-async function liveBillingCoverageCheck({ organizationId = null, hours = 24 } = {}) {
+async function liveBillingCoverageCheck({
+  organizationId = null,
+  hours = 24,
+} = {}) {
   const sb = getSupabase();
-  const start = new Date(Date.now() - Math.max(Number(hours) || 24, 1) * 60 * 60 * 1000).toISOString();
+  const start = new Date(
+    Date.now() - Math.max(Number(hours) || 24, 1) * 60 * 60 * 1000,
+  ).toISOString();
   const checks = [];
   async function tableExists(table) {
     try {
@@ -524,15 +569,32 @@ async function liveBillingCoverageCheck({ organizationId = null, hours = 24 } = 
   async function countEventsFor(category) {
     let query = sb
       .from("billing_usage_events")
-      .select("id,provider,service,event_type,unit,occurred_at", { count: "exact", head: false })
+      .select("id,provider,service,event_type,unit,occurred_at", {
+        count: "exact",
+        head: false,
+      })
       .gte("occurred_at", start)
       .limit(5000);
     if (organizationId) query = query.eq("organization_id", organizationId);
     const { data, error } = await query;
     if (error) return { count: 0, lastEventAt: null, error: error.message };
-    const matches = (data || []).filter((row) => classifyProductionCost(row.provider, row.service, row.event_type, row.unit) === category);
-    matches.sort((a, b) => String(b.occurred_at || "").localeCompare(String(a.occurred_at || "")));
-    return { count: matches.length, lastEventAt: matches[0]?.occurred_at || null, error: null };
+    const matches = (data || []).filter(
+      (row) =>
+        classifyProductionCost(
+          row.provider,
+          row.service,
+          row.event_type,
+          row.unit,
+        ) === category,
+    );
+    matches.sort((a, b) =>
+      String(b.occurred_at || "").localeCompare(String(a.occurred_at || "")),
+    );
+    return {
+      count: matches.length,
+      lastEventAt: matches[0]?.occurred_at || null,
+      error: null,
+    };
   }
   const requiredTables = [
     "billing_usage_events",
@@ -551,12 +613,15 @@ async function liveBillingCoverageCheck({ organizationId = null, hours = 24 } = 
     "leads",
   ];
   const tableStatus = {};
-  for (const table of requiredTables) tableStatus[table] = await tableExists(table);
+  for (const table of requiredTables)
+    tableStatus[table] = await tableExists(table);
   let rateCardsForCoverage = [];
   try {
     const { data } = await sb
       .from("billing_rate_cards")
-      .select("id,provider,service,event_type,unit,active")
+      .select(
+        "id,provider,service,event_type,unit,effective_to,source,metadata",
+      )
       .limit(5000);
     rateCardsForCoverage = data || [];
   } catch (_) {
@@ -565,8 +630,16 @@ async function liveBillingCoverageCheck({ organizationId = null, hours = 24 } = 
 
   function rateCardsForCategory(category) {
     return rateCardsForCoverage.filter((row) => {
-      if (row.active === false) return false;
-      return classifyProductionCost(row.provider, row.service, row.event_type, row.unit) === category;
+      if (row.effective_to !== null && row.effective_to !== undefined)
+        return false;
+      return (
+        classifyProductionCost(
+          row.provider,
+          row.service,
+          row.event_type,
+          row.unit,
+        ) === category
+      );
     });
   }
 
@@ -586,27 +659,50 @@ async function liveBillingCoverageCheck({ organizationId = null, hours = 24 } = 
       eventCountLastWindow: coverage.count,
       lastEventAt: coverage.lastEventAt,
       rateCardExactMatches: rateCount,
-      rateCardMatchMode: "classified_rate_cards_v59",
+      rateCardMatchMode: "classified_active_rate_cards_v60",
       status: !tableStatus.billing_usage_events
         ? "billing_usage_events_table_missing"
         : coverage.count > 0
           ? "live_events_recorded"
           : "endpoint_ready_no_events_in_window",
-      warning: coverage.error || (rateCount === 0 ? "no matching rate card found after production-category classification" : ""),
+      warning:
+        coverage.error ||
+        (rateCount === 0
+          ? "no active matching rate card found after production-category classification"
+          : ""),
     });
   }
   const counts = organizationId
     ? {
         calls: await getCountSafe(sb, "call_records", organizationId),
         leads: await getCountSafe(sb, "leads", organizationId),
-        knowledgeSources: await getCountSafe(sb, "knowledge_sources", organizationId),
-        knowledgeChunks: await getCountSafe(sb, "knowledge_chunks", organizationId),
+        knowledgeSources: await getCountSafe(
+          sb,
+          "knowledge_sources",
+          organizationId,
+        ),
+        knowledgeChunks: await getCountSafe(
+          sb,
+          "knowledge_chunks",
+          organizationId,
+        ),
         faqs: await getCountSafe(sb, "faqs", organizationId),
         products: await getCountSafe(sb, "scraped_products", organizationId),
-        phoneNumbers: await getCountSafe(sb, "twilio_phone_numbers", organizationId),
+        phoneNumbers: await getCountSafe(
+          sb,
+          "twilio_phone_numbers",
+          organizationId,
+        ),
       }
     : null;
-  return { organizationId, hours: Math.max(Number(hours) || 24, 1), start, tableStatus, counts, checks };
+  return {
+    organizationId,
+    hours: Math.max(Number(hours) || 24, 1),
+    start,
+    tableStatus,
+    counts,
+    checks,
+  };
 }
 
 function classifyProductionCost(provider, service, eventType, unit) {
@@ -615,19 +711,68 @@ function classifyProductionCost(provider, service, eventType, unit) {
   const e = String(eventType || "").toLowerCase();
   const u = String(unit || "").toLowerCase();
 
-  if (p === "twilio" && s.includes("phone") && (e.includes("purchase") || e.includes("buy") || e.includes("provision"))) return "phone_numbers.purchase";
-  if (p === "twilio" && (e.includes("rental") || e.includes("monthly") || e.includes("number_month") || s.includes("phone_number"))) return "phone_numbers.rental";
-  if ((p === "twilio" || p === "supabase") && (s.includes("record") || e.includes("record"))) return "calls.recordings";
-  if ((p === "twilio" || p === "openai") && (s.includes("transcript") || e.includes("transcript") || e.includes("transcription"))) return "calls.transcripts";
-  if (p === "twilio" && (s.includes("voice") || e.includes("call") || u === "minutes" || u === "seconds")) return "calls.telephony";
-  if (p === "openai" && (s.includes("realtime") || e.includes("realtime") || u === "tokens")) return "ai.brain";
+  if (
+    p === "twilio" &&
+    s.includes("phone") &&
+    (e.includes("purchase") || e.includes("buy") || e.includes("provision"))
+  )
+    return "phone_numbers.purchase";
+  if (
+    p === "twilio" &&
+    (e.includes("rental") ||
+      e.includes("monthly") ||
+      e.includes("number_month") ||
+      s.includes("phone_number"))
+  )
+    return "phone_numbers.rental";
+  if (
+    (p === "twilio" || p === "supabase") &&
+    (s.includes("record") || e.includes("record"))
+  )
+    return "calls.recordings";
+  if (
+    (p === "twilio" || p === "openai") &&
+    (s.includes("transcript") ||
+      e.includes("transcript") ||
+      e.includes("transcription"))
+  )
+    return "calls.transcripts";
+  if (
+    p === "twilio" &&
+    (s.includes("voice") ||
+      e.includes("call") ||
+      u === "minutes" ||
+      u === "seconds")
+  )
+    return "calls.telephony";
+  if (
+    p === "openai" &&
+    (s.includes("realtime") || e.includes("realtime") || u === "tokens")
+  )
+    return "ai.brain";
   if (p === "elevenlabs") return "ai.voice";
   if (p === "resend") return "messaging.email";
-  if ((p === "agently" || p === "supabase") && (s.includes("lead") || e.includes("lead"))) return "crm.leads";
+  if (
+    (p === "agently" || p === "supabase") &&
+    (s.includes("lead") || e.includes("lead"))
+  )
+    return "crm.leads";
   if (p === "railway") return "infrastructure.runtime";
-  if (p === "supabase" && (s.includes("storage") || e.includes("storage") || u.includes("byte"))) return "infrastructure.storage";
-  if (p === "supabase" || p === "postgres") return "infrastructure.database_compute";
-  if (s.includes("knowledge") || e.includes("knowledge") || e.includes("scrape") || e.includes("sync") || e.includes("embedding")) return "knowledge.scraping";
+  if (
+    p === "supabase" &&
+    (s.includes("storage") || e.includes("storage") || u.includes("byte"))
+  )
+    return "infrastructure.storage";
+  if (p === "supabase" || p === "postgres")
+    return "infrastructure.database_compute";
+  if (
+    s.includes("knowledge") ||
+    e.includes("knowledge") ||
+    e.includes("scrape") ||
+    e.includes("sync") ||
+    e.includes("embedding")
+  )
+    return "knowledge.scraping";
   return "other.unclassified";
 }
 
@@ -639,7 +784,12 @@ function catalogByCategory() {
   return map;
 }
 
-async function getProductionCostRows({ organizationId, start, end, includeExpected = true } = {}) {
+async function getProductionCostRows({
+  organizationId,
+  start,
+  end,
+  includeExpected = true,
+} = {}) {
   const sb = getSupabase();
   const catalogMap = catalogByCategory();
 
@@ -662,7 +812,8 @@ async function getProductionCostRows({ organizationId, start, end, includeExpect
       .in("usage_event_id", eventIds)
       .limit(50000);
     if (chargesError) throw chargesError;
-    for (const charge of charges || []) chargesByUsageId.set(charge.usage_event_id, charge);
+    for (const charge of charges || [])
+      chargesByUsageId.set(charge.usage_event_id, charge);
   }
 
   const walletsByUsageId = new Map();
@@ -677,17 +828,53 @@ async function getProductionCostRows({ organizationId, start, end, includeExpect
   if (!walletsError) {
     for (const tx of wallets || []) {
       const amount = Number(tx.amount_usd || 0);
-      const deduction = amount < 0 ? Math.abs(amount) : ["debit", "usage", "charge", "deduction"].includes(String(tx.transaction_type || "").toLowerCase()) ? Math.abs(amount) : 0;
-      if (tx.usage_event_id) walletsByUsageId.set(tx.usage_event_id, Number(walletsByUsageId.get(tx.usage_event_id) || 0) + deduction);
-      if (tx.usage_charge_id) walletsByChargeId.set(tx.usage_charge_id, Number(walletsByChargeId.get(tx.usage_charge_id) || 0) + deduction);
+      const deduction =
+        amount < 0
+          ? Math.abs(amount)
+          : ["debit", "usage", "charge", "deduction"].includes(
+                String(tx.transaction_type || "").toLowerCase(),
+              )
+            ? Math.abs(amount)
+            : 0;
+      if (tx.usage_event_id)
+        walletsByUsageId.set(
+          tx.usage_event_id,
+          Number(walletsByUsageId.get(tx.usage_event_id) || 0) + deduction,
+        );
+      if (tx.usage_charge_id)
+        walletsByChargeId.set(
+          tx.usage_charge_id,
+          Number(walletsByChargeId.get(tx.usage_charge_id) || 0) + deduction,
+        );
     }
   }
 
   const grouped = new Map();
-  function addRow({ provider, service, eventType, unit, quantity, userBill, internalCost, eventCount = 1, callId, voiceAgentId, knowledgeBaseId, source, status, metadata = {} }) {
+  function addRow({
+    provider,
+    service,
+    eventType,
+    unit,
+    quantity,
+    userBill,
+    internalCost,
+    eventCount = 1,
+    callId,
+    voiceAgentId,
+    knowledgeBaseId,
+    source,
+    status,
+    metadata = {},
+  }) {
     const category = classifyProductionCost(provider, service, eventType, unit);
     const catalog = catalogMap.get(category) || {};
-    const key = [category, provider || catalog.provider || "unknown", service || catalog.service || "unknown", eventType || catalog.eventType || "usage", unit || catalog.unit || "unit"].join("|");
+    const key = [
+      category,
+      provider || catalog.provider || "unknown",
+      service || catalog.service || "unknown",
+      eventType || catalog.eventType || "usage",
+      unit || catalog.unit || "unit",
+    ].join("|");
     if (!grouped.has(key)) {
       grouped.set(key, {
         category,
@@ -699,7 +886,8 @@ async function getProductionCostRows({ organizationId, start, end, includeExpect
         costType: catalog.costType || "unknown",
         chargeTiming: catalog.chargeTiming || "unknown",
         sourceOfTruth: catalog.sourceOfTruth || "billing_usage_events",
-        existingEndpoint: catalog.existingEndpoint || "GET /api/billing-usage/events",
+        existingEndpoint:
+          catalog.existingEndpoint || "GET /api/billing-usage/events",
         requiredEndpoint: catalog.requiredEndpoint || "review needed",
         implementationStatus: catalog.status || "unknown",
         usageQuantity: 0,
@@ -732,19 +920,30 @@ async function getProductionCostRows({ organizationId, start, end, includeExpect
     if (knowledgeBaseId) item.knowledgeBaseIds.add(knowledgeBaseId);
     if (source) item.sources.add(source);
     if (status) item.statuses.add(status);
-    if (!item.sampleMetadata && metadata && Object.keys(metadata).length) item.sampleMetadata = metadata;
+    if (!item.sampleMetadata && metadata && Object.keys(metadata).length)
+      item.sampleMetadata = metadata;
   }
 
   for (const event of events || []) {
     const charge = chargesByUsageId.get(event.id) || null;
-    const walletDeduction = Number(walletsByUsageId.get(event.id) || (charge?.id ? walletsByChargeId.get(charge.id) : 0) || 0);
+    const walletDeduction = Number(
+      walletsByUsageId.get(event.id) ||
+        (charge?.id ? walletsByChargeId.get(charge.id) : 0) ||
+        0,
+    );
     const billed = walletDeduction || Number(charge?.customer_charge_usd || 0);
-    const internalCost = Number(charge?.internal_cost_usd ?? event.estimated_cost_usd ?? 0);
+    const internalCost = Number(
+      charge?.internal_cost_usd ?? event.estimated_cost_usd ?? 0,
+    );
     let status = "ok";
-    if (!charge) status = "raw usage recorded, but no customer charge row found";
-    else if (!walletDeduction && Number(charge.customer_charge_usd || 0) > 0) status = "customer charge exists; wallet deduction not linked";
-    else if (billed === 0 && internalCost > 0) status = "internal cost exists, but customer was not billed";
-    else if (billed > 0 && internalCost === 0) status = "customer billed, but internal cost missing";
+    if (!charge)
+      status = "raw usage recorded, but no customer charge row found";
+    else if (!walletDeduction && Number(charge.customer_charge_usd || 0) > 0)
+      status = "customer charge exists; wallet deduction not linked";
+    else if (billed === 0 && internalCost > 0)
+      status = "internal cost exists, but customer was not billed";
+    else if (billed > 0 && internalCost === 0)
+      status = "customer billed, but internal cost missing";
     addRow({
       provider: event.provider,
       service: event.service,
@@ -765,13 +964,20 @@ async function getProductionCostRows({ organizationId, start, end, includeExpect
   try {
     const { data: numbers } = await sb
       .from("twilio_phone_numbers")
-      .select("id,phone_number,phone_sid,created_at,metadata,assigned_voice_agent_id,inbound_voice_agent_id,default_outbound_voice_agent_id")
+      .select(
+        "id,phone_number,phone_sid,created_at,metadata,assigned_voice_agent_id,inbound_voice_agent_id,default_outbound_voice_agent_id",
+      )
       .eq("organization_id", organizationId)
       .gte("created_at", start)
       .lte("created_at", end)
       .limit(5000);
     for (const number of numbers || []) {
-      const hasLedgerEvent = (events || []).some((event) => event.provider === "twilio" && (event.external_id === number.phone_sid || event.metadata?.phone_sid === number.phone_sid));
+      const hasLedgerEvent = (events || []).some(
+        (event) =>
+          event.provider === "twilio" &&
+          (event.external_id === number.phone_sid ||
+            event.metadata?.phone_sid === number.phone_sid),
+      );
       if (!hasLedgerEvent) {
         addRow({
           provider: "twilio",
@@ -779,12 +985,28 @@ async function getProductionCostRows({ organizationId, start, end, includeExpect
           eventType: "number_purchase_detected_no_ledger_event",
           unit: "number",
           quantity: 1,
-          userBill: Number(number.metadata?.customer_charge_usd || number.metadata?.user_charge_usd || 0),
-          internalCost: Number(number.metadata?.internal_cost_usd || number.metadata?.twilio_cost_usd || 0),
-          voiceAgentId: number.assigned_voice_agent_id || number.inbound_voice_agent_id || number.default_outbound_voice_agent_id || null,
+          userBill: Number(
+            number.metadata?.customer_charge_usd ||
+              number.metadata?.user_charge_usd ||
+              0,
+          ),
+          internalCost: Number(
+            number.metadata?.internal_cost_usd ||
+              number.metadata?.twilio_cost_usd ||
+              0,
+          ),
+          voiceAgentId:
+            number.assigned_voice_agent_id ||
+            number.inbound_voice_agent_id ||
+            number.default_outbound_voice_agent_id ||
+            null,
           source: "twilio_phone_numbers_fallback",
-          status: "number row created, but purchase cost event missing unless metadata carries amounts",
-          metadata: { phone_number: number.phone_number, phone_sid: number.phone_sid },
+          status:
+            "number row created, but purchase cost event missing unless metadata carries amounts",
+          metadata: {
+            phone_number: number.phone_number,
+            phone_sid: number.phone_sid,
+          },
         });
       }
     }
@@ -793,13 +1015,16 @@ async function getProductionCostRows({ organizationId, start, end, includeExpect
   try {
     const { data: agents } = await sb
       .from("voice_agents")
-      .select("id,name,twilio_phone_number,twilio_phone_sid,twilio_monthly_rental_usd")
+      .select(
+        "id,name,twilio_phone_number,twilio_phone_sid,twilio_monthly_rental_usd",
+      )
       .eq("organization_id", organizationId)
       .gt("twilio_monthly_rental_usd", 0)
       .limit(5000);
     const seenNumbers = new Set();
     for (const agent of agents || []) {
-      const key = agent.twilio_phone_sid || agent.twilio_phone_number || agent.id;
+      const key =
+        agent.twilio_phone_sid || agent.twilio_phone_number || agent.id;
       if (seenNumbers.has(key)) continue;
       seenNumbers.add(key);
       const dailyCost = Number(agent.twilio_monthly_rental_usd || 0) / 30;
@@ -813,18 +1038,37 @@ async function getProductionCostRows({ organizationId, start, end, includeExpect
         internalCost: dailyCost,
         voiceAgentId: agent.id,
         source: "voice_agents.twilio_monthly_rental_usd_fallback",
-        status: "rental estimated from voice agent field; create monthly rental ledger event for exact billing",
-        metadata: { phone_number: agent.twilio_phone_number, phone_sid: agent.twilio_phone_sid, monthly_rental_usd: agent.twilio_monthly_rental_usd },
+        status:
+          "rental estimated from voice agent field; create monthly rental ledger event for exact billing",
+        metadata: {
+          phone_number: agent.twilio_phone_number,
+          phone_sid: agent.twilio_phone_sid,
+          monthly_rental_usd: agent.twilio_monthly_rental_usd,
+        },
       });
     }
   } catch (_) {}
 
   if (includeExpected) {
     for (const catalog of PRODUCTION_COST_SERVICE_CATALOG) {
-      if (catalog.status === "implemented" || catalog.status === "implemented_partial" || catalog.status === "implemented_estimate" || catalog.status === "implemented_helper_missing_runtime_wiring" || catalog.status === "missing_dedicated_endpoint") {
-        const hasCategory = Array.from(grouped.values()).some((row) => row.category === catalog.category);
+      if (
+        catalog.status === "implemented" ||
+        catalog.status === "implemented_partial" ||
+        catalog.status === "implemented_estimate" ||
+        catalog.status === "implemented_helper_missing_runtime_wiring" ||
+        catalog.status === "missing_dedicated_endpoint"
+      ) {
+        const hasCategory = Array.from(grouped.values()).some(
+          (row) => row.category === catalog.category,
+        );
         if (!hasCategory) {
-          const key = [catalog.category, catalog.provider, catalog.service, catalog.eventType, catalog.unit].join("|");
+          const key = [
+            catalog.category,
+            catalog.provider,
+            catalog.service,
+            catalog.eventType,
+            catalog.unit,
+          ].join("|");
           if (!grouped.has(key)) {
             grouped.set(key, {
               category: catalog.category,
@@ -847,7 +1091,9 @@ async function getProductionCostRows({ organizationId, start, end, includeExpect
               userBillOrWalletDeductionUsd: 0,
               realInternalCostUsd: 0,
               grossProfitUsd: 0,
-              statuses: new Set(["no recorded usage/charge found in selected period"]),
+              statuses: new Set([
+                "no recorded usage/charge found in selected period",
+              ]),
               callIds: new Set(),
               voiceAgentIds: new Set(),
               knowledgeBaseIds: new Set(),
@@ -874,10 +1120,17 @@ async function getProductionCostRows({ organizationId, start, end, includeExpect
     linkedCallCount: item.callIds.size,
     voiceAgentCount: item.voiceAgentIds.size,
     knowledgeBaseCount: item.knowledgeBaseIds.size,
-    userBillOrWalletDeductionUsd: Math.round(item.userBillOrWalletDeductionUsd * 1000000) / 1000000,
-    realInternalCostUsd: Math.round(item.realInternalCostUsd * 1000000) / 1000000,
+    userBillOrWalletDeductionUsd:
+      Math.round(item.userBillOrWalletDeductionUsd * 1000000) / 1000000,
+    realInternalCostUsd:
+      Math.round(item.realInternalCostUsd * 1000000) / 1000000,
     grossProfitUsd: Math.round(item.grossProfitUsd * 1000000) / 1000000,
-    grossMarginPercent: item.userBillOrWalletDeductionUsd > 0 ? Math.round((item.grossProfitUsd / item.userBillOrWalletDeductionUsd) * 10000) / 100 : null,
+    grossMarginPercent:
+      item.userBillOrWalletDeductionUsd > 0
+        ? Math.round(
+            (item.grossProfitUsd / item.userBillOrWalletDeductionUsd) * 10000,
+          ) / 100
+        : null,
     sourceOfTruth: item.sourceOfTruth,
     existingEndpoint: item.existingEndpoint,
     requiredEndpoint: item.requiredEndpoint,
@@ -891,7 +1144,11 @@ async function getProductionCostRows({ organizationId, start, end, includeExpect
     const aMissing = a.eventCount === 0 ? 1 : 0;
     const bMissing = b.eventCount === 0 ? 1 : 0;
     if (aMissing !== bMissing) return aMissing - bMissing;
-    return (b.userBillOrWalletDeductionUsd || 0) - (a.userBillOrWalletDeductionUsd || 0) || (b.realInternalCostUsd || 0) - (a.realInternalCostUsd || 0);
+    return (
+      (b.userBillOrWalletDeductionUsd || 0) -
+        (a.userBillOrWalletDeductionUsd || 0) ||
+      (b.realInternalCostUsd || 0) - (a.realInternalCostUsd || 0)
+    );
   });
 
   const totals = rows
@@ -899,18 +1156,33 @@ async function getProductionCostRows({ organizationId, start, end, includeExpect
     .reduce(
       (acc, row) => {
         acc.eventCount += row.eventCount;
-        acc.userBillOrWalletDeductionUsd += Number(row.userBillOrWalletDeductionUsd || 0);
+        acc.userBillOrWalletDeductionUsd += Number(
+          row.userBillOrWalletDeductionUsd || 0,
+        );
         acc.realInternalCostUsd += Number(row.realInternalCostUsd || 0);
         acc.grossProfitUsd += Number(row.grossProfitUsd || 0);
         acc.linkedCallCount += Number(row.linkedCallCount || 0);
         return acc;
       },
-      { eventCount: 0, userBillOrWalletDeductionUsd: 0, realInternalCostUsd: 0, grossProfitUsd: 0, linkedCallCount: 0 },
+      {
+        eventCount: 0,
+        userBillOrWalletDeductionUsd: 0,
+        realInternalCostUsd: 0,
+        grossProfitUsd: 0,
+        linkedCallCount: 0,
+      },
     );
-  totals.userBillOrWalletDeductionUsd = Math.round(totals.userBillOrWalletDeductionUsd * 1000000) / 1000000;
-  totals.realInternalCostUsd = Math.round(totals.realInternalCostUsd * 1000000) / 1000000;
+  totals.userBillOrWalletDeductionUsd =
+    Math.round(totals.userBillOrWalletDeductionUsd * 1000000) / 1000000;
+  totals.realInternalCostUsd =
+    Math.round(totals.realInternalCostUsd * 1000000) / 1000000;
   totals.grossProfitUsd = Math.round(totals.grossProfitUsd * 1000000) / 1000000;
-  totals.grossMarginPercent = totals.userBillOrWalletDeductionUsd > 0 ? Math.round((totals.grossProfitUsd / totals.userBillOrWalletDeductionUsd) * 10000) / 100 : null;
+  totals.grossMarginPercent =
+    totals.userBillOrWalletDeductionUsd > 0
+      ? Math.round(
+          (totals.grossProfitUsd / totals.userBillOrWalletDeductionUsd) * 10000,
+        ) / 100
+      : null;
 
   return { organizationId, start, end, totals, rows };
 }
@@ -1628,14 +1900,11 @@ router.get("/rate-coverage", async (_req, res, next) => {
   }
 });
 
-
-
 router.get("/production-cost-catalog", async (_req, res, next) => {
   try {
     res.json({
       source: "static_runtime_catalog_v53",
-      note:
-        "This catalog defines every production-cost service Agently should meter. It does not expose vendor secrets or raw invoices to tenants.",
+      note: "This catalog defines every production-cost service Agently should meter. It does not expose vendor secrets or raw invoices to tenants.",
       categories: getProductionCatalog(),
     });
   } catch (err) {
@@ -1654,7 +1923,10 @@ router.get("/production-cost-summary", async (req, res, next) => {
         .json({ error: { message: "organizationId is required." } });
     }
     const range = dateRangeFromRequest(req);
-    const includeExpected = req.query.includeExpected === undefined ? true : parseBool(req.query.includeExpected);
+    const includeExpected =
+      req.query.includeExpected === undefined
+        ? true
+        : parseBool(req.query.includeExpected);
     const report = await getProductionCostRows({
       organizationId,
       start: range.start,
@@ -1663,7 +1935,8 @@ router.get("/production-cost-summary", async (req, res, next) => {
     });
     res.json({
       ok: true,
-      source: "billing_usage_events + billing_customer_usage_charges + billing_wallet_transactions + provider fallback tables",
+      source:
+        "billing_usage_events + billing_customer_usage_charges + billing_wallet_transactions + provider fallback tables",
       organizationId,
       period: range,
       ...report,
@@ -1676,10 +1949,20 @@ router.get("/production-cost-summary", async (req, res, next) => {
 router.post("/record/twilio-number-purchase", async (req, res, next) => {
   try {
     const body = req.body || {};
-    const organizationId = cleanOrgId(body.organizationId || body.organization_id);
-    if (!organizationId || !body.phoneSid && !body.phone_sid && !body.phoneNumber && !body.phone_number) {
+    const organizationId = cleanOrgId(
+      body.organizationId || body.organization_id,
+    );
+    if (
+      !organizationId ||
+      (!body.phoneSid &&
+        !body.phone_sid &&
+        !body.phoneNumber &&
+        !body.phone_number)
+    ) {
       return res.status(400).json({
-        error: { message: "organizationId and phoneSid or phoneNumber are required." },
+        error: {
+          message: "organizationId and phoneSid or phoneNumber are required.",
+        },
       });
     }
     const phoneSid = body.phoneSid || body.phone_sid || null;
@@ -1695,11 +1978,17 @@ router.post("/record/twilio-number-purchase", async (req, res, next) => {
       voiceAgentId: cleanOrgId(body.voiceAgentId || body.voice_agent_id),
       unit: "number",
       quantity: 1,
-      estimatedCostUsd: body.internalCostUsd ?? body.internal_cost_usd ?? body.twilioCostUsd ?? body.twilio_cost_usd ?? null,
+      estimatedCostUsd:
+        body.internalCostUsd ??
+        body.internal_cost_usd ??
+        body.twilioCostUsd ??
+        body.twilio_cost_usd ??
+        null,
       metadata: {
         phone_sid: phoneSid,
         phone_number: phoneNumber,
-        customer_charge_usd: body.customerChargeUsd ?? body.customer_charge_usd ?? null,
+        customer_charge_usd:
+          body.customerChargeUsd ?? body.customer_charge_usd ?? null,
         note: "Customer charge is applied by billing_admin_charge_usage_event/customer rate cards after the usage event is recorded.",
         ...(body.metadata || {}),
       },
@@ -1713,62 +2002,92 @@ router.post("/record/twilio-number-purchase", async (req, res, next) => {
 router.post("/record/knowledge-sync-cost", async (req, res, next) => {
   try {
     const body = req.body || {};
-    const organizationId = cleanOrgId(body.organizationId || body.organization_id);
+    const organizationId = cleanOrgId(
+      body.organizationId || body.organization_id,
+    );
     if (!organizationId) {
-      return res.status(400).json({ error: { message: "organizationId is required." } });
+      return res
+        .status(400)
+        .json({ error: { message: "organizationId is required." } });
     }
     const rows = [];
     if (body.pages || body.pageCount || body.page_count) {
-      rows.push(await insertUsageEvent({
-        organizationId,
-        provider: "knowledge_base",
-        service: "scrape_sync",
-        eventType: "pages_scraped",
-        source: "knowledge_sync_endpoint",
-        knowledgeBaseId: cleanOrgId(body.knowledgeBaseId || body.knowledge_base_id),
-        unit: "pages",
-        quantity: Number(body.pages ?? body.pageCount ?? body.page_count),
-        metadata: body.metadata || {},
-      }));
+      rows.push(
+        await insertUsageEvent({
+          organizationId,
+          provider: "knowledge_base",
+          service: "scrape_sync",
+          eventType: "pages_scraped",
+          source: "knowledge_sync_endpoint",
+          knowledgeBaseId: cleanOrgId(
+            body.knowledgeBaseId || body.knowledge_base_id,
+          ),
+          unit: "pages",
+          quantity: Number(body.pages ?? body.pageCount ?? body.page_count),
+          metadata: body.metadata || {},
+        }),
+      );
     }
     if (body.chunks || body.chunkCount || body.chunk_count) {
-      rows.push(await insertUsageEvent({
-        organizationId,
-        provider: "knowledge_base",
-        service: "scrape_sync",
-        eventType: "chunks_stored",
-        source: "knowledge_sync_endpoint",
-        knowledgeBaseId: cleanOrgId(body.knowledgeBaseId || body.knowledge_base_id),
-        unit: "chunks",
-        quantity: Number(body.chunks ?? body.chunkCount ?? body.chunk_count),
-        metadata: body.metadata || {},
-      }));
+      rows.push(
+        await insertUsageEvent({
+          organizationId,
+          provider: "knowledge_base",
+          service: "scrape_sync",
+          eventType: "chunks_stored",
+          source: "knowledge_sync_endpoint",
+          knowledgeBaseId: cleanOrgId(
+            body.knowledgeBaseId || body.knowledge_base_id,
+          ),
+          unit: "chunks",
+          quantity: Number(body.chunks ?? body.chunkCount ?? body.chunk_count),
+          metadata: body.metadata || {},
+        }),
+      );
     }
     if (body.storageBytes || body.storage_bytes) {
-      rows.push(await insertUsageEvent({
-        organizationId,
-        provider: "supabase",
-        service: "storage",
-        eventType: "knowledge_sync_storage_bytes",
-        source: "knowledge_sync_endpoint",
-        knowledgeBaseId: cleanOrgId(body.knowledgeBaseId || body.knowledge_base_id),
-        unit: "bytes",
-        quantity: Number(body.storageBytes ?? body.storage_bytes),
-        metadata: body.metadata || {},
-      }));
+      rows.push(
+        await insertUsageEvent({
+          organizationId,
+          provider: "supabase",
+          service: "storage",
+          eventType: "knowledge_sync_storage_bytes",
+          source: "knowledge_sync_endpoint",
+          knowledgeBaseId: cleanOrgId(
+            body.knowledgeBaseId || body.knowledge_base_id,
+          ),
+          unit: "bytes",
+          quantity: Number(body.storageBytes ?? body.storage_bytes),
+          metadata: body.metadata || {},
+        }),
+      );
     }
-    if (body.openaiTokens || body.openai_tokens || body.embeddingTokens || body.embedding_tokens) {
-      rows.push(await insertUsageEvent({
-        organizationId,
-        provider: "openai",
-        service: "embeddings",
-        eventType: "knowledge_sync_embedding_tokens",
-        source: "knowledge_sync_endpoint",
-        knowledgeBaseId: cleanOrgId(body.knowledgeBaseId || body.knowledge_base_id),
-        unit: "tokens",
-        quantity: Number(body.openaiTokens ?? body.openai_tokens ?? body.embeddingTokens ?? body.embedding_tokens),
-        metadata: body.metadata || {},
-      }));
+    if (
+      body.openaiTokens ||
+      body.openai_tokens ||
+      body.embeddingTokens ||
+      body.embedding_tokens
+    ) {
+      rows.push(
+        await insertUsageEvent({
+          organizationId,
+          provider: "openai",
+          service: "embeddings",
+          eventType: "knowledge_sync_embedding_tokens",
+          source: "knowledge_sync_endpoint",
+          knowledgeBaseId: cleanOrgId(
+            body.knowledgeBaseId || body.knowledge_base_id,
+          ),
+          unit: "tokens",
+          quantity: Number(
+            body.openaiTokens ??
+              body.openai_tokens ??
+              body.embeddingTokens ??
+              body.embedding_tokens,
+          ),
+          metadata: body.metadata || {},
+        }),
+      );
     }
     res.status(201).json({ ok: true, events: rows, count: rows.length });
   } catch (err) {
@@ -1779,22 +2098,37 @@ router.post("/record/knowledge-sync-cost", async (req, res, next) => {
 router.post("/record/railway-runtime", async (req, res, next) => {
   try {
     const body = req.body || {};
-    const organizationId = cleanOrgId(body.organizationId || body.organization_id);
-    if (!organizationId) return res.status(400).json({ error: { message: "organizationId is required." } });
-    const seconds = Number(body.seconds ?? body.runtimeSeconds ?? body.runtime_seconds ?? 0);
+    const organizationId = cleanOrgId(
+      body.organizationId || body.organization_id,
+    );
+    if (!organizationId)
+      return res
+        .status(400)
+        .json({ error: { message: "organizationId is required." } });
+    const seconds = Number(
+      body.seconds ?? body.runtimeSeconds ?? body.runtime_seconds ?? 0,
+    );
     const event = await insertUsageEvent({
       organizationId,
       provider: "railway",
       service: body.service || "runtime",
       eventType: body.eventType || body.event_type || "websocket_runtime",
       source: "railway_runtime_endpoint",
-      externalId: body.externalId || body.external_id || body.deploymentId || body.deployment_id || null,
+      externalId:
+        body.externalId ||
+        body.external_id ||
+        body.deploymentId ||
+        body.deployment_id ||
+        null,
       callId: cleanOrgId(body.callId || body.call_id),
       voiceAgentId: cleanOrgId(body.voiceAgentId || body.voice_agent_id),
       unit: "seconds",
       quantity: seconds,
       estimatedCostUsd: body.internalCostUsd ?? body.internal_cost_usd ?? null,
-      metadata: { service_name: body.serviceName || body.service_name || null, ...(body.metadata || {}) },
+      metadata: {
+        service_name: body.serviceName || body.service_name || null,
+        ...(body.metadata || {}),
+      },
     });
     res.status(201).json({ ok: true, event });
   } catch (err) {
@@ -1802,13 +2136,18 @@ router.post("/record/railway-runtime", async (req, res, next) => {
   }
 });
 
-
 router.get("/production-cost-live-check", async (req, res, next) => {
   try {
-    const organizationId = cleanOrgId(req.query.organizationId || req.query.organization_id);
+    const organizationId = cleanOrgId(
+      req.query.organizationId || req.query.organization_id,
+    );
     const hours = Number(req.query.hours || 24);
     const result = await liveBillingCoverageCheck({ organizationId, hours });
-    res.json({ ok: true, source: "v54_live_billing_coverage_checker", ...result });
+    res.json({
+      ok: true,
+      source: "v60_live_billing_coverage_checker",
+      ...result,
+    });
   } catch (err) {
     next(err);
   }
@@ -1817,13 +2156,20 @@ router.get("/production-cost-live-check", async (req, res, next) => {
 router.post("/reconcile/twilio-recordings", async (req, res, next) => {
   try {
     const body = req.body || {};
-    const organizationId = cleanOrgId(body.organizationId || body.organization_id || req.query.organizationId);
-    if (!organizationId) return res.status(400).json({ error: { message: "organizationId is required." } });
+    const organizationId = cleanOrgId(
+      body.organizationId || body.organization_id || req.query.organizationId,
+    );
+    if (!organizationId)
+      return res
+        .status(400)
+        .json({ error: { message: "organizationId is required." } });
     const range = dateRangeFromRequest(req);
     const sb = getSupabase();
     const { data, error } = await sb
       .from("call_records")
-      .select("id,organization_id,voice_agent_id,twilio_call_sid,recording_sid,recording_duration,recording_available,recording_file_size,recording_storage_provider,recording_storage_path,recording_public_url,created_at,updated_at")
+      .select(
+        "id,organization_id,voice_agent_id,twilio_call_sid,recording_sid,recording_duration,recording_available,recording_file_size,recording_storage_provider,recording_storage_path,recording_public_url,created_at,updated_at",
+      )
       .eq("organization_id", organizationId)
       .gte("created_at", range.start)
       .lte("created_at", range.end)
@@ -1831,8 +2177,15 @@ router.post("/reconcile/twilio-recordings", async (req, res, next) => {
     if (error) throw error;
     const events = [];
     for (const row of data || []) {
-      const minutes = minutesFromSecondsOrMinutes({ seconds: row.recording_duration });
-      if (!minutes && !Number(row.recording_file_size || 0) && !row.recording_available) continue;
+      const minutes = minutesFromSecondsOrMinutes({
+        seconds: row.recording_duration,
+      });
+      if (
+        !minutes &&
+        !Number(row.recording_file_size || 0) &&
+        !row.recording_available
+      )
+        continue;
       const rows = await logRecordingUsage({
         organizationId,
         provider: "twilio",
@@ -1843,11 +2196,23 @@ router.post("/reconcile/twilio-recordings", async (req, res, next) => {
         recordingSid: row.recording_sid || row.twilio_call_sid,
         externalId: row.recording_sid || row.twilio_call_sid,
         storageProvider: row.recording_storage_provider || "supabase",
-        metadata: { source_table: "call_records", recording_available: row.recording_available, recording_storage_path: row.recording_storage_path || null, recording_public_url: row.recording_public_url || null },
+        metadata: {
+          source_table: "call_records",
+          recording_available: row.recording_available,
+          recording_storage_path: row.recording_storage_path || null,
+          recording_public_url: row.recording_public_url || null,
+        },
       });
       events.push(...rows);
     }
-    res.json({ ok: true, organizationId, period: range, scanned: (data || []).length, eventsCreated: events.length, events });
+    res.json({
+      ok: true,
+      organizationId,
+      period: range,
+      scanned: (data || []).length,
+      eventsCreated: events.length,
+      events,
+    });
   } catch (err) {
     next(err);
   }
@@ -1856,13 +2221,20 @@ router.post("/reconcile/twilio-recordings", async (req, res, next) => {
 router.post("/reconcile/transcripts", async (req, res, next) => {
   try {
     const body = req.body || {};
-    const organizationId = cleanOrgId(body.organizationId || body.organization_id || req.query.organizationId);
-    if (!organizationId) return res.status(400).json({ error: { message: "organizationId is required." } });
+    const organizationId = cleanOrgId(
+      body.organizationId || body.organization_id || req.query.organizationId,
+    );
+    if (!organizationId)
+      return res
+        .status(400)
+        .json({ error: { message: "organizationId is required." } });
     const range = dateRangeFromRequest(req);
     const sb = getSupabase();
     const { data, error } = await sb
       .from("call_records")
-      .select("id,organization_id,voice_agent_id,twilio_call_sid,transcript,duration,call_duration,transcription_provider,transcription_status,transcription_error,created_at")
+      .select(
+        "id,organization_id,voice_agent_id,twilio_call_sid,transcript,duration,call_duration,transcription_provider,transcription_status,transcription_error,created_at",
+      )
       .eq("organization_id", organizationId)
       .gte("created_at", range.start)
       .lte("created_at", range.end)
@@ -1871,9 +2243,15 @@ router.post("/reconcile/transcripts", async (req, res, next) => {
     const events = [];
     for (const row of data || []) {
       const bytes = estimatePayloadBytes(row.transcript || []);
-      const hasTranscript = bytes > 2 || String(row.transcription_status || "").toLowerCase().includes("complete");
+      const hasTranscript =
+        bytes > 2 ||
+        String(row.transcription_status || "")
+          .toLowerCase()
+          .includes("complete");
       if (!hasTranscript) continue;
-      const minutes = minutesFromSecondsOrMinutes({ seconds: row.call_duration || row.duration });
+      const minutes = minutesFromSecondsOrMinutes({
+        seconds: row.call_duration || row.duration,
+      });
       const rows = await logTranscriptUsage({
         organizationId,
         provider: row.transcription_provider || "openai",
@@ -1882,11 +2260,21 @@ router.post("/reconcile/transcripts", async (req, res, next) => {
         callId: row.id,
         voiceAgentId: row.voice_agent_id,
         externalId: row.twilio_call_sid || row.id,
-        metadata: { transcription_status: row.transcription_status || null, source_table: "call_records" },
+        metadata: {
+          transcription_status: row.transcription_status || null,
+          source_table: "call_records",
+        },
       });
       events.push(...rows);
     }
-    res.json({ ok: true, organizationId, period: range, scanned: (data || []).length, eventsCreated: events.length, events });
+    res.json({
+      ok: true,
+      organizationId,
+      period: range,
+      scanned: (data || []).length,
+      eventsCreated: events.length,
+      events,
+    });
   } catch (err) {
     next(err);
   }
@@ -1895,52 +2283,103 @@ router.post("/reconcile/transcripts", async (req, res, next) => {
 router.post("/reconcile/twilio-number-rentals", async (req, res, next) => {
   try {
     const body = req.body || {};
-    const organizationId = cleanOrgId(body.organizationId || body.organization_id || req.query.organizationId);
-    if (!organizationId) return res.status(400).json({ error: { message: "organizationId is required." } });
+    const organizationId = cleanOrgId(
+      body.organizationId || body.organization_id || req.query.organizationId,
+    );
+    if (!organizationId)
+      return res
+        .status(400)
+        .json({ error: { message: "organizationId is required." } });
     const daily = body.daily !== false;
     const sb = getSupabase();
     const { data: numbers } = await sb
       .from("twilio_phone_numbers")
-      .select("id,phone_number,phone_sid,created_at,metadata,assigned_voice_agent_id,inbound_voice_agent_id,default_outbound_voice_agent_id")
+      .select(
+        "id,phone_number,phone_sid,created_at,metadata,assigned_voice_agent_id,inbound_voice_agent_id,default_outbound_voice_agent_id",
+      )
       .eq("organization_id", organizationId)
       .limit(5000);
     const { data: agents } = await sb
       .from("voice_agents")
-      .select("id,name,twilio_phone_number,twilio_phone_sid,twilio_monthly_rental_usd")
+      .select(
+        "id,name,twilio_phone_number,twilio_phone_sid,twilio_monthly_rental_usd",
+      )
       .eq("organization_id", organizationId)
       .gt("twilio_monthly_rental_usd", 0)
       .limit(5000);
     const rentals = new Map();
     for (const n of numbers || []) {
-      const monthly = toUsd(n.metadata?.monthly_rental_usd ?? n.metadata?.twilio_monthly_rental_usd ?? n.metadata?.rental_usd, null);
-      rentals.set(n.phone_sid || n.phone_number || n.id, { phoneNumber: n.phone_number, phoneSid: n.phone_sid, monthlyRentalUsd: monthly, voiceAgentId: n.assigned_voice_agent_id || n.inbound_voice_agent_id || n.default_outbound_voice_agent_id || null, source: "twilio_phone_numbers" });
+      const monthly = toUsd(
+        n.metadata?.monthly_rental_usd ??
+          n.metadata?.twilio_monthly_rental_usd ??
+          n.metadata?.rental_usd,
+        null,
+      );
+      rentals.set(n.phone_sid || n.phone_number || n.id, {
+        phoneNumber: n.phone_number,
+        phoneSid: n.phone_sid,
+        monthlyRentalUsd: monthly,
+        voiceAgentId:
+          n.assigned_voice_agent_id ||
+          n.inbound_voice_agent_id ||
+          n.default_outbound_voice_agent_id ||
+          null,
+        source: "twilio_phone_numbers",
+      });
     }
     for (const a of agents || []) {
       const key = a.twilio_phone_sid || a.twilio_phone_number || a.id;
       if (!rentals.has(key) || rentals.get(key).monthlyRentalUsd == null) {
-        rentals.set(key, { phoneNumber: a.twilio_phone_number, phoneSid: a.twilio_phone_sid, monthlyRentalUsd: toUsd(a.twilio_monthly_rental_usd, null), voiceAgentId: a.id, source: "voice_agents" });
+        rentals.set(key, {
+          phoneNumber: a.twilio_phone_number,
+          phoneSid: a.twilio_phone_sid,
+          monthlyRentalUsd: toUsd(a.twilio_monthly_rental_usd, null),
+          voiceAgentId: a.id,
+          source: "voice_agents",
+        });
       }
     }
     const events = [];
     for (const r of rentals.values()) {
       const quantity = daily ? 1 : 1;
       const unit = daily ? "number_day" : "number_month";
-      const cost = r.monthlyRentalUsd == null ? null : daily ? Number(r.monthlyRentalUsd) / 30 : Number(r.monthlyRentalUsd);
-      events.push(await insertUsageEvent({
-        organizationId,
-        provider: "twilio",
-        service: "phone_number",
-        eventType: daily ? "daily_prorated_number_rental" : "monthly_number_rental",
-        source: "twilio_number_rental_reconcile",
-        externalId: `${r.phoneSid || r.phoneNumber || "number"}:${daily ? new Date().toISOString().slice(0,10) : new Date().toISOString().slice(0,7)}`,
-        voiceAgentId: r.voiceAgentId || null,
-        unit,
-        quantity,
-        estimatedCostUsd: cost,
-        metadata: { phone_number: r.phoneNumber || null, phone_sid: r.phoneSid || null, monthly_rental_usd: r.monthlyRentalUsd, source_table: r.source },
-      }));
+      const cost =
+        r.monthlyRentalUsd == null
+          ? null
+          : daily
+            ? Number(r.monthlyRentalUsd) / 30
+            : Number(r.monthlyRentalUsd);
+      events.push(
+        await insertUsageEvent({
+          organizationId,
+          provider: "twilio",
+          service: "phone_number",
+          eventType: daily
+            ? "daily_prorated_number_rental"
+            : "monthly_number_rental",
+          source: "twilio_number_rental_reconcile",
+          externalId: `${r.phoneSid || r.phoneNumber || "number"}:${daily ? new Date().toISOString().slice(0, 10) : new Date().toISOString().slice(0, 7)}`,
+          voiceAgentId: r.voiceAgentId || null,
+          unit,
+          quantity,
+          estimatedCostUsd: cost,
+          metadata: {
+            phone_number: r.phoneNumber || null,
+            phone_sid: r.phoneSid || null,
+            monthly_rental_usd: r.monthlyRentalUsd,
+            source_table: r.source,
+          },
+        }),
+      );
     }
-    res.json({ ok: true, organizationId, mode: daily ? "daily_prorated" : "monthly", numbersScanned: rentals.size, eventsCreated: events.length, events });
+    res.json({
+      ok: true,
+      organizationId,
+      mode: daily ? "daily_prorated" : "monthly",
+      numbersScanned: rentals.size,
+      eventsCreated: events.length,
+      events,
+    });
   } catch (err) {
     next(err);
   }
@@ -1949,29 +2388,58 @@ router.post("/reconcile/twilio-number-rentals", async (req, res, next) => {
 router.post("/reconcile/elevenlabs", async (req, res, next) => {
   try {
     const body = req.body || {};
-    const organizationId = cleanOrgId(body.organizationId || body.organization_id || req.query.organizationId);
-    if (!organizationId) return res.status(400).json({ error: { message: "organizationId is required." } });
+    const organizationId = cleanOrgId(
+      body.organizationId || body.organization_id || req.query.organizationId,
+    );
+    if (!organizationId)
+      return res
+        .status(400)
+        .json({ error: { message: "organizationId is required." } });
     const events = [];
     const items = Array.isArray(body.events) ? body.events : [body];
     for (const item of items) {
-      const qty = Number(item.credits ?? item.characters ?? item.minutes ?? item.quantity ?? 0);
+      const qty = Number(
+        item.credits ?? item.characters ?? item.minutes ?? item.quantity ?? 0,
+      );
       if (!qty) continue;
-      events.push(await insertUsageEvent({
-        organizationId,
-        provider: "elevenlabs",
-        service: item.service || "voice",
-        eventType: item.eventType || item.event_type || "tts_or_agent_voice",
-        source: "elevenlabs_reconcile_endpoint",
-        externalId: item.externalId || item.external_id || item.requestId || item.request_id || null,
-        callId: cleanOrgId(item.callId || item.call_id),
-        voiceAgentId: cleanOrgId(item.voiceAgentId || item.voice_agent_id),
-        unit: item.credits != null ? "credits" : item.minutes != null ? "minutes" : "characters",
-        quantity: qty,
-        estimatedCostUsd: item.internalCostUsd ?? item.internal_cost_usd ?? null,
-        metadata: { voice_id: item.voiceId || item.voice_id || null, model_id: item.modelId || item.model_id || null, ...(item.metadata || {}) },
-      }));
+      events.push(
+        await insertUsageEvent({
+          organizationId,
+          provider: "elevenlabs",
+          service: item.service || "voice",
+          eventType: item.eventType || item.event_type || "tts_or_agent_voice",
+          source: "elevenlabs_reconcile_endpoint",
+          externalId:
+            item.externalId ||
+            item.external_id ||
+            item.requestId ||
+            item.request_id ||
+            null,
+          callId: cleanOrgId(item.callId || item.call_id),
+          voiceAgentId: cleanOrgId(item.voiceAgentId || item.voice_agent_id),
+          unit:
+            item.credits != null
+              ? "credits"
+              : item.minutes != null
+                ? "minutes"
+                : "characters",
+          quantity: qty,
+          estimatedCostUsd:
+            item.internalCostUsd ?? item.internal_cost_usd ?? null,
+          metadata: {
+            voice_id: item.voiceId || item.voice_id || null,
+            model_id: item.modelId || item.model_id || null,
+            ...(item.metadata || {}),
+          },
+        }),
+      );
     }
-    res.json({ ok: true, organizationId, eventsCreated: events.length, events });
+    res.json({
+      ok: true,
+      organizationId,
+      eventsCreated: events.length,
+      events,
+    });
   } catch (err) {
     next(err);
   }
@@ -1980,13 +2448,20 @@ router.post("/reconcile/elevenlabs", async (req, res, next) => {
 router.post("/reconcile/railway-runtime", async (req, res, next) => {
   try {
     const body = req.body || {};
-    const organizationId = cleanOrgId(body.organizationId || body.organization_id || req.query.organizationId);
-    if (!organizationId) return res.status(400).json({ error: { message: "organizationId is required." } });
+    const organizationId = cleanOrgId(
+      body.organizationId || body.organization_id || req.query.organizationId,
+    );
+    if (!organizationId)
+      return res
+        .status(400)
+        .json({ error: { message: "organizationId is required." } });
     const range = dateRangeFromRequest(req);
     const sb = getSupabase();
     const { data } = await sb
       .from("call_records")
-      .select("id,voice_agent_id,twilio_call_sid,duration,call_duration,created_at")
+      .select(
+        "id,voice_agent_id,twilio_call_sid,duration,call_duration,created_at",
+      )
       .eq("organization_id", organizationId)
       .gte("created_at", range.start)
       .lte("created_at", range.end)
@@ -1995,68 +2470,124 @@ router.post("/reconcile/railway-runtime", async (req, res, next) => {
     for (const row of data || []) {
       const seconds = Number(row.call_duration || row.duration || 0);
       if (seconds <= 0) continue;
-      events.push(await logRailwayRuntimeUsage({
-        organizationId,
-        seconds,
-        callId: row.id,
-        voiceAgentId: row.voice_agent_id,
-        externalId: row.twilio_call_sid || row.id,
-        metadata: { allocation_method: "call_duration_seconds", source_table: "call_records" },
-      }));
+      events.push(
+        await logRailwayRuntimeUsage({
+          organizationId,
+          seconds,
+          callId: row.id,
+          voiceAgentId: row.voice_agent_id,
+          externalId: row.twilio_call_sid || row.id,
+          metadata: {
+            allocation_method: "call_duration_seconds",
+            source_table: "call_records",
+          },
+        }),
+      );
     }
-    res.json({ ok: true, organizationId, period: range, callsScanned: (data || []).length, eventsCreated: events.length, events });
+    res.json({
+      ok: true,
+      organizationId,
+      period: range,
+      callsScanned: (data || []).length,
+      eventsCreated: events.length,
+      events,
+    });
   } catch (err) {
     next(err);
   }
 });
 
-router.post("/reconcile/supabase-compute-allocation", async (req, res, next) => {
-  try {
-    const body = req.body || {};
-    const organizationId = cleanOrgId(body.organizationId || body.organization_id || req.query.organizationId);
-    const totalCostUsd = toUsd(body.totalInternalCostUsd ?? body.total_internal_cost_usd ?? body.internalCostUsd ?? body.internal_cost_usd, null);
-    if (totalCostUsd == null) return res.status(400).json({ error: { message: "totalInternalCostUsd is required." } });
-    const sb = getSupabase();
-    let orgs = [];
-    if (organizationId) orgs = [{ id: organizationId }];
-    else {
-      const { data, error } = await sb.from("organizations").select("id").limit(5000);
-      if (error) throw error;
-      orgs = data || [];
+router.post(
+  "/reconcile/supabase-compute-allocation",
+  async (req, res, next) => {
+    try {
+      const body = req.body || {};
+      const organizationId = cleanOrgId(
+        body.organizationId || body.organization_id || req.query.organizationId,
+      );
+      const totalCostUsd = toUsd(
+        body.totalInternalCostUsd ??
+          body.total_internal_cost_usd ??
+          body.internalCostUsd ??
+          body.internal_cost_usd,
+        null,
+      );
+      if (totalCostUsd == null)
+        return res
+          .status(400)
+          .json({ error: { message: "totalInternalCostUsd is required." } });
+      const sb = getSupabase();
+      let orgs = [];
+      if (organizationId) orgs = [{ id: organizationId }];
+      else {
+        const { data, error } = await sb
+          .from("organizations")
+          .select("id")
+          .limit(5000);
+        if (error) throw error;
+        orgs = data || [];
+      }
+      const weights = [];
+      for (const org of orgs) {
+        const storage =
+          (await getCountSafe(sb, "knowledge_chunks", org.id)) +
+          (await getCountSafe(sb, "leads", org.id)) +
+          (await getCountSafe(sb, "call_records", org.id));
+        weights.push({ organizationId: org.id, weight: Math.max(storage, 1) });
+      }
+      const totalWeight =
+        weights.reduce((sum, row) => sum + row.weight, 0) || 1;
+      const events = [];
+      for (const row of weights) {
+        const allocated =
+          Math.round(((totalCostUsd * row.weight) / totalWeight) * 1000000) /
+          1000000;
+        events.push(
+          await insertUsageEvent({
+            organizationId: row.organizationId,
+            provider: "supabase",
+            service: "database",
+            eventType: "database_compute_allocation",
+            source: "supabase_compute_allocation_endpoint",
+            externalId:
+              body.externalId ||
+              body.external_id ||
+              `supabase-compute:${new Date().toISOString().slice(0, 10)}:${row.organizationId}`,
+            unit: "allocation",
+            quantity: row.weight,
+            estimatedCostUsd: allocated,
+            metadata: {
+              total_internal_cost_usd: totalCostUsd,
+              allocation_weight: row.weight,
+              total_weight: totalWeight,
+              allocation_method: "tenant_activity_weight",
+            },
+          }),
+        );
+      }
+      res.json({
+        ok: true,
+        organizationsAllocated: weights.length,
+        totalCostUsd,
+        eventsCreated: events.length,
+        events,
+      });
+    } catch (err) {
+      next(err);
     }
-    const weights = [];
-    for (const org of orgs) {
-      const storage = await getCountSafe(sb, "knowledge_chunks", org.id) + await getCountSafe(sb, "leads", org.id) + await getCountSafe(sb, "call_records", org.id);
-      weights.push({ organizationId: org.id, weight: Math.max(storage, 1) });
-    }
-    const totalWeight = weights.reduce((sum, row) => sum + row.weight, 0) || 1;
-    const events = [];
-    for (const row of weights) {
-      const allocated = Math.round((totalCostUsd * row.weight / totalWeight) * 1000000) / 1000000;
-      events.push(await insertUsageEvent({
-        organizationId: row.organizationId,
-        provider: "supabase",
-        service: "database",
-        eventType: "database_compute_allocation",
-        source: "supabase_compute_allocation_endpoint",
-        externalId: body.externalId || body.external_id || `supabase-compute:${new Date().toISOString().slice(0,10)}:${row.organizationId}`,
-        unit: "allocation",
-        quantity: row.weight,
-        estimatedCostUsd: allocated,
-        metadata: { total_internal_cost_usd: totalCostUsd, allocation_weight: row.weight, total_weight: totalWeight, allocation_method: "tenant_activity_weight" },
-      }));
-    }
-    res.json({ ok: true, organizationsAllocated: weights.length, totalCostUsd, eventsCreated: events.length, events });
-  } catch (err) {
-    next(err);
-  }
-});
+  },
+);
 
 router.post("/reconcile/leads-storage", async (req, res, next) => {
   try {
     const body = req.body || {};
-    const organizationId = cleanOrgId(body.organizationId || body.organization_id || req.query.organizationId);
-    if (!organizationId) return res.status(400).json({ error: { message: "organizationId is required." } });
+    const organizationId = cleanOrgId(
+      body.organizationId || body.organization_id || req.query.organizationId,
+    );
+    if (!organizationId)
+      return res
+        .status(400)
+        .json({ error: { message: "organizationId is required." } });
     const range = dateRangeFromRequest(req);
     const sb = getSupabase();
     const { data, error } = await sb
@@ -2074,7 +2605,14 @@ router.post("/reconcile/leads-storage", async (req, res, next) => {
       source: "lead_storage_reconcile_endpoint",
       metadata: { start: range.start, end: range.end },
     });
-    res.json({ ok: true, organizationId, period: range, leadsScanned: (data || []).length, eventsCreated: events.length, events });
+    res.json({
+      ok: true,
+      organizationId,
+      period: range,
+      leadsScanned: (data || []).length,
+      eventsCreated: events.length,
+      events,
+    });
   } catch (err) {
     next(err);
   }
@@ -2889,128 +3427,274 @@ router.get("/admin-queries", (_req, res) => {
   });
 });
 
-
 // V55: self-updating vendor cost/rate sync + margin guardrails.
-router.get("/vendor-rate-sync/status", requireInternalBillingAccess, async (req, res, next) => {
-  try {
-    const status = await getVendorRateSyncStatus();
+router.get(
+  "/vendor-rate-sync/status",
+  requireInternalBillingAccess,
+  async (req, res, next) => {
+    try {
+      const status = await getVendorRateSyncStatus();
+      res.json({
+        ok: true,
+        source: "vendor_rate_sync_status_v55",
+        requiredEnv: {
+          twilio: [
+            "TWILIO_ACCOUNT_SID",
+            "TWILIO_AUTH_TOKEN",
+            "TWILIO_RATE_SYNC_COUNTRIES optional",
+          ],
+          openai: [
+            "OPENAI_ADMIN_KEY preferred",
+            "OPENAI_API_KEY fallback",
+            "OPENAI_ORG_ID optional",
+          ],
+          elevenlabs: ["ELEVENLABS_API_KEY"],
+          railway: [
+            "RAILWAY_API_TOKEN",
+            "RAILWAY_PROJECT_ID",
+            "RAILWAY_SERVICE_ID optional",
+          ],
+          supabase: [
+            "SUPABASE_ACCESS_TOKEN",
+            "SUPABASE_PROJECT_REF",
+            "SUPABASE_SERVICE_ROLE_KEY",
+          ],
+          resend: ["RESEND_API_KEY"],
+          fallbackRateCards: [
+            "VENDOR_RATE_CARD_JSON",
+            "OPENAI_RATE_CARD_JSON",
+            "ELEVENLABS_RATE_CARD_JSON",
+            "TWILIO_RATE_CARD_JSON",
+            "RAILWAY_RATE_CARD_JSON",
+            "SUPABASE_RATE_CARD_JSON",
+            "RESEND_RATE_CARD_JSON",
+          ],
+          internalRateCards: [
+            "Use VENDOR_RATE_CARD_JSON entries with provider=agently for crm.leads",
+            "Use VENDOR_RATE_CARD_JSON entries with provider=knowledge_base for knowledge.scraping",
+          ],
+        },
+        status,
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+router.post(
+  "/vendor-rate-sync/run",
+  requireInternalBillingAccess,
+  async (req, res, next) => {
+    try {
+      const body = req.body || {};
+      const providers =
+        body.providers || req.query.providers || DEFAULT_PROVIDERS;
+      const result = await runVendorRateSync({
+        providers,
+        organizationId: cleanOrgId(
+          body.organizationId ||
+            body.organization_id ||
+            req.query.organizationId ||
+            req.query.organization_id,
+        ),
+        hours: Number(body.hours || req.query.hours || 24),
+        startAt:
+          body.startAt ||
+          body.start_at ||
+          req.query.startAt ||
+          req.query.start_at ||
+          null,
+        endAt:
+          body.endAt ||
+          body.end_at ||
+          req.query.endAt ||
+          req.query.end_at ||
+          null,
+        dryRun: parseBool(
+          body.dryRun ?? body.dry_run ?? req.query.dryRun ?? req.query.dry_run,
+        ),
+        recalculate:
+          body.recalculate !== false &&
+          String(req.query.recalculate || "true") !== "false",
+        recalculateCustomers:
+          body.recalculateCustomers !== false &&
+          body.recalculate_customers !== false &&
+          String(
+            req.query.recalculateCustomers ||
+              req.query.recalculate_customers ||
+              "true",
+          ) !== "false",
+        applyWallet: parseBool(
+          body.applyWallet ??
+            body.apply_wallet ??
+            req.query.applyWallet ??
+            req.query.apply_wallet,
+        ),
+        targetMarginPercent: Number(
+          body.targetMarginPercent ||
+            body.target_margin_percent ||
+            req.query.targetMarginPercent ||
+            req.query.target_margin_percent ||
+            process.env.BILLING_TARGET_GROSS_MARGIN_PERCENT ||
+            70,
+        ),
+      });
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+router.post(
+  "/vendor-rate-sync/:provider",
+  requireInternalBillingAccess,
+  async (req, res, next) => {
+    try {
+      const provider = String(req.params.provider || "").toLowerCase();
+      const body = req.body || {};
+      const result = await runVendorRateSync({
+        providers: [provider],
+        organizationId: cleanOrgId(
+          body.organizationId ||
+            body.organization_id ||
+            req.query.organizationId ||
+            req.query.organization_id,
+        ),
+        hours: Number(body.hours || req.query.hours || 24),
+        startAt:
+          body.startAt ||
+          body.start_at ||
+          req.query.startAt ||
+          req.query.start_at ||
+          null,
+        endAt:
+          body.endAt ||
+          body.end_at ||
+          req.query.endAt ||
+          req.query.end_at ||
+          null,
+        dryRun: parseBool(
+          body.dryRun ?? body.dry_run ?? req.query.dryRun ?? req.query.dry_run,
+        ),
+        recalculate:
+          body.recalculate !== false &&
+          String(req.query.recalculate || "true") !== "false",
+        recalculateCustomers:
+          body.recalculateCustomers !== false &&
+          body.recalculate_customers !== false &&
+          String(
+            req.query.recalculateCustomers ||
+              req.query.recalculate_customers ||
+              "true",
+          ) !== "false",
+        applyWallet: parseBool(
+          body.applyWallet ??
+            body.apply_wallet ??
+            req.query.applyWallet ??
+            req.query.apply_wallet,
+        ),
+        targetMarginPercent: Number(
+          body.targetMarginPercent ||
+            body.target_margin_percent ||
+            req.query.targetMarginPercent ||
+            req.query.target_margin_percent ||
+            process.env.BILLING_TARGET_GROSS_MARGIN_PERCENT ||
+            70,
+        ),
+      });
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+router.get(
+  "/margin-risk-report",
+  requireInternalBillingAccess,
+  async (req, res, next) => {
+    try {
+      const result = await getMarginRiskReport({
+        organizationId: cleanOrgId(
+          req.query.organizationId || req.query.organization_id,
+        ),
+        hours: Number(req.query.hours || 24),
+        startAt: req.query.startAt || req.query.start_at || null,
+        endAt: req.query.endAt || req.query.end_at || null,
+        targetMarginPercent: Number(
+          req.query.targetMarginPercent ||
+            req.query.target_margin_percent ||
+            process.env.BILLING_TARGET_GROSS_MARGIN_PERCENT ||
+            70,
+        ),
+      });
+      res.json({ ok: true, source: "margin_risk_report_v55", ...result });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+router.get(
+  "/recommended-customer-pricing",
+  requireInternalBillingAccess,
+  async (req, res, next) => {
+    try {
+      const result = await getRecommendedCustomerPricing({
+        organizationId: cleanOrgId(
+          req.query.organizationId || req.query.organization_id,
+        ),
+        hours: Number(req.query.hours || 24),
+        startAt: req.query.startAt || req.query.start_at || null,
+        endAt: req.query.endAt || req.query.end_at || null,
+        targetMarginPercent: Number(
+          req.query.targetMarginPercent ||
+            req.query.target_margin_percent ||
+            process.env.BILLING_TARGET_GROSS_MARGIN_PERCENT ||
+            70,
+        ),
+      });
+      res.json({
+        ok: true,
+        source: "recommended_customer_pricing_v55",
+        ...result,
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+router.get(
+  "/vendor-rate-sync/env-template",
+  requireInternalBillingAccess,
+  (_req, res) => {
     res.json({
       ok: true,
-      source: "vendor_rate_sync_status_v55",
-      requiredEnv: {
-        twilio: ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_RATE_SYNC_COUNTRIES optional"],
-        openai: ["OPENAI_ADMIN_KEY preferred", "OPENAI_API_KEY fallback", "OPENAI_ORG_ID optional"],
-        elevenlabs: ["ELEVENLABS_API_KEY"],
-        railway: ["RAILWAY_API_TOKEN", "RAILWAY_PROJECT_ID", "RAILWAY_SERVICE_ID optional"],
-        supabase: ["SUPABASE_ACCESS_TOKEN", "SUPABASE_PROJECT_REF", "SUPABASE_SERVICE_ROLE_KEY"],
-        resend: ["RESEND_API_KEY"],
-        fallbackRateCards: ["VENDOR_RATE_CARD_JSON", "OPENAI_RATE_CARD_JSON", "ELEVENLABS_RATE_CARD_JSON", "TWILIO_RATE_CARD_JSON", "RAILWAY_RATE_CARD_JSON", "SUPABASE_RATE_CARD_JSON", "RESEND_RATE_CARD_JSON"],
-        internalRateCards: ["Use VENDOR_RATE_CARD_JSON entries with provider=agently for crm.leads", "Use VENDOR_RATE_CARD_JSON entries with provider=knowledge_base for knowledge.scraping"],
+      note: "Set provider API keys for exact vendor sync. Use JSON rate-card envs only as fallback/account-specific overrides.",
+      env: {
+        TWILIO_ACCOUNT_SID: "AC...",
+        TWILIO_AUTH_TOKEN: "...",
+        TWILIO_RATE_SYNC_COUNTRIES: "US,GB,CA,NG",
+        OPENAI_ADMIN_KEY: "sk-admin-... preferred for org cost API",
+        OPENAI_API_KEY: "sk-... fallback",
+        OPENAI_ORG_ID: "optional",
+        ELEVENLABS_API_KEY: "...",
+        RAILWAY_API_TOKEN: "...",
+        RAILWAY_PROJECT_ID: "...",
+        RAILWAY_SERVICE_ID: "optional",
+        SUPABASE_ACCESS_TOKEN: "sbp_...",
+        SUPABASE_PROJECT_REF: "project ref",
+        SUPABASE_SERVICE_ROLE_KEY: "existing backend key",
+        RESEND_API_KEY: "re_...",
+        BILLING_TARGET_GROSS_MARGIN_PERCENT: "70",
+        VENDOR_RATE_CARD_JSON:
+          '[{"provider":"openai","service":"transcription","eventType":"transcription_minutes","unit":"minutes","unitCostUsd":0.006},{"provider":"agently","service":"leads","eventType":"lead_created_or_imported","unit":"lead","unitCostUsd":0.00001},{"provider":"knowledge_base","service":"scrape_sync","eventType":"sync_attempt","unit":"sync","unitCostUsd":0.01}]',
       },
-      status,
     });
-  } catch (err) {
-    next(err);
-  }
-});
-
-router.post("/vendor-rate-sync/run", requireInternalBillingAccess, async (req, res, next) => {
-  try {
-    const body = req.body || {};
-    const providers = body.providers || req.query.providers || DEFAULT_PROVIDERS;
-    const result = await runVendorRateSync({
-      providers,
-      organizationId: cleanOrgId(body.organizationId || body.organization_id || req.query.organizationId || req.query.organization_id),
-      hours: Number(body.hours || req.query.hours || 24),
-      startAt: body.startAt || body.start_at || req.query.startAt || req.query.start_at || null,
-      endAt: body.endAt || body.end_at || req.query.endAt || req.query.end_at || null,
-      dryRun: parseBool(body.dryRun ?? body.dry_run ?? req.query.dryRun ?? req.query.dry_run),
-      recalculate: body.recalculate !== false && String(req.query.recalculate || "true") !== "false",
-      recalculateCustomers: body.recalculateCustomers !== false && body.recalculate_customers !== false && String(req.query.recalculateCustomers || req.query.recalculate_customers || "true") !== "false",
-      applyWallet: parseBool(body.applyWallet ?? body.apply_wallet ?? req.query.applyWallet ?? req.query.apply_wallet),
-      targetMarginPercent: Number(body.targetMarginPercent || body.target_margin_percent || req.query.targetMarginPercent || req.query.target_margin_percent || process.env.BILLING_TARGET_GROSS_MARGIN_PERCENT || 70),
-    });
-    res.json(result);
-  } catch (err) {
-    next(err);
-  }
-});
-
-router.post("/vendor-rate-sync/:provider", requireInternalBillingAccess, async (req, res, next) => {
-  try {
-    const provider = String(req.params.provider || "").toLowerCase();
-    const body = req.body || {};
-    const result = await runVendorRateSync({
-      providers: [provider],
-      organizationId: cleanOrgId(body.organizationId || body.organization_id || req.query.organizationId || req.query.organization_id),
-      hours: Number(body.hours || req.query.hours || 24),
-      startAt: body.startAt || body.start_at || req.query.startAt || req.query.start_at || null,
-      endAt: body.endAt || body.end_at || req.query.endAt || req.query.end_at || null,
-      dryRun: parseBool(body.dryRun ?? body.dry_run ?? req.query.dryRun ?? req.query.dry_run),
-      recalculate: body.recalculate !== false && String(req.query.recalculate || "true") !== "false",
-      recalculateCustomers: body.recalculateCustomers !== false && body.recalculate_customers !== false && String(req.query.recalculateCustomers || req.query.recalculate_customers || "true") !== "false",
-      applyWallet: parseBool(body.applyWallet ?? body.apply_wallet ?? req.query.applyWallet ?? req.query.apply_wallet),
-      targetMarginPercent: Number(body.targetMarginPercent || body.target_margin_percent || req.query.targetMarginPercent || req.query.target_margin_percent || process.env.BILLING_TARGET_GROSS_MARGIN_PERCENT || 70),
-    });
-    res.json(result);
-  } catch (err) {
-    next(err);
-  }
-});
-
-router.get("/margin-risk-report", requireInternalBillingAccess, async (req, res, next) => {
-  try {
-    const result = await getMarginRiskReport({
-      organizationId: cleanOrgId(req.query.organizationId || req.query.organization_id),
-      hours: Number(req.query.hours || 24),
-      startAt: req.query.startAt || req.query.start_at || null,
-      endAt: req.query.endAt || req.query.end_at || null,
-      targetMarginPercent: Number(req.query.targetMarginPercent || req.query.target_margin_percent || process.env.BILLING_TARGET_GROSS_MARGIN_PERCENT || 70),
-    });
-    res.json({ ok: true, source: "margin_risk_report_v55", ...result });
-  } catch (err) {
-    next(err);
-  }
-});
-
-router.get("/recommended-customer-pricing", requireInternalBillingAccess, async (req, res, next) => {
-  try {
-    const result = await getRecommendedCustomerPricing({
-      organizationId: cleanOrgId(req.query.organizationId || req.query.organization_id),
-      hours: Number(req.query.hours || 24),
-      startAt: req.query.startAt || req.query.start_at || null,
-      endAt: req.query.endAt || req.query.end_at || null,
-      targetMarginPercent: Number(req.query.targetMarginPercent || req.query.target_margin_percent || process.env.BILLING_TARGET_GROSS_MARGIN_PERCENT || 70),
-    });
-    res.json({ ok: true, source: "recommended_customer_pricing_v55", ...result });
-  } catch (err) {
-    next(err);
-  }
-});
-
-router.get("/vendor-rate-sync/env-template", requireInternalBillingAccess, (_req, res) => {
-  res.json({
-    ok: true,
-    note: "Set provider API keys for exact vendor sync. Use JSON rate-card envs only as fallback/account-specific overrides.",
-    env: {
-      TWILIO_ACCOUNT_SID: "AC...",
-      TWILIO_AUTH_TOKEN: "...",
-      TWILIO_RATE_SYNC_COUNTRIES: "US,GB,CA,NG",
-      OPENAI_ADMIN_KEY: "sk-admin-... preferred for org cost API",
-      OPENAI_API_KEY: "sk-... fallback",
-      OPENAI_ORG_ID: "optional",
-      ELEVENLABS_API_KEY: "...",
-      RAILWAY_API_TOKEN: "...",
-      RAILWAY_PROJECT_ID: "...",
-      RAILWAY_SERVICE_ID: "optional",
-      SUPABASE_ACCESS_TOKEN: "sbp_...",
-      SUPABASE_PROJECT_REF: "project ref",
-      SUPABASE_SERVICE_ROLE_KEY: "existing backend key",
-      RESEND_API_KEY: "re_...",
-      BILLING_TARGET_GROSS_MARGIN_PERCENT: "70",
-      VENDOR_RATE_CARD_JSON: "[{\"provider\":\"openai\",\"service\":\"transcription\",\"eventType\":\"transcription_minutes\",\"unit\":\"minutes\",\"unitCostUsd\":0.006},{\"provider\":\"agently\",\"service\":\"leads\",\"eventType\":\"lead_created_or_imported\",\"unit\":\"lead\",\"unitCostUsd\":0.00001},{\"provider\":\"knowledge_base\",\"service\":\"scrape_sync\",\"eventType\":\"sync_attempt\",\"unit\":\"sync\",\"unitCostUsd\":0.01}]",
-    },
-  });
-});
+  },
+);
 
 module.exports = router;
