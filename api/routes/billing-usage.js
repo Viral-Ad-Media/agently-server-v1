@@ -28,6 +28,14 @@ const {
   getEnforcementMode,
 } = require("../../lib/billing-entitlements");
 
+const {
+  DEFAULT_PROVIDERS,
+  runVendorRateSync,
+  getVendorRateSyncStatus,
+  getMarginRiskReport,
+  getRecommendedCustomerPricing,
+} = require("../../lib/vendor-rate-sync");
+
 const router = express.Router();
 
 function parseBool(value) {
@@ -3397,5 +3405,271 @@ router.get("/admin-queries", (_req, res) => {
     },
   });
 });
+
+// V55: self-updating vendor cost/rate sync + margin guardrails.
+router.get(
+  "/vendor-rate-sync/status",
+  requireInternalBillingAccess,
+  async (req, res, next) => {
+    try {
+      const status = await getVendorRateSyncStatus();
+      res.json({
+        ok: true,
+        source: "vendor_rate_sync_status_v55",
+        requiredEnv: {
+          twilio: [
+            "TWILIO_ACCOUNT_SID",
+            "TWILIO_AUTH_TOKEN",
+            "TWILIO_RATE_SYNC_COUNTRIES optional",
+          ],
+          openai: [
+            "OPENAI_ADMIN_KEY preferred",
+            "OPENAI_API_KEY fallback",
+            "OPENAI_ORG_ID optional",
+          ],
+          elevenlabs: ["ELEVENLABS_API_KEY"],
+          railway: [
+            "RAILWAY_API_TOKEN",
+            "RAILWAY_PROJECT_ID",
+            "RAILWAY_SERVICE_ID optional",
+          ],
+          supabase: [
+            "SUPABASE_ACCESS_TOKEN",
+            "SUPABASE_PROJECT_REF",
+            "SUPABASE_SERVICE_ROLE_KEY",
+          ],
+          resend: ["RESEND_API_KEY"],
+          fallbackRateCards: [
+            "VENDOR_RATE_CARD_JSON",
+            "OPENAI_RATE_CARD_JSON",
+            "ELEVENLABS_RATE_CARD_JSON",
+            "TWILIO_RATE_CARD_JSON",
+            "RAILWAY_RATE_CARD_JSON",
+            "SUPABASE_RATE_CARD_JSON",
+            "RESEND_RATE_CARD_JSON",
+          ],
+        },
+        status,
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+router.post(
+  "/vendor-rate-sync/run",
+  requireInternalBillingAccess,
+  async (req, res, next) => {
+    try {
+      const body = req.body || {};
+      const providers =
+        body.providers || req.query.providers || DEFAULT_PROVIDERS;
+      const result = await runVendorRateSync({
+        providers,
+        organizationId: cleanOrgId(
+          body.organizationId ||
+            body.organization_id ||
+            req.query.organizationId ||
+            req.query.organization_id,
+        ),
+        hours: Number(body.hours || req.query.hours || 24),
+        startAt:
+          body.startAt ||
+          body.start_at ||
+          req.query.startAt ||
+          req.query.start_at ||
+          null,
+        endAt:
+          body.endAt ||
+          body.end_at ||
+          req.query.endAt ||
+          req.query.end_at ||
+          null,
+        dryRun: parseBool(
+          body.dryRun ?? body.dry_run ?? req.query.dryRun ?? req.query.dry_run,
+        ),
+        recalculate:
+          body.recalculate !== false &&
+          String(req.query.recalculate || "true") !== "false",
+        recalculateCustomers:
+          body.recalculateCustomers !== false &&
+          body.recalculate_customers !== false &&
+          String(
+            req.query.recalculateCustomers ||
+              req.query.recalculate_customers ||
+              "true",
+          ) !== "false",
+        applyWallet: parseBool(
+          body.applyWallet ??
+            body.apply_wallet ??
+            req.query.applyWallet ??
+            req.query.apply_wallet,
+        ),
+        targetMarginPercent: Number(
+          body.targetMarginPercent ||
+            body.target_margin_percent ||
+            req.query.targetMarginPercent ||
+            req.query.target_margin_percent ||
+            process.env.BILLING_TARGET_GROSS_MARGIN_PERCENT ||
+            70,
+        ),
+      });
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+router.post(
+  "/vendor-rate-sync/:provider",
+  requireInternalBillingAccess,
+  async (req, res, next) => {
+    try {
+      const provider = String(req.params.provider || "").toLowerCase();
+      const body = req.body || {};
+      const result = await runVendorRateSync({
+        providers: [provider],
+        organizationId: cleanOrgId(
+          body.organizationId ||
+            body.organization_id ||
+            req.query.organizationId ||
+            req.query.organization_id,
+        ),
+        hours: Number(body.hours || req.query.hours || 24),
+        startAt:
+          body.startAt ||
+          body.start_at ||
+          req.query.startAt ||
+          req.query.start_at ||
+          null,
+        endAt:
+          body.endAt ||
+          body.end_at ||
+          req.query.endAt ||
+          req.query.end_at ||
+          null,
+        dryRun: parseBool(
+          body.dryRun ?? body.dry_run ?? req.query.dryRun ?? req.query.dry_run,
+        ),
+        recalculate:
+          body.recalculate !== false &&
+          String(req.query.recalculate || "true") !== "false",
+        recalculateCustomers:
+          body.recalculateCustomers !== false &&
+          body.recalculate_customers !== false &&
+          String(
+            req.query.recalculateCustomers ||
+              req.query.recalculate_customers ||
+              "true",
+          ) !== "false",
+        applyWallet: parseBool(
+          body.applyWallet ??
+            body.apply_wallet ??
+            req.query.applyWallet ??
+            req.query.apply_wallet,
+        ),
+        targetMarginPercent: Number(
+          body.targetMarginPercent ||
+            body.target_margin_percent ||
+            req.query.targetMarginPercent ||
+            req.query.target_margin_percent ||
+            process.env.BILLING_TARGET_GROSS_MARGIN_PERCENT ||
+            70,
+        ),
+      });
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+router.get(
+  "/margin-risk-report",
+  requireInternalBillingAccess,
+  async (req, res, next) => {
+    try {
+      const result = await getMarginRiskReport({
+        organizationId: cleanOrgId(
+          req.query.organizationId || req.query.organization_id,
+        ),
+        hours: Number(req.query.hours || 24),
+        startAt: req.query.startAt || req.query.start_at || null,
+        endAt: req.query.endAt || req.query.end_at || null,
+        targetMarginPercent: Number(
+          req.query.targetMarginPercent ||
+            req.query.target_margin_percent ||
+            process.env.BILLING_TARGET_GROSS_MARGIN_PERCENT ||
+            70,
+        ),
+      });
+      res.json({ ok: true, source: "margin_risk_report_v55", ...result });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+router.get(
+  "/recommended-customer-pricing",
+  requireInternalBillingAccess,
+  async (req, res, next) => {
+    try {
+      const result = await getRecommendedCustomerPricing({
+        organizationId: cleanOrgId(
+          req.query.organizationId || req.query.organization_id,
+        ),
+        hours: Number(req.query.hours || 24),
+        startAt: req.query.startAt || req.query.start_at || null,
+        endAt: req.query.endAt || req.query.end_at || null,
+        targetMarginPercent: Number(
+          req.query.targetMarginPercent ||
+            req.query.target_margin_percent ||
+            process.env.BILLING_TARGET_GROSS_MARGIN_PERCENT ||
+            70,
+        ),
+      });
+      res.json({
+        ok: true,
+        source: "recommended_customer_pricing_v55",
+        ...result,
+      });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+router.get(
+  "/vendor-rate-sync/env-template",
+  requireInternalBillingAccess,
+  (_req, res) => {
+    res.json({
+      ok: true,
+      note: "Set provider API keys for exact vendor sync. Use JSON rate-card envs only as fallback/account-specific overrides.",
+      env: {
+        TWILIO_ACCOUNT_SID: "AC...",
+        TWILIO_AUTH_TOKEN: "...",
+        TWILIO_RATE_SYNC_COUNTRIES: "US,GB,CA,NG",
+        OPENAI_ADMIN_KEY: "sk-admin-... preferred for org cost API",
+        OPENAI_API_KEY: "sk-... fallback",
+        OPENAI_ORG_ID: "optional",
+        ELEVENLABS_API_KEY: "...",
+        RAILWAY_API_TOKEN: "...",
+        RAILWAY_PROJECT_ID: "...",
+        RAILWAY_SERVICE_ID: "optional",
+        SUPABASE_ACCESS_TOKEN: "sbp_...",
+        SUPABASE_PROJECT_REF: "project ref",
+        SUPABASE_SERVICE_ROLE_KEY: "existing backend key",
+        RESEND_API_KEY: "re_...",
+        BILLING_TARGET_GROSS_MARGIN_PERCENT: "70",
+        VENDOR_RATE_CARD_JSON:
+          '[{"provider":"openai","service":"realtime","eventType":"*","unit":"tokens","unitCostUsd":0.000001}]',
+      },
+    });
+  },
+);
 
 module.exports = router;
