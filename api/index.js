@@ -235,6 +235,15 @@ safeMount(
   "agent-voice-config",
 );
 
+// Billing usage, production-cost, vendor-rate-sync, wallet, and margin endpoints.
+// Keep this mounted BEFORE the generic /api misc route so nested billing paths
+// like /api/billing-usage/vendor-rate-sync/status are not swallowed by misc/404.
+safeMount(
+  "/api/billing-usage",
+  () => require("./routes/billing-usage"),
+  "billing-usage",
+);
+
 safeMount("/api", () => require("./routes/misc"), "misc");
 safeMount("/chatbot-widget", () => require("./routes/widget"), "widget");
 
