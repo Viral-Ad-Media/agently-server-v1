@@ -32,7 +32,11 @@ const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
 const { requireAuth, requireAdmin } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
-const { ensureWalletCreditOrRespond, getWalletCreditStatus, creditStatusToTwimlMessage } = require("../../lib/billing-credit-enforcement");
+const {
+  ensureWalletCreditOrRespond,
+  getWalletCreditStatus,
+  creditStatusToTwimlMessage,
+} = require("../../lib/billing-credit-enforcement");
 const {
   listSupportedCountries,
   searchAvailableNumbers,
@@ -59,7 +63,12 @@ const {
   updateCallRecordById,
   finalizeUsage,
 } = require("../../lib/call-records");
-const { logTwilioCallUsage, logStorageUsage, logOpenAIUsage } = require("../../lib/usage-ledger");
+const {
+  logTwilioCallUsage,
+  logStorageUsage,
+  logOpenAIUsage,
+  insertUsageEvent,
+} = require("../../lib/usage-ledger");
 const { mapTwilioError } = require("../../lib/twilio-errors");
 const { checkOpenAIRealtimeProvider } = require("../../lib/ai-provider-health");
 const voiceBehavior = require("../../lib/voice-behavior");
@@ -387,7 +396,10 @@ function mediaStreamUrl(params) {
       if (!criticalKeys.has(key)) return;
       if (value === undefined || value === null || value === "") return;
       const clean = String(value);
-      url.searchParams.set(key, clean.length > 900 ? clean.slice(0, 900) : clean);
+      url.searchParams.set(
+        key,
+        clean.length > 900 ? clean.slice(0, 900) : clean,
+      );
     });
   }
   return url.toString();
@@ -547,7 +559,8 @@ function buildRealtimeTwiml({
             "",
     ),
     knowledgeBaseId: agent?.knowledge_base_id || "",
-    knowledgeBaseName: agent?.knowledge_base_business_name || agent?.knowledge_base_name || "",
+    knowledgeBaseName:
+      agent?.knowledge_base_business_name || agent?.knowledge_base_name || "",
     voiceProviderHint: selectedVoiceProvider || agent.voice_provider || "",
     openAiVoice: selectedOpenAiVoice,
     elevenLabsVoiceId: selectedElevenLabsVoiceId,
@@ -2615,6 +2628,32 @@ router.post(
           phoneSid: saved.phone_sid,
         },
       });
+      try {
+        await insertUsageEvent({
+          organizationId,
+          userId: req.user?.id || null,
+          provider: "twilio",
+          service: "phone_number",
+          eventType: "number_purchase",
+          source: "twilio_number_purchase_route",
+          externalId: saved.phone_sid || saved.phone_number,
+          voiceAgentId: agentId || null,
+          unit: "number",
+          quantity: 1,
+          metadata: {
+            phone_number: saved.phone_number,
+            phone_sid: saved.phone_sid,
+            account_sid: account.account_sid,
+            country,
+            purchase_origin: "in_app_purchase",
+          },
+        });
+      } catch (billingErr) {
+        console.warn(
+          "[twilio/numbers/purchase] billing meter skipped:",
+          billingErr.message || String(billingErr),
+        );
+      }
       res.json({
         success: true,
         phoneNumber: saved.phone_number,

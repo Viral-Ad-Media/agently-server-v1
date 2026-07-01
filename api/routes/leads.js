@@ -5,6 +5,7 @@ const { getSupabase } = require("../../lib/supabase");
 const { requireAuth, requireAdmin } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 const { serializeLead } = require("../../lib/serializers");
+const { logLeadStorageUsage } = require("../../lib/usage-ledger");
 
 const router = express.Router();
 
@@ -16,6 +17,14 @@ router.get(
     res.json({ success: true, route: "leads", organizationId: req.orgId });
   }),
 );
+
+function estimatePayloadBytes(value) {
+  try {
+    return Buffer.byteLength(JSON.stringify(value || {}), "utf8");
+  } catch (_) {
+    return 0;
+  }
+}
 
 function normalizeTags(tags) {
   if (!Array.isArray(tags)) return [];
@@ -268,6 +277,23 @@ router.post(
       });
     }
 
+    try {
+      await logLeadStorageUsage({
+        organizationId: req.orgId,
+        userId: req.user?.id || null,
+        leadId: lead.id,
+        leadCount: 1,
+        storageBytes: estimatePayloadBytes(lead),
+        source: "manual_lead_create_route",
+        metadata: { source: "manual" },
+      });
+    } catch (billingErr) {
+      console.warn(
+        "[leads] billing meter skipped:",
+        billingErr.message || String(billingErr),
+      );
+    }
+
     res.status(201).json(serializeLead(lead));
   }),
 );
@@ -421,6 +447,22 @@ router.post(
         });
       }
       imported += (data || []).length;
+    }
+
+    try {
+      await logLeadStorageUsage({
+        organizationId: req.orgId,
+        userId: req.user?.id || null,
+        leadCount: imported,
+        storageBytes: estimatePayloadBytes(payload),
+        source: "lead_csv_import_route",
+        metadata: { imported, total: payload.length },
+      });
+    } catch (billingErr) {
+      console.warn(
+        "[leads] CSV import billing meter skipped:",
+        billingErr.message || String(billingErr),
+      );
     }
 
     res.json({ success: true, imported, total: payload.length });
