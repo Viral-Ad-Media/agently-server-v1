@@ -2131,7 +2131,7 @@ async function buildCtoOrgCostBaseline({ organizationId, start, end } = {}) {
     },
     infrastructure: {
       exactRuntimeCostUsd: exactRuntimeCost,
-      estimatedRuntimeCostUsd,
+      estimatedRuntimeCostUsd: estimatedRuntimeCost,
       exactStorageCostUsd: exactStorageCost,
       estimatedCurrentStorageSnapshotCostUsd:
         estimatedStorageCurrentSnapshotCost,
