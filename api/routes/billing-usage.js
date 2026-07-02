@@ -1187,6 +1187,1005 @@ async function getProductionCostRows({
   return { organizationId, start, end, totals, rows };
 }
 
+function ctoRoundUsd(value) {
+  const n = Number(value || 0);
+  return Math.round(n * 1000000) / 1000000;
+}
+
+function ctoSafeNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function ctoJsonBytes(value) {
+  try {
+    return Buffer.byteLength(JSON.stringify(value || {}), "utf8");
+  } catch (_) {
+    return 0;
+  }
+}
+
+function ctoMoney(value) {
+  const n = ctoRoundUsd(value);
+  return `$${n.toFixed(6).replace(/0+$/, "").replace(/\.$/, "")}`;
+}
+
+function ctoNum(value) {
+  const n = Number(value || 0);
+  return Number.isInteger(n)
+    ? String(n)
+    : n.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function ctoDaysBetween(start, end) {
+  const a = new Date(start || 0).getTime();
+  const b = new Date(end || new Date()).getTime();
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a) return 0;
+  return Math.max(0, (b - a) / (24 * 60 * 60 * 1000));
+}
+
+function ctoMinutesFromCallRow(row) {
+  const candidates = [
+    row?.call_duration,
+    row?.duration_seconds,
+    row?.duration,
+    row?.metadata?.duration_seconds,
+    row?.metadata?.call_duration,
+    row?.raw_status_callback?.CallDuration,
+    row?.metadata?.raw_status_callback?.CallDuration,
+  ];
+  for (const value of candidates) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) {
+      if (n > 10) return Math.ceil(n / 60);
+      return Math.ceil(n);
+    }
+  }
+  return 0;
+}
+
+function ctoPickString(row, keys) {
+  for (const key of keys) {
+    const value = row?.[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function ctoRateKey(provider, service, eventType, unit) {
+  return [provider || "*", service || "*", eventType || "*", unit || "*"]
+    .map((v) => String(v || "*").toLowerCase())
+    .join("|");
+}
+
+function ctoRateMatches(
+  row,
+  { provider, service, eventTypes = [], units = [] },
+) {
+  const p = String(row.provider || "").toLowerCase();
+  const s = String(row.service || "").toLowerCase();
+  const e = String(row.event_type || row.eventType || "").toLowerCase();
+  const u = String(row.unit || "").toLowerCase();
+  const wantedEvents = eventTypes
+    .map((x) => String(x || "").toLowerCase())
+    .filter(Boolean);
+  const wantedUnits = units
+    .map((x) => String(x || "").toLowerCase())
+    .filter(Boolean);
+  if (provider && p !== String(provider).toLowerCase() && p !== "*")
+    return false;
+  if (service && s !== String(service).toLowerCase() && s !== "*") return false;
+  if (
+    wantedEvents.length &&
+    e !== "*" &&
+    !wantedEvents.some((x) => e === x || e.includes(x) || x.includes(e))
+  )
+    return false;
+  if (
+    wantedUnits.length &&
+    u !== "*" &&
+    !wantedUnits.some((x) => u === x || u.includes(x) || x.includes(u))
+  )
+    return false;
+  return true;
+}
+
+function ctoFindMaxRate(rateCards, spec, fallback = 0) {
+  const matches = (rateCards || []).filter((row) => ctoRateMatches(row, spec));
+  const values = matches
+    .map((row) => ctoSafeNumber(row.unit_cost_usd ?? row.unitCostUsd, 0))
+    .filter((n) => n > 0);
+  return values.length ? Math.max(...values) : fallback;
+}
+
+async function ctoFetchRowsAndCount(
+  sb,
+  table,
+  organizationId,
+  { limit = 5000, orgColumn = "organization_id" } = {},
+) {
+  try {
+    const max = Math.min(Math.max(Number(limit) || 5000, 1), 50000);
+    const { data, error, count } = await sb
+      .from(table)
+      .select("*", { count: "exact" })
+      .eq(orgColumn, organizationId)
+      .limit(max);
+    if (error) throw error;
+    return {
+      ok: true,
+      table,
+      rows: data || [],
+      count: count ?? (data || []).length,
+      sampled: (data || []).length,
+      error: null,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      table,
+      rows: [],
+      count: 0,
+      sampled: 0,
+      error: err.message || String(err),
+    };
+  }
+}
+
+async function ctoFetchOrgProfile(sb, organizationId) {
+  try {
+    const { data, error } = await sb
+      .from("organizations")
+      .select("*")
+      .eq("id", organizationId)
+      .maybeSingle();
+    if (error) throw error;
+    return data || { id: organizationId };
+  } catch (err) {
+    return { id: organizationId, warning: err.message || String(err) };
+  }
+}
+
+async function ctoFetchActiveRateCards(sb) {
+  try {
+    const { data, error } = await sb
+      .from("billing_rate_cards")
+      .select(
+        "id,provider,service,event_type,unit,unit_cost_usd,currency,effective_from,effective_to,source,metadata",
+      )
+      .limit(10000);
+    if (error) throw error;
+    return (data || []).filter(
+      (row) => row.effective_to === null || row.effective_to === undefined,
+    );
+  } catch (_) {
+    return [];
+  }
+}
+
+function ctoSumProductionRows(rows, predicate, field) {
+  return ctoRoundUsd(
+    (rows || [])
+      .filter(predicate)
+      .reduce((sum, row) => sum + ctoSafeNumber(row[field], 0), 0),
+  );
+}
+
+function ctoGroupByCategory(rows) {
+  const map = new Map();
+  for (const row of rows || []) {
+    const key = row.category || "uncategorized";
+    if (!map.has(key)) {
+      map.set(key, {
+        category: key,
+        customerChargedUsd: 0,
+        exactInternalCostUsd: 0,
+        grossProfitUsd: 0,
+        usageQuantity: 0,
+        eventCount: 0,
+        billingStatus: new Set(),
+      });
+    }
+    const item = map.get(key);
+    item.customerChargedUsd += ctoSafeNumber(
+      row.userBillOrWalletDeductionUsd,
+      0,
+    );
+    item.exactInternalCostUsd += ctoSafeNumber(row.realInternalCostUsd, 0);
+    item.grossProfitUsd += ctoSafeNumber(row.grossProfitUsd, 0);
+    item.usageQuantity += ctoSafeNumber(row.usageQuantity, 0);
+    item.eventCount += ctoSafeNumber(row.eventCount, 0);
+    if (row.billingStatus) item.billingStatus.add(row.billingStatus);
+  }
+  return Array.from(map.values())
+    .map((item) => ({
+      category: item.category,
+      customerChargedUsd: ctoRoundUsd(item.customerChargedUsd),
+      exactInternalCostUsd: ctoRoundUsd(item.exactInternalCostUsd),
+      grossProfitUsd: ctoRoundUsd(item.grossProfitUsd),
+      usageQuantity: Math.round(item.usageQuantity * 1000000) / 1000000,
+      eventCount: item.eventCount,
+      billingStatus: Array.from(item.billingStatus).join("; "),
+    }))
+    .sort(
+      (a, b) =>
+        b.exactInternalCostUsd - a.exactInternalCostUsd ||
+        b.customerChargedUsd - a.customerChargedUsd,
+    );
+}
+
+function ctoStorageEstimateFromTables(tableResults) {
+  let sampledBytes = 0;
+  let estimatedBytes = 0;
+  const tables = [];
+  for (const result of tableResults || []) {
+    if (!result.ok) {
+      tables.push({
+        table: result.table,
+        rows: 0,
+        sampled: 0,
+        estimatedBytes: 0,
+        estimatedMb: 0,
+        error: result.error,
+      });
+      continue;
+    }
+    const bytes = ctoJsonBytes(result.rows);
+    const sampled = Math.max(result.sampled || result.rows.length || 0, 1);
+    const count = Number(result.count || result.rows.length || 0);
+    const projected = count > sampled ? bytes * (count / sampled) : bytes;
+    sampledBytes += bytes;
+    estimatedBytes += projected;
+    tables.push({
+      table: result.table,
+      rows: count,
+      sampled: result.rows.length,
+      sampledBytes: Math.round(bytes),
+      estimatedBytes: Math.round(projected),
+      estimatedMb: Math.round((projected / 1024 / 1024) * 1000) / 1000,
+      error: null,
+    });
+  }
+  return {
+    sampledBytes: Math.round(sampledBytes),
+    estimatedBytes: Math.round(estimatedBytes),
+    estimatedMb: Math.round((estimatedBytes / 1024 / 1024) * 1000) / 1000,
+    tables,
+  };
+}
+
+function ctoBuildMarkdownReport(report) {
+  const s = report.summary || {};
+  const f = report.accountFootprint || {};
+  const lines = [];
+  lines.push(`# CTO Cost Baseline Report`);
+  lines.push("");
+  lines.push(`Organization: ${report.organizationId}`);
+  lines.push(
+    `Period: ${report.period?.start || ""} to ${report.period?.end || ""}`,
+  );
+  lines.push("");
+  lines.push(`## Executive summary`);
+  lines.push("");
+  lines.push(
+    `- Exact ledger internal cost: **${ctoMoney(s.exactLedgerInternalCostUsd)}**`,
+  );
+  lines.push(
+    `- Estimated unreconciled/additional cost: **${ctoMoney(s.estimatedUnreconciledInternalCostUsd)}**`,
+  );
+  lines.push(
+    `- Estimated all-in internal cost: **${ctoMoney(s.estimatedAllInInternalCostUsd)}**`,
+  );
+  lines.push(`- Customer charged: **${ctoMoney(s.customerChargedUsd)}**`);
+  lines.push(`- Exact gross profit: **${ctoMoney(s.exactGrossProfitUsd)}**`);
+  lines.push(
+    `- Exact gross margin: **${s.exactGrossMarginPercent === null ? "N/A" : `${ctoNum(s.exactGrossMarginPercent)}%`}**`,
+  );
+  lines.push(
+    `- Data confidence: **${report.dataConfidence?.level || "partial"}**`,
+  );
+  lines.push("");
+  lines.push(`## Account footprint`);
+  lines.push("");
+  lines.push(`- Phone numbers: ${ctoNum(f.phoneNumbers)}`);
+  lines.push(`- Calls: ${ctoNum(f.calls)}`);
+  lines.push(
+    `- Call minutes from call records: ${ctoNum(f.callRecordMinutes)}`,
+  );
+  lines.push(`- Leads: ${ctoNum(f.leads)}`);
+  lines.push(`- Chatbots: ${ctoNum(f.chatbots)}`);
+  lines.push(`- Chat messages/responses: ${ctoNum(f.chatMessages)}`);
+  lines.push(`- Voice agents: ${ctoNum(f.voiceAgents)}`);
+  lines.push(`- Knowledge bases: ${ctoNum(f.knowledgeBases)}`);
+  lines.push(`- Knowledge sources: ${ctoNum(f.knowledgeSources)}`);
+  lines.push(`- Knowledge chunks: ${ctoNum(f.knowledgeChunks)}`);
+  lines.push(`- FAQs: ${ctoNum(f.faqs)}`);
+  lines.push(`- Products: ${ctoNum(f.products)}`);
+  lines.push(
+    `- Estimated stored data: ${ctoNum(report.storage?.estimatedMb)} MB`,
+  );
+  lines.push("");
+  lines.push(`## Main cost buckets`);
+  lines.push("");
+  lines.push(
+    `| Category | Customer Charged | Exact Internal Cost | Estimated Missing Cost | Notes |`,
+  );
+  lines.push(`|---|---:|---:|---:|---|`);
+  for (const row of report.costBuckets || []) {
+    lines.push(
+      `| ${row.category} | ${ctoMoney(row.customerChargedUsd)} | ${ctoMoney(row.exactInternalCostUsd)} | ${ctoMoney(row.estimatedUnreconciledCostUsd)} | ${(row.notes || "").replace(/\|/g, "\\|")} |`,
+    );
+  }
+  lines.push("");
+  lines.push(`## Phone numbers`);
+  lines.push("");
+  lines.push(`- Count: ${ctoNum(report.phoneNumbers?.count)}`);
+  lines.push(
+    `- Exact recorded purchase cost: ${ctoMoney(report.phoneNumbers?.exactLedgerPurchaseCostUsd)}`,
+  );
+  lines.push(
+    `- Estimated purchase cost: ${ctoMoney(report.phoneNumbers?.estimatedPurchaseCostUsd)}`,
+  );
+  lines.push(
+    `- Exact recorded rental cost: ${ctoMoney(report.phoneNumbers?.exactLedgerRentalCostUsd)}`,
+  );
+  lines.push(
+    `- Estimated rental since acquisition: ${ctoMoney(report.phoneNumbers?.estimatedRentalCostUsd)}`,
+  );
+  lines.push("");
+  if ((report.phoneNumbers?.numbers || []).length) {
+    lines.push(
+      `| Number | SID | Created | Estimated Purchase | Estimated Rental | Notes |`,
+    );
+    lines.push(`|---|---|---|---:|---:|---|`);
+    for (const n of report.phoneNumbers.numbers) {
+      lines.push(
+        `| ${n.phoneNumber || ""} | ${n.phoneSid || ""} | ${n.createdAt || ""} | ${ctoMoney(n.estimatedPurchaseCostUsd)} | ${ctoMoney(n.estimatedRentalCostUsd)} | ${(n.notes || "").replace(/\|/g, "\\|")} |`,
+      );
+    }
+    lines.push("");
+  }
+  lines.push(`## Warnings / missing exact data`);
+  lines.push("");
+  if ((report.missingCostWarnings || []).length) {
+    for (const warning of report.missingCostWarnings)
+      lines.push(`- ${warning}`);
+  } else {
+    lines.push("- No missing-cost warnings returned.");
+  }
+  lines.push("");
+  lines.push(`## Recommended next actions`);
+  lines.push("");
+  for (const action of report.nextActions || []) lines.push(`- ${action}`);
+  lines.push("");
+  return lines.join("\n");
+}
+
+async function buildCtoOrgCostBaseline({ organizationId, start, end } = {}) {
+  const sb = getSupabase();
+  const organization = await ctoFetchOrgProfile(sb, organizationId);
+  const effectiveStart =
+    start === "onboarding" || start === "from_onboarding"
+      ? organization.created_at ||
+        organization.inserted_at ||
+        "1970-01-01T00:00:00.000Z"
+      : start;
+  const rateCards = await ctoFetchActiveRateCards(sb);
+  const production = await getProductionCostRows({
+    organizationId,
+    start: effectiveStart,
+    end,
+    includeExpected: true,
+  });
+
+  const [
+    phoneNumbersResult,
+    callRecordsResult,
+    leadsResult,
+    knowledgeBasesResult,
+    knowledgeSourcesResult,
+    knowledgeChunksResult,
+    faqsResult,
+    productsResult,
+    chatbotsResult,
+    chatMessagesResult,
+    voiceAgentsResult,
+  ] = await Promise.all([
+    ctoFetchRowsAndCount(sb, "twilio_phone_numbers", organizationId),
+    ctoFetchRowsAndCount(sb, "call_records", organizationId),
+    ctoFetchRowsAndCount(sb, "leads", organizationId),
+    ctoFetchRowsAndCount(sb, "knowledge_bases", organizationId),
+    ctoFetchRowsAndCount(sb, "knowledge_sources", organizationId),
+    ctoFetchRowsAndCount(sb, "knowledge_chunks", organizationId),
+    ctoFetchRowsAndCount(sb, "faqs", organizationId),
+    ctoFetchRowsAndCount(sb, "scraped_products", organizationId),
+    ctoFetchRowsAndCount(sb, "chatbots", organizationId),
+    ctoFetchRowsAndCount(sb, "chat_messages", organizationId),
+    ctoFetchRowsAndCount(sb, "voice_agents", organizationId),
+  ]);
+
+  const storage = ctoStorageEstimateFromTables([
+    phoneNumbersResult,
+    callRecordsResult,
+    leadsResult,
+    knowledgeBasesResult,
+    knowledgeSourcesResult,
+    knowledgeChunksResult,
+    faqsResult,
+    productsResult,
+    chatbotsResult,
+    chatMessagesResult,
+    voiceAgentsResult,
+  ]);
+
+  const productionRows = production.rows || [];
+  const exactByCategory = ctoGroupByCategory(productionRows);
+  const exactInternalCostUsd = ctoRoundUsd(
+    production.totals?.realInternalCostUsd || 0,
+  );
+  const customerChargedUsd = ctoRoundUsd(
+    production.totals?.userBillOrWalletDeductionUsd || 0,
+  );
+  const exactGrossProfitUsd = ctoRoundUsd(
+    production.totals?.grossProfitUsd ||
+      customerChargedUsd - exactInternalCostUsd,
+  );
+  const exactGrossMarginPercent =
+    customerChargedUsd > 0
+      ? Math.round((exactGrossProfitUsd / customerChargedUsd) * 10000) / 100
+      : null;
+
+  const purchaseRate = ctoFindMaxRate(
+    rateCards,
+    {
+      provider: "twilio",
+      service: "phone_number",
+      eventTypes: ["number_purchase"],
+      units: ["number"],
+    },
+    1.15,
+  );
+  const dailyRentalRate = ctoFindMaxRate(
+    rateCards,
+    {
+      provider: "twilio",
+      service: "phone_number",
+      eventTypes: ["daily_prorated_number_rental", "rental"],
+      units: ["number_day"],
+    },
+    0.0384,
+  );
+  const twilioMinuteRate = ctoFindMaxRate(
+    rateCards,
+    {
+      provider: "twilio",
+      service: "voice",
+      eventTypes: ["twilio_call", "outbound_call", "inbound_call"],
+      units: ["minutes"],
+    },
+    0.02,
+  );
+  const leadRate = ctoFindMaxRate(
+    rateCards,
+    {
+      provider: "agently",
+      service: "leads",
+      eventTypes: ["lead_created_or_imported"],
+      units: ["lead"],
+    },
+    0.00001,
+  );
+  const knowledgeSyncRate = ctoFindMaxRate(
+    rateCards,
+    {
+      provider: "knowledge_base",
+      service: "scrape_sync",
+      eventTypes: ["sync_attempt"],
+      units: ["sync"],
+    },
+    0.01,
+  );
+  const railwaySecondRate = ctoFindMaxRate(
+    rateCards,
+    {
+      provider: "railway",
+      service: "runtime",
+      eventTypes: ["websocket_runtime"],
+      units: ["seconds"],
+    },
+    0.00001,
+  );
+  const storageByteRate = ctoFindMaxRate(
+    rateCards,
+    {
+      provider: "supabase",
+      service: "storage",
+      eventTypes: ["tenant_storage_snapshot"],
+      units: ["bytes"],
+    },
+    0.000000000000685,
+  );
+
+  const numbers = (phoneNumbersResult.rows || []).map((row) => {
+    const createdAt =
+      row.created_at ||
+      row.purchased_at ||
+      row.metadata?.created_at ||
+      effectiveStart;
+    const daysOwned = ctoDaysBetween(createdAt, end);
+    const meta = row.metadata || {};
+    const purchase = ctoSafeNumber(
+      meta.internal_cost_usd ?? meta.twilio_cost_usd ?? meta.purchase_cost_usd,
+      purchaseRate,
+    );
+    const daily = ctoSafeNumber(
+      meta.daily_rental_usd ?? meta.daily_prorated_number_rental_usd,
+      dailyRentalRate,
+    );
+    return {
+      id: row.id || null,
+      phoneNumber: ctoPickString(row, [
+        "phone_number",
+        "number",
+        "friendly_name",
+        "display_phone_number",
+      ]),
+      phoneSid: ctoPickString(row, ["phone_sid", "sid", "twilio_phone_sid"]),
+      status:
+        row.status || row.lifecycle_status || row.metadata?.status || null,
+      createdAt,
+      daysOwned: Math.round(daysOwned * 100) / 100,
+      estimatedPurchaseCostUsd: ctoRoundUsd(purchase),
+      estimatedRentalCostUsd: ctoRoundUsd(daysOwned * daily),
+      estimatedDailyRentalUsd: ctoRoundUsd(daily),
+      assignedVoiceAgentId:
+        row.assigned_voice_agent_id ||
+        row.inbound_voice_agent_id ||
+        row.default_outbound_voice_agent_id ||
+        null,
+      notes:
+        meta.internal_cost_usd || meta.twilio_cost_usd
+          ? "purchase cost from number metadata"
+          : "purchase/rental estimated from active Twilio rate cards",
+    };
+  });
+
+  const exactPhonePurchase = ctoSumProductionRows(
+    productionRows,
+    (r) =>
+      r.category === "phone_numbers.purchase" &&
+      !String(r.eventType || "").includes("detected_no_ledger"),
+    "realInternalCostUsd",
+  );
+  const exactPhoneRental = ctoSumProductionRows(
+    productionRows,
+    (r) => r.category === "phone_numbers.rental",
+    "realInternalCostUsd",
+  );
+  const estimatedPhonePurchase = ctoRoundUsd(
+    numbers.reduce(
+      (sum, row) => sum + ctoSafeNumber(row.estimatedPurchaseCostUsd, 0),
+      0,
+    ),
+  );
+  const estimatedPhoneRental = ctoRoundUsd(
+    numbers.reduce(
+      (sum, row) => sum + ctoSafeNumber(row.estimatedRentalCostUsd, 0),
+      0,
+    ),
+  );
+
+  const callRecordMinutes = (callRecordsResult.rows || []).reduce(
+    (sum, row) => sum + ctoMinutesFromCallRow(row),
+    0,
+  );
+  const ledgerCallMinutes = ctoSumProductionRows(
+    productionRows,
+    (r) => r.category === "calls.telephony",
+    "usageQuantity",
+  );
+  const exactCallCost = ctoSumProductionRows(
+    productionRows,
+    (r) => r.category === "calls.telephony",
+    "realInternalCostUsd",
+  );
+  const unledgeredCallMinutes = Math.max(
+    0,
+    callRecordMinutes - ledgerCallMinutes,
+  );
+  const estimatedUnledgeredCallCost = ctoRoundUsd(
+    unledgeredCallMinutes * twilioMinuteRate,
+  );
+
+  const exactLeadCost = ctoSumProductionRows(
+    productionRows,
+    (r) => r.category === "crm.leads",
+    "realInternalCostUsd",
+  );
+  const estimatedLeadCost = ctoRoundUsd((leadsResult.count || 0) * leadRate);
+  const exactKnowledgeCost = ctoSumProductionRows(
+    productionRows,
+    (r) => r.category === "knowledge.scraping",
+    "realInternalCostUsd",
+  );
+  const estimatedKnowledgeCost = ctoRoundUsd(
+    (knowledgeSourcesResult.count || 0) * knowledgeSyncRate,
+  );
+  const exactRuntimeCost = ctoSumProductionRows(
+    productionRows,
+    (r) => r.category === "infrastructure.runtime",
+    "realInternalCostUsd",
+  );
+  const estimatedRuntimeCost = ctoRoundUsd(
+    Math.max(0, callRecordMinutes * 60) * railwaySecondRate,
+  );
+  const exactStorageCost = ctoSumProductionRows(
+    productionRows,
+    (r) => r.category === "infrastructure.storage",
+    "realInternalCostUsd",
+  );
+  const estimatedStorageCurrentSnapshotCost = ctoRoundUsd(
+    storage.estimatedBytes * storageByteRate,
+  );
+
+  const estimatedPieces = {
+    phoneNumberPurchaseMissingUsd: ctoRoundUsd(
+      Math.max(0, estimatedPhonePurchase - exactPhonePurchase),
+    ),
+    phoneNumberRentalMissingUsd: ctoRoundUsd(
+      Math.max(0, estimatedPhoneRental - exactPhoneRental),
+    ),
+    twilioCallMissingUsd: estimatedUnledgeredCallCost,
+    leadsMissingUsd: ctoRoundUsd(
+      Math.max(0, estimatedLeadCost - exactLeadCost),
+    ),
+    knowledgeSyncMissingUsd: ctoRoundUsd(
+      Math.max(0, estimatedKnowledgeCost - exactKnowledgeCost),
+    ),
+    railwayRuntimeMissingUsd: ctoRoundUsd(
+      Math.max(0, estimatedRuntimeCost - exactRuntimeCost),
+    ),
+    storageCurrentSnapshotMissingUsd: ctoRoundUsd(
+      Math.max(0, estimatedStorageCurrentSnapshotCost - exactStorageCost),
+    ),
+  };
+  const estimatedUnreconciledInternalCostUsd = ctoRoundUsd(
+    Object.values(estimatedPieces).reduce(
+      (sum, value) => sum + ctoSafeNumber(value, 0),
+      0,
+    ),
+  );
+
+  const callRowsWithTranscript = (callRecordsResult.rows || []).filter(
+    (row) => row.transcript || row.transcription_status || row.summary,
+  );
+  const exactOpenAiCost = ctoSumProductionRows(
+    productionRows,
+    (r) => r.category === "ai.brain" || r.category === "calls.transcripts",
+    "realInternalCostUsd",
+  );
+  const exactElevenLabsCost = ctoSumProductionRows(
+    productionRows,
+    (r) => r.category === "ai.voice",
+    "realInternalCostUsd",
+  );
+  const missingCostWarnings = [];
+  if (numbers.length && exactPhonePurchase < estimatedPhonePurchase)
+    missingCostWarnings.push(
+      "Phone number purchase costs are partly estimated; run/verify Twilio number purchase reconciliation for exact cost.",
+    );
+  if (numbers.length && exactPhoneRental < estimatedPhoneRental)
+    missingCostWarnings.push(
+      "Phone number rental is estimated from active daily/monthly rates; schedule daily/monthly number-rental reconciliation for exact accrued rental.",
+    );
+  if (unledgeredCallMinutes > 0)
+    missingCostWarnings.push(
+      `${ctoNum(unledgeredCallMinutes)} call minutes appear in call_records beyond recorded billing ledger minutes; Twilio call usage backfill/reconciliation may be incomplete.`,
+    );
+  if ((callRecordsResult.count || 0) > 0 && exactOpenAiCost <= 0)
+    missingCostWarnings.push(
+      "OpenAI realtime/transcription historical cost is not fully recorded for this org; exact cost requires runtime usage events or provider invoice/API reconciliation.",
+    );
+  if ((callRecordsResult.count || 0) > 0 && exactElevenLabsCost <= 0)
+    missingCostWarnings.push(
+      "ElevenLabs historical voice cost is not fully recorded for this org; exact cost requires ElevenLabs usage reconciliation or runtime synthesis ledger events.",
+    );
+  if ((chatMessagesResult.count || 0) > 0 && exactOpenAiCost <= 0)
+    missingCostWarnings.push(
+      "Chatbot response costs are not separately itemized; add chatbot OpenAI token metering if chatbot usage should affect pricing baseline.",
+    );
+  if ((leadsResult.count || 0) > 0 && exactLeadCost < estimatedLeadCost)
+    missingCostWarnings.push(
+      "Lead storage/import cost is estimated from lead count; run leads-storage reconciliation for exact ledger rows.",
+    );
+  if (
+    (knowledgeSourcesResult.count || 0) > 0 &&
+    exactKnowledgeCost < estimatedKnowledgeCost
+  )
+    missingCostWarnings.push(
+      "Knowledge scrape/sync cost is estimated from source count; exact scrape pages/chunks/tokens require per-sync ledger events.",
+    );
+  if (storage.estimatedBytes > 0 && exactStorageCost <= 0)
+    missingCostWarnings.push(
+      "Storage cost is a current footprint estimate from database rows; exact historical storage cost requires daily storage snapshots.",
+    );
+
+  const costBuckets = [
+    {
+      category: "phone_numbers.purchase",
+      customerChargedUsd: ctoSumProductionRows(
+        productionRows,
+        (r) => r.category === "phone_numbers.purchase",
+        "userBillOrWalletDeductionUsd",
+      ),
+      exactInternalCostUsd: exactPhonePurchase,
+      estimatedUnreconciledCostUsd:
+        estimatedPieces.phoneNumberPurchaseMissingUsd,
+      notes: `${numbers.length} phone number(s); purchase rate fallback ${ctoMoney(purchaseRate)} per number.`,
+    },
+    {
+      category: "phone_numbers.rental",
+      customerChargedUsd: ctoSumProductionRows(
+        productionRows,
+        (r) => r.category === "phone_numbers.rental",
+        "userBillOrWalletDeductionUsd",
+      ),
+      exactInternalCostUsd: exactPhoneRental,
+      estimatedUnreconciledCostUsd: estimatedPieces.phoneNumberRentalMissingUsd,
+      notes: `Estimated from owned days and ${ctoMoney(dailyRentalRate)}/number/day fallback.`,
+    },
+    {
+      category: "calls.telephony",
+      customerChargedUsd: ctoSumProductionRows(
+        productionRows,
+        (r) => r.category === "calls.telephony",
+        "userBillOrWalletDeductionUsd",
+      ),
+      exactInternalCostUsd: exactCallCost,
+      estimatedUnreconciledCostUsd: estimatedPieces.twilioCallMissingUsd,
+      notes: `${ctoNum(callRecordMinutes)} call-record minutes; ${ctoNum(ledgerCallMinutes)} ledger minutes.`,
+    },
+    {
+      category: "ai.openai_and_transcripts",
+      customerChargedUsd: ctoSumProductionRows(
+        productionRows,
+        (r) => r.category === "ai.brain" || r.category === "calls.transcripts",
+        "userBillOrWalletDeductionUsd",
+      ),
+      exactInternalCostUsd: exactOpenAiCost,
+      estimatedUnreconciledCostUsd: 0,
+      notes: `${callRowsWithTranscript.length} call(s) have transcript/summary indicators; exact token cost requires usage ledger events.`,
+    },
+    {
+      category: "ai.elevenlabs_voice",
+      customerChargedUsd: ctoSumProductionRows(
+        productionRows,
+        (r) => r.category === "ai.voice",
+        "userBillOrWalletDeductionUsd",
+      ),
+      exactInternalCostUsd: exactElevenLabsCost,
+      estimatedUnreconciledCostUsd: 0,
+      notes:
+        "Exact cost requires ElevenLabs usage events or invoice reconciliation.",
+    },
+    {
+      category: "infrastructure.runtime",
+      customerChargedUsd: ctoSumProductionRows(
+        productionRows,
+        (r) => r.category === "infrastructure.runtime",
+        "userBillOrWalletDeductionUsd",
+      ),
+      exactInternalCostUsd: exactRuntimeCost,
+      estimatedUnreconciledCostUsd: estimatedPieces.railwayRuntimeMissingUsd,
+      notes: "Estimated fallback uses call-record duration as runtime proxy.",
+    },
+    {
+      category: "infrastructure.storage",
+      customerChargedUsd: ctoSumProductionRows(
+        productionRows,
+        (r) => r.category === "infrastructure.storage",
+        "userBillOrWalletDeductionUsd",
+      ),
+      exactInternalCostUsd: exactStorageCost,
+      estimatedUnreconciledCostUsd:
+        estimatedPieces.storageCurrentSnapshotMissingUsd,
+      notes: `${ctoNum(storage.estimatedMb)} MB estimated current stored data.`,
+    },
+    {
+      category: "crm.leads",
+      customerChargedUsd: ctoSumProductionRows(
+        productionRows,
+        (r) => r.category === "crm.leads",
+        "userBillOrWalletDeductionUsd",
+      ),
+      exactInternalCostUsd: exactLeadCost,
+      estimatedUnreconciledCostUsd: estimatedPieces.leadsMissingUsd,
+      notes: `${ctoNum(leadsResult.count)} lead(s) at ${ctoMoney(leadRate)} fallback.`,
+    },
+    {
+      category: "knowledge.scraping",
+      customerChargedUsd: ctoSumProductionRows(
+        productionRows,
+        (r) => r.category === "knowledge.scraping",
+        "userBillOrWalletDeductionUsd",
+      ),
+      exactInternalCostUsd: exactKnowledgeCost,
+      estimatedUnreconciledCostUsd: estimatedPieces.knowledgeSyncMissingUsd,
+      notes: `${ctoNum(knowledgeSourcesResult.count)} source(s), ${ctoNum(knowledgeChunksResult.count)} chunk(s).`,
+    },
+    {
+      category: "messaging.email",
+      customerChargedUsd: ctoSumProductionRows(
+        productionRows,
+        (r) => r.category === "messaging.email",
+        "userBillOrWalletDeductionUsd",
+      ),
+      exactInternalCostUsd: ctoSumProductionRows(
+        productionRows,
+        (r) => r.category === "messaging.email",
+        "realInternalCostUsd",
+      ),
+      estimatedUnreconciledCostUsd: 0,
+      notes: "Recorded through Resend/email ledger events where available.",
+    },
+  ];
+
+  const summary = {
+    exactLedgerInternalCostUsd: exactInternalCostUsd,
+    estimatedUnreconciledInternalCostUsd,
+    estimatedAllInInternalCostUsd: ctoRoundUsd(
+      exactInternalCostUsd + estimatedUnreconciledInternalCostUsd,
+    ),
+    customerChargedUsd,
+    exactGrossProfitUsd,
+    exactGrossMarginPercent,
+    estimatedProfitAfterUnreconciledCostUsd: ctoRoundUsd(
+      customerChargedUsd -
+        exactInternalCostUsd -
+        estimatedUnreconciledInternalCostUsd,
+    ),
+    estimatedMarginAfterUnreconciledCostPercent:
+      customerChargedUsd > 0
+        ? Math.round(
+            ((customerChargedUsd -
+              exactInternalCostUsd -
+              estimatedUnreconciledInternalCostUsd) /
+              customerChargedUsd) *
+              10000,
+          ) / 100
+        : null,
+  };
+
+  return {
+    ok: true,
+    source: "cto_org_cost_baseline_v61",
+    organizationId,
+    period: { start: effectiveStart, end },
+    organization: {
+      id: organization.id || organizationId,
+      name:
+        organization.name ||
+        organization.business_name ||
+        organization.company_name ||
+        null,
+      plan:
+        organization.plan ||
+        organization.plan_key ||
+        organization.billing_plan ||
+        null,
+      createdAt: organization.created_at || null,
+      timezone: organization.timezone || null,
+    },
+    dataConfidence: {
+      level: missingCostWarnings.length
+        ? "partial_exact_plus_estimated"
+        : "high_ledger_coverage",
+      exactSourceOfTruth:
+        "billing_usage_events + billing_customer_usage_charges + billing_wallet_transactions",
+      estimateSourceOfTruth:
+        "asset tables + active vendor rate cards + current storage footprint",
+      warningCount: missingCostWarnings.length,
+    },
+    summary,
+    accountFootprint: {
+      phoneNumbers: phoneNumbersResult.count,
+      calls: callRecordsResult.count,
+      callRecordMinutes,
+      leads: leadsResult.count,
+      chatbots: chatbotsResult.count,
+      chatMessages: chatMessagesResult.count,
+      voiceAgents: voiceAgentsResult.count,
+      knowledgeBases: knowledgeBasesResult.count,
+      knowledgeSources: knowledgeSourcesResult.count,
+      knowledgeChunks: knowledgeChunksResult.count,
+      faqs: faqsResult.count,
+      products: productsResult.count,
+    },
+    phoneNumbers: {
+      count: phoneNumbersResult.count,
+      exactLedgerPurchaseCostUsd: exactPhonePurchase,
+      estimatedPurchaseCostUsd: estimatedPhonePurchase,
+      exactLedgerRentalCostUsd: exactPhoneRental,
+      estimatedRentalCostUsd: estimatedPhoneRental,
+      purchaseRateFallbackUsd: ctoRoundUsd(purchaseRate),
+      dailyRentalRateFallbackUsd: ctoRoundUsd(dailyRentalRate),
+      numbers,
+    },
+    twilio: {
+      exactLedgerCostUsd: ctoRoundUsd(
+        exactCallCost + exactPhonePurchase + exactPhoneRental,
+      ),
+      callRecordCount: callRecordsResult.count,
+      callRecordMinutes,
+      ledgerCallMinutes,
+      exactCallCostUsd: exactCallCost,
+      unledgeredCallMinutes,
+      estimatedUnledgeredCallCostUsd: estimatedUnledgeredCallCost,
+      minuteRateFallbackUsd: ctoRoundUsd(twilioMinuteRate),
+    },
+    ai: {
+      exactOpenAiAndTranscriptCostUsd: exactOpenAiCost,
+      exactElevenLabsCostUsd: exactElevenLabsCost,
+      transcriptOrSummaryCallCount: callRowsWithTranscript.length,
+      chatbotMessageCount: chatMessagesResult.count,
+    },
+    infrastructure: {
+      exactRuntimeCostUsd: exactRuntimeCost,
+      estimatedRuntimeCostUsd,
+      exactStorageCostUsd: exactStorageCost,
+      estimatedCurrentStorageSnapshotCostUsd:
+        estimatedStorageCurrentSnapshotCost,
+      exactDatabaseComputeCostUsd: ctoSumProductionRows(
+        productionRows,
+        (r) => r.category === "infrastructure.database_compute",
+        "realInternalCostUsd",
+      ),
+    },
+    storage,
+    knowledge: {
+      bases: knowledgeBasesResult.count,
+      sources: knowledgeSourcesResult.count,
+      chunks: knowledgeChunksResult.count,
+      faqs: faqsResult.count,
+      products: productsResult.count,
+      exactLedgerCostUsd: exactKnowledgeCost,
+      estimatedSyncCostUsd: estimatedKnowledgeCost,
+      syncRateFallbackUsd: ctoRoundUsd(knowledgeSyncRate),
+    },
+    crm: {
+      leads: leadsResult.count,
+      exactLedgerCostUsd: exactLeadCost,
+      estimatedLeadCostUsd: estimatedLeadCost,
+      leadRateFallbackUsd: ctoRoundUsd(leadRate),
+    },
+    exactLedgerByCategory: exactByCategory,
+    costBuckets,
+    missingCostWarnings,
+    rawTableReadErrors: [
+      phoneNumbersResult,
+      callRecordsResult,
+      leadsResult,
+      knowledgeBasesResult,
+      knowledgeSourcesResult,
+      knowledgeChunksResult,
+      faqsResult,
+      productsResult,
+      chatbotsResult,
+      chatMessagesResult,
+      voiceAgentsResult,
+    ]
+      .filter((r) => !r.ok)
+      .map((r) => ({ table: r.table, error: r.error })),
+    nextActions: [
+      "Schedule daily /api/billing-usage/reconcile/twilio-number-rentals for exact phone rental accrual.",
+      "Backfill /api/billing-usage/record/twilio-number-purchase or Twilio account usage for exact number procurement cost.",
+      "Ensure runtime logs OpenAI realtime tokens, ElevenLabs usage, Railway seconds, and chatbot token usage for every session.",
+      "Schedule daily storage snapshots so storage cost becomes historical/exact instead of current-footprint estimate.",
+      "Use this endpoint for CTO pricing baseline; use vendor-rate-sync/status only for rate-card coverage health.",
+    ],
+  };
+}
+
 router.use(requireInternalBillingAccess);
 
 router.get("/plans", async (_req, res, next) => {
@@ -1941,6 +2940,56 @@ router.get("/production-cost-summary", async (req, res, next) => {
       period: range,
       ...report,
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get("/org-cost-baseline", async (req, res, next) => {
+  try {
+    const organizationId = cleanOrgId(
+      req.query.organizationId ||
+        req.query.organization_id ||
+        req.query.orgId ||
+        req.query.org_id,
+    );
+    if (!organizationId) {
+      return res
+        .status(400)
+        .json({ error: { message: "organizationId is required." } });
+    }
+    const end = req.query.end || new Date().toISOString();
+    let start = req.query.start || req.query.from || null;
+    if (!start && req.query.hours) {
+      start = new Date(
+        new Date(end).getTime() -
+          Math.max(Number(req.query.hours) || 87600, 1) * 60 * 60 * 1000,
+      ).toISOString();
+    } else if (
+      !start ||
+      ["onboarding", "all", "all_time", "from_onboarding"].includes(
+        String(start).toLowerCase(),
+      )
+    ) {
+      start = "onboarding";
+    }
+    if (start !== "onboarding" && Number.isNaN(new Date(start).getTime())) {
+      start = new Date(
+        new Date(end).getTime() -
+          Math.max(Number(req.query.hours) || 87600, 1) * 60 * 60 * 1000,
+      ).toISOString();
+    }
+    const report = await buildCtoOrgCostBaseline({
+      organizationId,
+      start,
+      end,
+    });
+    const format = String(req.query.format || "json").toLowerCase();
+    if (["md", "markdown", "text"].includes(format)) {
+      res.type("text/markdown").send(ctoBuildMarkdownReport(report));
+      return;
+    }
+    res.json(report);
   } catch (err) {
     next(err);
   }
