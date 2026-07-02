@@ -1458,7 +1458,7 @@ function ctoBuildMarkdownReport(report) {
   const s = report.summary || {};
   const f = report.accountFootprint || {};
   const lines = [];
-  lines.push(`# CTO Cost Baseline Report`);
+  lines.push(`# CTO Exact Cost Baseline Report`);
   lines.push("");
   lines.push(`Organization: ${report.organizationId}`);
   lines.push(
@@ -1468,21 +1468,25 @@ function ctoBuildMarkdownReport(report) {
   lines.push(`## Executive summary`);
   lines.push("");
   lines.push(
-    `- Exact ledger internal cost: **${ctoMoney(s.exactLedgerInternalCostUsd)}**`,
+    `- Exact recorded internal cost: **${ctoMoney(s.exactRecordedInternalCostUsd)}**`,
   );
   lines.push(
-    `- Estimated unreconciled/additional cost: **${ctoMoney(s.estimatedUnreconciledInternalCostUsd)}**`,
+    `- Current customer billing already recorded: **${ctoMoney(s.customerBillingRecordedUsd)}**`,
   );
   lines.push(
-    `- Estimated all-in internal cost: **${ctoMoney(s.estimatedAllInInternalCostUsd)}**`,
-  );
-  lines.push(`- Customer charged: **${ctoMoney(s.customerChargedUsd)}**`);
-  lines.push(`- Exact gross profit: **${ctoMoney(s.exactGrossProfitUsd)}**`);
-  lines.push(
-    `- Exact gross margin: **${s.exactGrossMarginPercent === null ? "N/A" : `${ctoNum(s.exactGrossMarginPercent)}%`}**`,
+    `- Exact usage ledger events: **${ctoNum(s.exactUsageEventCount)}**`,
   );
   lines.push(
-    `- Data confidence: **${report.dataConfidence?.level || "partial"}**`,
+    `- Exact customer charge rows: **${ctoNum(s.customerChargeRowCount)}**`,
+  );
+  lines.push(`- Profit/margin: **not calculated in this report**`);
+  lines.push(`- Estimate policy: **${report.estimatePolicy || "exact_only"}**`);
+  lines.push(
+    `- Data confidence: **${report.dataConfidence?.level || "exact_ledger_only"}**`,
+  );
+  lines.push("");
+  lines.push(
+    `> This report is intentionally exact-only. It does not add estimated costs, suggested profits, markups, or margins to the real billing section.`,
   );
   lines.push("");
   lines.push(`## Account footprint`);
@@ -1491,6 +1495,9 @@ function ctoBuildMarkdownReport(report) {
   lines.push(`- Calls: ${ctoNum(f.calls)}`);
   lines.push(
     `- Call minutes from call records: ${ctoNum(f.callRecordMinutes)}`,
+  );
+  lines.push(
+    `- Call minutes recorded in billing ledger: ${ctoNum(f.ledgerCallMinutes)}`,
   );
   lines.push(`- Leads: ${ctoNum(f.leads)}`);
   lines.push(`- Chatbots: ${ctoNum(f.chatbots)}`);
@@ -1502,18 +1509,18 @@ function ctoBuildMarkdownReport(report) {
   lines.push(`- FAQs: ${ctoNum(f.faqs)}`);
   lines.push(`- Products: ${ctoNum(f.products)}`);
   lines.push(
-    `- Estimated stored data: ${ctoNum(report.storage?.estimatedMb)} MB`,
+    `- Current measured database footprint: ${ctoNum(report.storage?.measuredMb)} MB`,
   );
   lines.push("");
-  lines.push(`## Main cost buckets`);
+  lines.push(`## Exact cost buckets`);
   lines.push("");
   lines.push(
-    `| Category | Customer Charged | Exact Internal Cost | Estimated Missing Cost | Notes |`,
+    `| Category | Customer Billing Recorded | Exact Internal Cost Recorded | Usage Qty | Events | Ledger Status | Notes |`,
   );
-  lines.push(`|---|---:|---:|---:|---|`);
+  lines.push(`|---|---:|---:|---:|---:|---|---|`);
   for (const row of report.costBuckets || []) {
     lines.push(
-      `| ${row.category} | ${ctoMoney(row.customerChargedUsd)} | ${ctoMoney(row.exactInternalCostUsd)} | ${ctoMoney(row.estimatedUnreconciledCostUsd)} | ${(row.notes || "").replace(/\|/g, "\\|")} |`,
+      `| ${row.category} | ${ctoMoney(row.customerBillingRecordedUsd)} | ${ctoMoney(row.exactInternalCostRecordedUsd)} | ${ctoNum(row.usageQuantity)} | ${ctoNum(row.eventCount)} | ${row.ledgerStatus || ""} | ${(row.notes || "").replace(/\|/g, "\\|")} |`,
     );
   }
   lines.push("");
@@ -1521,44 +1528,214 @@ function ctoBuildMarkdownReport(report) {
   lines.push("");
   lines.push(`- Count: ${ctoNum(report.phoneNumbers?.count)}`);
   lines.push(
-    `- Exact recorded purchase cost: ${ctoMoney(report.phoneNumbers?.exactLedgerPurchaseCostUsd)}`,
+    `- Exact recorded purchase cost: ${ctoMoney(report.phoneNumbers?.exactRecordedPurchaseCostUsd)}`,
   );
   lines.push(
-    `- Estimated purchase cost: ${ctoMoney(report.phoneNumbers?.estimatedPurchaseCostUsd)}`,
-  );
-  lines.push(
-    `- Exact recorded rental cost: ${ctoMoney(report.phoneNumbers?.exactLedgerRentalCostUsd)}`,
-  );
-  lines.push(
-    `- Estimated rental since acquisition: ${ctoMoney(report.phoneNumbers?.estimatedRentalCostUsd)}`,
+    `- Exact recorded rental cost: ${ctoMoney(report.phoneNumbers?.exactRecordedRentalCostUsd)}`,
   );
   lines.push("");
   if ((report.phoneNumbers?.numbers || []).length) {
     lines.push(
-      `| Number | SID | Created | Estimated Purchase | Estimated Rental | Notes |`,
+      `| Number | SID | Created | Exact Purchase Cost Recorded | Exact Rental Cost Recorded | Ledger Status |`,
     );
     lines.push(`|---|---|---|---:|---:|---|`);
     for (const n of report.phoneNumbers.numbers) {
       lines.push(
-        `| ${n.phoneNumber || ""} | ${n.phoneSid || ""} | ${n.createdAt || ""} | ${ctoMoney(n.estimatedPurchaseCostUsd)} | ${ctoMoney(n.estimatedRentalCostUsd)} | ${(n.notes || "").replace(/\|/g, "\\|")} |`,
+        `| ${n.phoneNumber || ""} | ${n.phoneSid || ""} | ${n.createdAt || ""} | ${ctoMoney(n.exactPurchaseCostRecordedUsd)} | ${ctoMoney(n.exactRentalCostRecordedUsd)} | ${n.ledgerStatus || ""} |`,
       );
     }
     lines.push("");
   }
-  lines.push(`## Warnings / missing exact data`);
+  lines.push(`## Exact-data coverage status`);
   lines.push("");
-  if ((report.missingCostWarnings || []).length) {
-    for (const warning of report.missingCostWarnings)
-      lines.push(`- ${warning}`);
+  if ((report.exactDataCoverage || []).length) {
+    lines.push(
+      `| Area | Status | Current exact figure | Why this matters | Required action for real figure |`,
+    );
+    lines.push(`|---|---|---:|---|---|`);
+    for (const item of report.exactDataCoverage) {
+      lines.push(
+        `| ${item.area} | ${item.status} | ${item.currentExactFigure || ""} | ${(item.reason || "").replace(/\|/g, "\\|")} | ${(item.requiredAction || "").replace(/\|/g, "\\|")} |`,
+      );
+    }
   } else {
-    lines.push("- No missing-cost warnings returned.");
+    lines.push("No exact-data coverage rows returned.");
   }
   lines.push("");
-  lines.push(`## Recommended next actions`);
+  lines.push(`## Separate pricing model workspace`);
   lines.push("");
-  for (const action of report.nextActions || []) lines.push(`- ${action}`);
+  lines.push(
+    `This section is separate from real current billing. It is not applied to totals.`,
+  );
+  lines.push("");
+  if ((report.pricingModelWorkspace?.rules || []).length) {
+    lines.push(
+      `| Service | Basis | Exact Internal Unit Cost | Markup/Profit % Placeholder | Simulated Customer Price | Active? |`,
+    );
+    lines.push(`|---|---|---:|---:|---:|---|`);
+    for (const rule of report.pricingModelWorkspace.rules) {
+      lines.push(
+        `| ${rule.service} | ${rule.basis} | ${rule.exactInternalUnitCostUsd === null ? "" : ctoMoney(rule.exactInternalUnitCostUsd)} | ${rule.markupPercent === null ? "" : `${ctoNum(rule.markupPercent)}%`} | ${rule.simulatedCustomerUnitPriceUsd === null ? "" : ctoMoney(rule.simulatedCustomerUnitPriceUsd)} | ${rule.active ? "yes" : "no"} |`,
+      );
+    }
+  } else {
+    lines.push("No pricing model rules returned.");
+  }
+  lines.push("");
+  lines.push(`## Notes`);
+  lines.push("");
+  lines.push(
+    `- Exact cost comes only from recorded billing ledger/provider reconciliation events.`,
+  );
+  lines.push(
+    `- If an asset exists but no provider usage/cost event was recorded, the report shows $0 exact cost and marks the area as needing reconciliation.`,
+  );
+  lines.push(
+    `- Profit and final markup rules should be modeled later inside pricingModelWorkspace, not inside the real-cost baseline.`,
+  );
   lines.push("");
   return lines.join("\n");
+}
+
+function ctoStatusForExactCost({
+  assetCount = 0,
+  exactCost = 0,
+  eventCount = 0,
+  observedQuantity = 0,
+  ledgerQuantity = 0,
+} = {}) {
+  if (eventCount > 0 && exactCost > 0) return "exact_cost_recorded";
+  if (eventCount > 0 && exactCost === 0)
+    return "ledger_event_recorded_zero_cost";
+  if (
+    observedQuantity > 0 &&
+    ledgerQuantity > 0 &&
+    ledgerQuantity < observedQuantity
+  )
+    return "partial_ledger_coverage";
+  if (assetCount > 0 || observedQuantity > 0)
+    return "asset_or_usage_exists_no_exact_cost_recorded";
+  return "no_usage_in_period";
+}
+
+function ctoComputeUnitCost(exactCost, quantity) {
+  const q = ctoSafeNumber(quantity, 0);
+  if (q <= 0) return null;
+  return ctoRoundUsd(ctoSafeNumber(exactCost, 0) / q);
+}
+
+function ctoBuildPricingWorkspace({ costBuckets = [] } = {}) {
+  const byCategory = new Map(
+    (costBuckets || []).map((row) => [row.category, row]),
+  );
+  const rule = (service, category, basis, editableNotes = "") => {
+    const row = byCategory.get(category) || {};
+    return {
+      service,
+      category,
+      basis,
+      exactInternalUnitCostUsd: ctoComputeUnitCost(
+        row.exactInternalCostRecordedUsd,
+        row.usageQuantity,
+      ),
+      markupPercent: null,
+      simulatedCustomerUnitPriceUsd: null,
+      active: false,
+      notes:
+        editableNotes ||
+        "Set markupPercent later; this does not affect current billing totals.",
+    };
+  };
+  return {
+    active: false,
+    note: "Profit/markup modeling is intentionally separate from real billing. Fill markupPercent later per service; do not use this as actual cost.",
+    rules: [
+      rule(
+        "inbound_calls",
+        "calls.telephony",
+        "per inbound billed minute",
+        "Future CTO rule example: 50% markup on inbound calls.",
+      ),
+      rule(
+        "outbound_calls",
+        "calls.telephony",
+        "per outbound billed minute",
+        "Future CTO rule example: 70% markup on outbound calls.",
+      ),
+      rule(
+        "extra_inbound_minutes",
+        "calls.telephony",
+        "per extra inbound minute",
+        "Separate rule for extra inbound minutes.",
+      ),
+      rule(
+        "extra_outbound_minutes",
+        "calls.telephony",
+        "per extra outbound minute",
+        "Separate rule for extra outbound minutes.",
+      ),
+      rule(
+        "chatbot_responses",
+        "ai.openai_and_transcripts",
+        "per chatbot response or token unit",
+        "Future CTO rule example: 30% markup on chatbot response costs.",
+      ),
+      rule(
+        "knowledge_base_storage",
+        "knowledge.scraping",
+        "per sync/source/chunk or storage unit",
+        "Future CTO rule example: 70% markup on knowledge base/FAQ storage.",
+      ),
+      rule(
+        "faq_storage",
+        "knowledge.scraping",
+        "per FAQ or storage unit",
+        "Separate FAQ pricing model placeholder.",
+      ),
+      rule(
+        "leads",
+        "crm.leads",
+        "per lead",
+        "Future CTO rule example: 60% markup on leads.",
+      ),
+      rule(
+        "voice_ai",
+        "ai.elevenlabs_voice",
+        "per voice unit",
+        "Future CTO rule for ElevenLabs/voice usage.",
+      ),
+      rule(
+        "openai_realtime",
+        "ai.openai_and_transcripts",
+        "per token/minute unit",
+        "Future CTO rule for OpenAI realtime usage.",
+      ),
+      rule(
+        "phone_number_purchase",
+        "phone_numbers.purchase",
+        "per number",
+        "Future CTO setup fee rule for number procurement.",
+      ),
+      rule(
+        "phone_number_rental",
+        "phone_numbers.rental",
+        "per number/month or number/day",
+        "Future CTO monthly phone rental markup rule.",
+      ),
+      rule(
+        "storage",
+        "infrastructure.storage",
+        "per stored byte/GB-month",
+        "Future CTO storage markup rule.",
+      ),
+      rule(
+        "runtime",
+        "infrastructure.runtime",
+        "per runtime second/minute",
+        "Future CTO runtime markup rule.",
+      ),
+    ],
+  };
 }
 
 async function buildCtoOrgCostBaseline({ organizationId, start, end } = {}) {
@@ -1570,7 +1747,6 @@ async function buildCtoOrgCostBaseline({ organizationId, start, end } = {}) {
         organization.inserted_at ||
         "1970-01-01T00:00:00.000Z"
       : start;
-  const rateCards = await ctoFetchActiveRateCards(sb);
   const production = await getProductionCostRows({
     organizationId,
     start: effectiveStart,
@@ -1623,132 +1799,16 @@ async function buildCtoOrgCostBaseline({ organizationId, start, end } = {}) {
   const exactInternalCostUsd = ctoRoundUsd(
     production.totals?.realInternalCostUsd || 0,
   );
-  const customerChargedUsd = ctoRoundUsd(
+  const customerBillingRecordedUsd = ctoRoundUsd(
     production.totals?.userBillOrWalletDeductionUsd || 0,
   );
-  const exactGrossProfitUsd = ctoRoundUsd(
-    production.totals?.grossProfitUsd ||
-      customerChargedUsd - exactInternalCostUsd,
+  const exactUsageEventCount = ctoSafeNumber(
+    production.totals?.eventCount,
+    productionRows.reduce(
+      (sum, row) => sum + ctoSafeNumber(row.eventCount, 0),
+      0,
+    ),
   );
-  const exactGrossMarginPercent =
-    customerChargedUsd > 0
-      ? Math.round((exactGrossProfitUsd / customerChargedUsd) * 10000) / 100
-      : null;
-
-  const purchaseRate = ctoFindMaxRate(
-    rateCards,
-    {
-      provider: "twilio",
-      service: "phone_number",
-      eventTypes: ["number_purchase"],
-      units: ["number"],
-    },
-    1.15,
-  );
-  const dailyRentalRate = ctoFindMaxRate(
-    rateCards,
-    {
-      provider: "twilio",
-      service: "phone_number",
-      eventTypes: ["daily_prorated_number_rental", "rental"],
-      units: ["number_day"],
-    },
-    0.0384,
-  );
-  const twilioMinuteRate = ctoFindMaxRate(
-    rateCards,
-    {
-      provider: "twilio",
-      service: "voice",
-      eventTypes: ["twilio_call", "outbound_call", "inbound_call"],
-      units: ["minutes"],
-    },
-    0.02,
-  );
-  const leadRate = ctoFindMaxRate(
-    rateCards,
-    {
-      provider: "agently",
-      service: "leads",
-      eventTypes: ["lead_created_or_imported"],
-      units: ["lead"],
-    },
-    0.00001,
-  );
-  const knowledgeSyncRate = ctoFindMaxRate(
-    rateCards,
-    {
-      provider: "knowledge_base",
-      service: "scrape_sync",
-      eventTypes: ["sync_attempt"],
-      units: ["sync"],
-    },
-    0.01,
-  );
-  const railwaySecondRate = ctoFindMaxRate(
-    rateCards,
-    {
-      provider: "railway",
-      service: "runtime",
-      eventTypes: ["websocket_runtime"],
-      units: ["seconds"],
-    },
-    0.00001,
-  );
-  const storageByteRate = ctoFindMaxRate(
-    rateCards,
-    {
-      provider: "supabase",
-      service: "storage",
-      eventTypes: ["tenant_storage_snapshot"],
-      units: ["bytes"],
-    },
-    0.000000000000685,
-  );
-
-  const numbers = (phoneNumbersResult.rows || []).map((row) => {
-    const createdAt =
-      row.created_at ||
-      row.purchased_at ||
-      row.metadata?.created_at ||
-      effectiveStart;
-    const daysOwned = ctoDaysBetween(createdAt, end);
-    const meta = row.metadata || {};
-    const purchase = ctoSafeNumber(
-      meta.internal_cost_usd ?? meta.twilio_cost_usd ?? meta.purchase_cost_usd,
-      purchaseRate,
-    );
-    const daily = ctoSafeNumber(
-      meta.daily_rental_usd ?? meta.daily_prorated_number_rental_usd,
-      dailyRentalRate,
-    );
-    return {
-      id: row.id || null,
-      phoneNumber: ctoPickString(row, [
-        "phone_number",
-        "number",
-        "friendly_name",
-        "display_phone_number",
-      ]),
-      phoneSid: ctoPickString(row, ["phone_sid", "sid", "twilio_phone_sid"]),
-      status:
-        row.status || row.lifecycle_status || row.metadata?.status || null,
-      createdAt,
-      daysOwned: Math.round(daysOwned * 100) / 100,
-      estimatedPurchaseCostUsd: ctoRoundUsd(purchase),
-      estimatedRentalCostUsd: ctoRoundUsd(daysOwned * daily),
-      estimatedDailyRentalUsd: ctoRoundUsd(daily),
-      assignedVoiceAgentId:
-        row.assigned_voice_agent_id ||
-        row.inbound_voice_agent_id ||
-        row.default_outbound_voice_agent_id ||
-        null,
-      notes:
-        meta.internal_cost_usd || meta.twilio_cost_usd
-          ? "purchase cost from number metadata"
-          : "purchase/rental estimated from active Twilio rate cards",
-    };
-  });
 
   const exactPhonePurchase = ctoSumProductionRows(
     productionRows,
@@ -1762,19 +1822,6 @@ async function buildCtoOrgCostBaseline({ organizationId, start, end } = {}) {
     (r) => r.category === "phone_numbers.rental",
     "realInternalCostUsd",
   );
-  const estimatedPhonePurchase = ctoRoundUsd(
-    numbers.reduce(
-      (sum, row) => sum + ctoSafeNumber(row.estimatedPurchaseCostUsd, 0),
-      0,
-    ),
-  );
-  const estimatedPhoneRental = ctoRoundUsd(
-    numbers.reduce(
-      (sum, row) => sum + ctoSafeNumber(row.estimatedRentalCostUsd, 0),
-      0,
-    ),
-  );
-
   const callRecordMinutes = (callRecordsResult.rows || []).reduce(
     (sum, row) => sum + ctoMinutesFromCallRow(row),
     0,
@@ -1789,76 +1836,6 @@ async function buildCtoOrgCostBaseline({ organizationId, start, end } = {}) {
     (r) => r.category === "calls.telephony",
     "realInternalCostUsd",
   );
-  const unledgeredCallMinutes = Math.max(
-    0,
-    callRecordMinutes - ledgerCallMinutes,
-  );
-  const estimatedUnledgeredCallCost = ctoRoundUsd(
-    unledgeredCallMinutes * twilioMinuteRate,
-  );
-
-  const exactLeadCost = ctoSumProductionRows(
-    productionRows,
-    (r) => r.category === "crm.leads",
-    "realInternalCostUsd",
-  );
-  const estimatedLeadCost = ctoRoundUsd((leadsResult.count || 0) * leadRate);
-  const exactKnowledgeCost = ctoSumProductionRows(
-    productionRows,
-    (r) => r.category === "knowledge.scraping",
-    "realInternalCostUsd",
-  );
-  const estimatedKnowledgeCost = ctoRoundUsd(
-    (knowledgeSourcesResult.count || 0) * knowledgeSyncRate,
-  );
-  const exactRuntimeCost = ctoSumProductionRows(
-    productionRows,
-    (r) => r.category === "infrastructure.runtime",
-    "realInternalCostUsd",
-  );
-  const estimatedRuntimeCost = ctoRoundUsd(
-    Math.max(0, callRecordMinutes * 60) * railwaySecondRate,
-  );
-  const exactStorageCost = ctoSumProductionRows(
-    productionRows,
-    (r) => r.category === "infrastructure.storage",
-    "realInternalCostUsd",
-  );
-  const estimatedStorageCurrentSnapshotCost = ctoRoundUsd(
-    storage.estimatedBytes * storageByteRate,
-  );
-
-  const estimatedPieces = {
-    phoneNumberPurchaseMissingUsd: ctoRoundUsd(
-      Math.max(0, estimatedPhonePurchase - exactPhonePurchase),
-    ),
-    phoneNumberRentalMissingUsd: ctoRoundUsd(
-      Math.max(0, estimatedPhoneRental - exactPhoneRental),
-    ),
-    twilioCallMissingUsd: estimatedUnledgeredCallCost,
-    leadsMissingUsd: ctoRoundUsd(
-      Math.max(0, estimatedLeadCost - exactLeadCost),
-    ),
-    knowledgeSyncMissingUsd: ctoRoundUsd(
-      Math.max(0, estimatedKnowledgeCost - exactKnowledgeCost),
-    ),
-    railwayRuntimeMissingUsd: ctoRoundUsd(
-      Math.max(0, estimatedRuntimeCost - exactRuntimeCost),
-    ),
-    storageCurrentSnapshotMissingUsd: ctoRoundUsd(
-      Math.max(0, estimatedStorageCurrentSnapshotCost - exactStorageCost),
-    ),
-  };
-  const estimatedUnreconciledInternalCostUsd = ctoRoundUsd(
-    Object.values(estimatedPieces).reduce(
-      (sum, value) => sum + ctoSafeNumber(value, 0),
-      0,
-    ),
-  );
-
-  const callRowsWithTranscript = (callRecordsResult.rows || []).filter(
-    (row) => row.transcript || row.transcription_status || row.summary,
-  );
   const exactOpenAiCost = ctoSumProductionRows(
     productionRows,
     (r) => r.category === "ai.brain" || r.category === "calls.transcripts",
@@ -1869,198 +1846,366 @@ async function buildCtoOrgCostBaseline({ organizationId, start, end } = {}) {
     (r) => r.category === "ai.voice",
     "realInternalCostUsd",
   );
-  const missingCostWarnings = [];
-  if (numbers.length && exactPhonePurchase < estimatedPhonePurchase)
-    missingCostWarnings.push(
-      "Phone number purchase costs are partly estimated; run/verify Twilio number purchase reconciliation for exact cost.",
-    );
-  if (numbers.length && exactPhoneRental < estimatedPhoneRental)
-    missingCostWarnings.push(
-      "Phone number rental is estimated from active daily/monthly rates; schedule daily/monthly number-rental reconciliation for exact accrued rental.",
-    );
-  if (unledgeredCallMinutes > 0)
-    missingCostWarnings.push(
-      `${ctoNum(unledgeredCallMinutes)} call minutes appear in call_records beyond recorded billing ledger minutes; Twilio call usage backfill/reconciliation may be incomplete.`,
-    );
-  if ((callRecordsResult.count || 0) > 0 && exactOpenAiCost <= 0)
-    missingCostWarnings.push(
-      "OpenAI realtime/transcription historical cost is not fully recorded for this org; exact cost requires runtime usage events or provider invoice/API reconciliation.",
-    );
-  if ((callRecordsResult.count || 0) > 0 && exactElevenLabsCost <= 0)
-    missingCostWarnings.push(
-      "ElevenLabs historical voice cost is not fully recorded for this org; exact cost requires ElevenLabs usage reconciliation or runtime synthesis ledger events.",
-    );
-  if ((chatMessagesResult.count || 0) > 0 && exactOpenAiCost <= 0)
-    missingCostWarnings.push(
-      "Chatbot response costs are not separately itemized; add chatbot OpenAI token metering if chatbot usage should affect pricing baseline.",
-    );
-  if ((leadsResult.count || 0) > 0 && exactLeadCost < estimatedLeadCost)
-    missingCostWarnings.push(
-      "Lead storage/import cost is estimated from lead count; run leads-storage reconciliation for exact ledger rows.",
-    );
-  if (
-    (knowledgeSourcesResult.count || 0) > 0 &&
-    exactKnowledgeCost < estimatedKnowledgeCost
-  )
-    missingCostWarnings.push(
-      "Knowledge scrape/sync cost is estimated from source count; exact scrape pages/chunks/tokens require per-sync ledger events.",
-    );
-  if (storage.estimatedBytes > 0 && exactStorageCost <= 0)
-    missingCostWarnings.push(
-      "Storage cost is a current footprint estimate from database rows; exact historical storage cost requires daily storage snapshots.",
-    );
+  const exactRuntimeCost = ctoSumProductionRows(
+    productionRows,
+    (r) => r.category === "infrastructure.runtime",
+    "realInternalCostUsd",
+  );
+  const exactStorageCost = ctoSumProductionRows(
+    productionRows,
+    (r) => r.category === "infrastructure.storage",
+    "realInternalCostUsd",
+  );
+  const exactDatabaseComputeCost = ctoSumProductionRows(
+    productionRows,
+    (r) => r.category === "infrastructure.database_compute",
+    "realInternalCostUsd",
+  );
+  const exactLeadCost = ctoSumProductionRows(
+    productionRows,
+    (r) => r.category === "crm.leads",
+    "realInternalCostUsd",
+  );
+  const exactKnowledgeCost = ctoSumProductionRows(
+    productionRows,
+    (r) => r.category === "knowledge.scraping",
+    "realInternalCostUsd",
+  );
+  const exactEmailCost = ctoSumProductionRows(
+    productionRows,
+    (r) => r.category === "messaging.email",
+    "realInternalCostUsd",
+  );
+
+  const categoryRow = (
+    category,
+    assetCount,
+    observedQuantity,
+    ledgerQuantity,
+    exactCost,
+    notes,
+    extraPredicate = null,
+  ) => {
+    const predicate = extraPredicate || ((r) => r.category === category);
+    const eventCount = productionRows
+      .filter(predicate)
+      .reduce((sum, row) => sum + ctoSafeNumber(row.eventCount, 0), 0);
+    const usageQuantity = productionRows
+      .filter(predicate)
+      .reduce((sum, row) => sum + ctoSafeNumber(row.usageQuantity, 0), 0);
+    return {
+      category,
+      customerBillingRecordedUsd: ctoSumProductionRows(
+        productionRows,
+        predicate,
+        "userBillOrWalletDeductionUsd",
+      ),
+      exactInternalCostRecordedUsd: ctoRoundUsd(exactCost),
+      usageQuantity,
+      observedQuantity,
+      eventCount,
+      ledgerStatus: ctoStatusForExactCost({
+        assetCount,
+        exactCost,
+        eventCount,
+        observedQuantity,
+        ledgerQuantity,
+      }),
+      notes,
+    };
+  };
 
   const costBuckets = [
-    {
-      category: "phone_numbers.purchase",
-      customerChargedUsd: ctoSumProductionRows(
+    categoryRow(
+      "phone_numbers.purchase",
+      phoneNumbersResult.count,
+      phoneNumbersResult.count,
+      0,
+      exactPhonePurchase,
+      `${ctoNum(phoneNumbersResult.count)} phone number asset(s). Exact cost only if procurement events were recorded.`,
+    ),
+    categoryRow(
+      "phone_numbers.rental",
+      phoneNumbersResult.count,
+      phoneNumbersResult.count,
+      0,
+      exactPhoneRental,
+      `${ctoNum(phoneNumbersResult.count)} phone number asset(s). Exact rental only if rental accrual events were recorded.`,
+    ),
+    categoryRow(
+      "calls.telephony",
+      callRecordsResult.count,
+      callRecordMinutes,
+      ledgerCallMinutes,
+      exactCallCost,
+      `${ctoNum(callRecordMinutes)} call-record minutes; ${ctoNum(ledgerCallMinutes)} minutes currently in exact billing ledger.`,
+    ),
+    categoryRow(
+      "calls.recordings",
+      callRecordsResult.count,
+      callRecordMinutes,
+      0,
+      ctoSumProductionRows(
         productionRows,
-        (r) => r.category === "phone_numbers.purchase",
-        "userBillOrWalletDeductionUsd",
-      ),
-      exactInternalCostUsd: exactPhonePurchase,
-      estimatedUnreconciledCostUsd:
-        estimatedPieces.phoneNumberPurchaseMissingUsd,
-      notes: `${numbers.length} phone number(s); purchase rate fallback ${ctoMoney(purchaseRate)} per number.`,
-    },
-    {
-      category: "phone_numbers.rental",
-      customerChargedUsd: ctoSumProductionRows(
-        productionRows,
-        (r) => r.category === "phone_numbers.rental",
-        "userBillOrWalletDeductionUsd",
-      ),
-      exactInternalCostUsd: exactPhoneRental,
-      estimatedUnreconciledCostUsd: estimatedPieces.phoneNumberRentalMissingUsd,
-      notes: `Estimated from owned days and ${ctoMoney(dailyRentalRate)}/number/day fallback.`,
-    },
-    {
-      category: "calls.telephony",
-      customerChargedUsd: ctoSumProductionRows(
-        productionRows,
-        (r) => r.category === "calls.telephony",
-        "userBillOrWalletDeductionUsd",
-      ),
-      exactInternalCostUsd: exactCallCost,
-      estimatedUnreconciledCostUsd: estimatedPieces.twilioCallMissingUsd,
-      notes: `${ctoNum(callRecordMinutes)} call-record minutes; ${ctoNum(ledgerCallMinutes)} ledger minutes.`,
-    },
-    {
-      category: "ai.openai_and_transcripts",
-      customerChargedUsd: ctoSumProductionRows(
-        productionRows,
-        (r) => r.category === "ai.brain" || r.category === "calls.transcripts",
-        "userBillOrWalletDeductionUsd",
-      ),
-      exactInternalCostUsd: exactOpenAiCost,
-      estimatedUnreconciledCostUsd: 0,
-      notes: `${callRowsWithTranscript.length} call(s) have transcript/summary indicators; exact token cost requires usage ledger events.`,
-    },
-    {
-      category: "ai.elevenlabs_voice",
-      customerChargedUsd: ctoSumProductionRows(
-        productionRows,
-        (r) => r.category === "ai.voice",
-        "userBillOrWalletDeductionUsd",
-      ),
-      exactInternalCostUsd: exactElevenLabsCost,
-      estimatedUnreconciledCostUsd: 0,
-      notes:
-        "Exact cost requires ElevenLabs usage events or invoice reconciliation.",
-    },
-    {
-      category: "infrastructure.runtime",
-      customerChargedUsd: ctoSumProductionRows(
-        productionRows,
-        (r) => r.category === "infrastructure.runtime",
-        "userBillOrWalletDeductionUsd",
-      ),
-      exactInternalCostUsd: exactRuntimeCost,
-      estimatedUnreconciledCostUsd: estimatedPieces.railwayRuntimeMissingUsd,
-      notes: "Estimated fallback uses call-record duration as runtime proxy.",
-    },
-    {
-      category: "infrastructure.storage",
-      customerChargedUsd: ctoSumProductionRows(
-        productionRows,
-        (r) => r.category === "infrastructure.storage",
-        "userBillOrWalletDeductionUsd",
-      ),
-      exactInternalCostUsd: exactStorageCost,
-      estimatedUnreconciledCostUsd:
-        estimatedPieces.storageCurrentSnapshotMissingUsd,
-      notes: `${ctoNum(storage.estimatedMb)} MB estimated current stored data.`,
-    },
-    {
-      category: "crm.leads",
-      customerChargedUsd: ctoSumProductionRows(
-        productionRows,
-        (r) => r.category === "crm.leads",
-        "userBillOrWalletDeductionUsd",
-      ),
-      exactInternalCostUsd: exactLeadCost,
-      estimatedUnreconciledCostUsd: estimatedPieces.leadsMissingUsd,
-      notes: `${ctoNum(leadsResult.count)} lead(s) at ${ctoMoney(leadRate)} fallback.`,
-    },
-    {
-      category: "knowledge.scraping",
-      customerChargedUsd: ctoSumProductionRows(
-        productionRows,
-        (r) => r.category === "knowledge.scraping",
-        "userBillOrWalletDeductionUsd",
-      ),
-      exactInternalCostUsd: exactKnowledgeCost,
-      estimatedUnreconciledCostUsd: estimatedPieces.knowledgeSyncMissingUsd,
-      notes: `${ctoNum(knowledgeSourcesResult.count)} source(s), ${ctoNum(knowledgeChunksResult.count)} chunk(s).`,
-    },
-    {
-      category: "messaging.email",
-      customerChargedUsd: ctoSumProductionRows(
-        productionRows,
-        (r) => r.category === "messaging.email",
-        "userBillOrWalletDeductionUsd",
-      ),
-      exactInternalCostUsd: ctoSumProductionRows(
-        productionRows,
-        (r) => r.category === "messaging.email",
+        (r) => r.category === "calls.recordings",
         "realInternalCostUsd",
       ),
-      estimatedUnreconciledCostUsd: 0,
-      notes: "Recorded through Resend/email ledger events where available.",
+      "Exact recording cost only if recording usage/storage events were recorded.",
+    ),
+    categoryRow(
+      "calls.transcripts",
+      callRecordsResult.count,
+      callRecordMinutes,
+      0,
+      ctoSumProductionRows(
+        productionRows,
+        (r) => r.category === "calls.transcripts",
+        "realInternalCostUsd",
+      ),
+      "Exact transcript cost only if transcription events were recorded.",
+    ),
+    categoryRow(
+      "ai.openai_and_transcripts",
+      callRecordsResult.count + chatMessagesResult.count,
+      callRecordsResult.count + chatMessagesResult.count,
+      0,
+      exactOpenAiCost,
+      "Exact OpenAI cost only from token/transcription ledger events.",
+      (r) => r.category === "ai.brain" || r.category === "calls.transcripts",
+    ),
+    categoryRow(
+      "ai.elevenlabs_voice",
+      callRecordsResult.count,
+      callRecordsResult.count,
+      0,
+      exactElevenLabsCost,
+      "Exact ElevenLabs cost only from voice synthesis/agent ledger events.",
+      (r) => r.category === "ai.voice",
+    ),
+    categoryRow(
+      "infrastructure.runtime",
+      callRecordsResult.count,
+      callRecordMinutes * 60,
+      0,
+      exactRuntimeCost,
+      "Exact runtime cost only from runtime allocation/websocket events.",
+    ),
+    categoryRow(
+      "infrastructure.storage",
+      storage.estimatedBytes > 0 ? 1 : 0,
+      storage.estimatedBytes,
+      0,
+      exactStorageCost,
+      `${ctoNum(storage.estimatedMb)} MB current measured database footprint; cost is exact only if storage snapshot events exist.`,
+    ),
+    categoryRow(
+      "infrastructure.database_compute",
+      1,
+      1,
+      0,
+      exactDatabaseComputeCost,
+      "Exact database compute cost only from allocation/import events.",
+    ),
+    categoryRow(
+      "crm.leads",
+      leadsResult.count,
+      leadsResult.count,
+      0,
+      exactLeadCost,
+      `${ctoNum(leadsResult.count)} lead asset(s). Exact lead cost only if lead create/import events were recorded.`,
+    ),
+    categoryRow(
+      "knowledge.scraping",
+      knowledgeSourcesResult.count,
+      knowledgeSourcesResult.count,
+      0,
+      exactKnowledgeCost,
+      `${ctoNum(knowledgeSourcesResult.count)} source(s), ${ctoNum(knowledgeChunksResult.count)} chunk(s), ${ctoNum(faqsResult.count)} FAQ(s). Exact cost only if sync/storage events were recorded.`,
+    ),
+    categoryRow(
+      "messaging.email",
+      0,
+      0,
+      0,
+      exactEmailCost,
+      "Recorded through Resend/email ledger events where available.",
+    ),
+  ];
+
+  const numbers = (phoneNumbersResult.rows || []).map((row) => {
+    const phoneSid = ctoPickString(row, [
+      "phone_sid",
+      "sid",
+      "twilio_phone_sid",
+    ]);
+    const phoneNumber = ctoPickString(row, [
+      "phone_number",
+      "number",
+      "friendly_name",
+      "display_phone_number",
+    ]);
+    return {
+      id: row.id || null,
+      phoneNumber,
+      phoneSid,
+      status:
+        row.status || row.lifecycle_status || row.metadata?.status || null,
+      createdAt:
+        row.created_at || row.purchased_at || row.metadata?.created_at || null,
+      assignedVoiceAgentId:
+        row.assigned_voice_agent_id ||
+        row.inbound_voice_agent_id ||
+        row.default_outbound_voice_agent_id ||
+        null,
+      exactPurchaseCostRecordedUsd: 0,
+      exactRentalCostRecordedUsd: 0,
+      ledgerStatus: "asset_recorded_cost_not_itemized_per_number",
+    };
+  });
+
+  const exactDataCoverage = [
+    {
+      area: "phone_numbers.purchase",
+      status:
+        exactPhonePurchase > 0
+          ? "exact_cost_recorded"
+          : phoneNumbersResult.count
+            ? "needs_exact_reconciliation"
+            : "no_phone_numbers",
+      currentExactFigure: ctoMoney(exactPhonePurchase),
+      reason:
+        "Phone number assets exist, but exact procurement dollars must come from Twilio purchase/usage events or invoice backfill.",
+      requiredAction:
+        "Run/backfill Twilio number purchase reconciliation into billing_usage_events.",
+    },
+    {
+      area: "phone_numbers.rental",
+      status:
+        exactPhoneRental > 0
+          ? "exact_cost_recorded"
+          : phoneNumbersResult.count
+            ? "needs_exact_reconciliation"
+            : "no_phone_numbers",
+      currentExactFigure: ctoMoney(exactPhoneRental),
+      reason:
+        "Rental accrues over time and should be written as daily/monthly ledger events.",
+      requiredAction: "Schedule/run Twilio number rental reconciliation.",
+    },
+    {
+      area: "calls.telephony",
+      status:
+        ledgerCallMinutes >= callRecordMinutes && callRecordMinutes > 0
+          ? "exact_coverage_complete"
+          : ledgerCallMinutes > 0
+            ? "partial_exact_coverage"
+            : "needs_exact_reconciliation",
+      currentExactFigure: `${ctoMoney(exactCallCost)} / ${ctoNum(ledgerCallMinutes)} ledger minute(s)`,
+      reason: `${ctoNum(callRecordMinutes)} minutes exist in call_records; ${ctoNum(ledgerCallMinutes)} minutes exist in billing ledger.`,
+      requiredAction:
+        "Backfill/reconcile Twilio call usage for missing historical call minutes.",
+    },
+    {
+      area: "openai.realtime_and_transcripts",
+      status:
+        exactOpenAiCost > 0
+          ? "exact_cost_recorded"
+          : callRecordsResult.count || chatMessagesResult.count
+            ? "needs_exact_usage_events"
+            : "no_usage",
+      currentExactFigure: ctoMoney(exactOpenAiCost),
+      reason:
+        "OpenAI exact dollars require token/transcription usage ledger events.",
+      requiredAction:
+        "Ensure runtime token metering is on and backfill provider usage where available.",
+    },
+    {
+      area: "elevenlabs.voice",
+      status:
+        exactElevenLabsCost > 0
+          ? "exact_cost_recorded"
+          : callRecordsResult.count
+            ? "needs_exact_usage_events"
+            : "no_usage",
+      currentExactFigure: ctoMoney(exactElevenLabsCost),
+      reason:
+        "ElevenLabs exact dollars require voice synthesis/agent usage ledger events.",
+      requiredAction:
+        "Enable/reconcile ElevenLabs usage into billing_usage_events.",
+    },
+    {
+      area: "railway.runtime",
+      status:
+        exactRuntimeCost > 0
+          ? "exact_cost_recorded"
+          : callRecordsResult.count
+            ? "needs_runtime_allocation_events"
+            : "no_usage",
+      currentExactFigure: ctoMoney(exactRuntimeCost),
+      reason:
+        "Runtime exact dollars require websocket/runtime allocation events.",
+      requiredAction: "Run/schedule Railway/runtime allocation reconciliation.",
+    },
+    {
+      area: "supabase.storage",
+      status:
+        exactStorageCost > 0
+          ? "exact_cost_recorded"
+          : storage.estimatedBytes > 0
+            ? "needs_storage_snapshot_events"
+            : "no_storage_footprint",
+      currentExactFigure: `${ctoMoney(exactStorageCost)} / ${ctoNum(storage.estimatedMb)} MB measured footprint`,
+      reason:
+        "Measured footprint is not the same as exact historical storage cost.",
+      requiredAction:
+        "Schedule daily storage snapshots and cost ledger events.",
+    },
+    {
+      area: "crm.leads",
+      status:
+        exactLeadCost > 0
+          ? "exact_cost_recorded"
+          : leadsResult.count
+            ? "needs_lead_events"
+            : "no_leads",
+      currentExactFigure: ctoMoney(exactLeadCost),
+      reason:
+        "Lead count exists, but cost is exact only when lead create/import ledger rows exist.",
+      requiredAction: "Run leads storage/create/import reconciliation.",
+    },
+    {
+      area: "knowledge.scraping_and_storage",
+      status:
+        exactKnowledgeCost > 0
+          ? "exact_cost_recorded"
+          : knowledgeSourcesResult.count
+            ? "needs_sync_events"
+            : "no_knowledge_sources",
+      currentExactFigure: ctoMoney(exactKnowledgeCost),
+      reason:
+        "Sources/chunks/FAQs exist, but exact cost requires per-sync/snapshot ledger rows.",
+      requiredAction:
+        "Run knowledge sync cost reconciliation and ensure scrapeAndStore meters every sync.",
     },
   ];
 
   const summary = {
-    exactLedgerInternalCostUsd: exactInternalCostUsd,
-    estimatedUnreconciledInternalCostUsd,
-    estimatedAllInInternalCostUsd: ctoRoundUsd(
-      exactInternalCostUsd + estimatedUnreconciledInternalCostUsd,
+    exactRecordedInternalCostUsd: exactInternalCostUsd,
+    customerBillingRecordedUsd,
+    exactUsageEventCount,
+    customerChargeRowCount: productionRows.reduce(
+      (sum, row) => sum + ctoSafeNumber(row.eventCount, 0),
+      0,
     ),
-    customerChargedUsd,
-    exactGrossProfitUsd,
-    exactGrossMarginPercent,
-    estimatedProfitAfterUnreconciledCostUsd: ctoRoundUsd(
-      customerChargedUsd -
-        exactInternalCostUsd -
-        estimatedUnreconciledInternalCostUsd,
-    ),
-    estimatedMarginAfterUnreconciledCostPercent:
-      customerChargedUsd > 0
-        ? Math.round(
-            ((customerChargedUsd -
-              exactInternalCostUsd -
-              estimatedUnreconciledInternalCostUsd) /
-              customerChargedUsd) *
-              10000,
-          ) / 100
-        : null,
+    profitOrMarginCalculated: false,
+    pricingSimulationApplied: false,
   };
 
   return {
     ok: true,
-    source: "cto_org_cost_baseline_v61",
+    source: "cto_org_exact_cost_baseline_v63",
     organizationId,
     period: { start: effectiveStart, end },
+    estimatePolicy: "exact_only_no_estimates_no_profit_margin",
     organization: {
       id: organization.id || organizationId,
       name:
@@ -2077,20 +2222,29 @@ async function buildCtoOrgCostBaseline({ organizationId, start, end } = {}) {
       timezone: organization.timezone || null,
     },
     dataConfidence: {
-      level: missingCostWarnings.length
-        ? "partial_exact_plus_estimated"
-        : "high_ledger_coverage",
+      level: exactDataCoverage.some(
+        (row) =>
+          String(row.status || "").includes("needs") ||
+          String(row.status || "").includes("partial"),
+      )
+        ? "exact_ledger_with_reconciliation_gaps"
+        : "exact_ledger_complete_for_available_assets",
       exactSourceOfTruth:
-        "billing_usage_events + billing_customer_usage_charges + billing_wallet_transactions",
-      estimateSourceOfTruth:
-        "asset tables + active vendor rate cards + current storage footprint",
-      warningCount: missingCostWarnings.length,
+        "billing_usage_events + billing_customer_usage_charges + billing_wallet_transactions + exact reconciliation events",
+      estimatesIncludedInCostTotals: false,
+      profitIncludedInCostTotals: false,
+      reconciliationGapCount: exactDataCoverage.filter(
+        (row) =>
+          String(row.status || "").includes("needs") ||
+          String(row.status || "").includes("partial"),
+      ).length,
     },
     summary,
     accountFootprint: {
       phoneNumbers: phoneNumbersResult.count,
       calls: callRecordsResult.count,
       callRecordMinutes,
+      ledgerCallMinutes,
       leads: leadsResult.count,
       chatbots: chatbotsResult.count,
       chatMessages: chatMessagesResult.count,
@@ -2103,64 +2257,57 @@ async function buildCtoOrgCostBaseline({ organizationId, start, end } = {}) {
     },
     phoneNumbers: {
       count: phoneNumbersResult.count,
-      exactLedgerPurchaseCostUsd: exactPhonePurchase,
-      estimatedPurchaseCostUsd: estimatedPhonePurchase,
-      exactLedgerRentalCostUsd: exactPhoneRental,
-      estimatedRentalCostUsd: estimatedPhoneRental,
-      purchaseRateFallbackUsd: ctoRoundUsd(purchaseRate),
-      dailyRentalRateFallbackUsd: ctoRoundUsd(dailyRentalRate),
+      exactRecordedPurchaseCostUsd: exactPhonePurchase,
+      exactRecordedRentalCostUsd: exactPhoneRental,
       numbers,
     },
     twilio: {
-      exactLedgerCostUsd: ctoRoundUsd(
+      exactRecordedCostUsd: ctoRoundUsd(
         exactCallCost + exactPhonePurchase + exactPhoneRental,
       ),
+      exactRecordedPhonePurchaseUsd: exactPhonePurchase,
+      exactRecordedPhoneRentalUsd: exactPhoneRental,
+      exactRecordedCallCostUsd: exactCallCost,
       callRecordCount: callRecordsResult.count,
       callRecordMinutes,
       ledgerCallMinutes,
-      exactCallCostUsd: exactCallCost,
-      unledgeredCallMinutes,
-      estimatedUnledgeredCallCostUsd: estimatedUnledgeredCallCost,
-      minuteRateFallbackUsd: ctoRoundUsd(twilioMinuteRate),
-    },
-    ai: {
-      exactOpenAiAndTranscriptCostUsd: exactOpenAiCost,
-      exactElevenLabsCostUsd: exactElevenLabsCost,
-      transcriptOrSummaryCallCount: callRowsWithTranscript.length,
-      chatbotMessageCount: chatMessagesResult.count,
-    },
-    infrastructure: {
-      exactRuntimeCostUsd: exactRuntimeCost,
-      estimatedRuntimeCostUsd: estimatedRuntimeCost,
-      exactStorageCostUsd: exactStorageCost,
-      estimatedCurrentStorageSnapshotCostUsd:
-        estimatedStorageCurrentSnapshotCost,
-      exactDatabaseComputeCostUsd: ctoSumProductionRows(
-        productionRows,
-        (r) => r.category === "infrastructure.database_compute",
-        "realInternalCostUsd",
+      callMinutesNotYetInLedger: Math.max(
+        0,
+        callRecordMinutes - ledgerCallMinutes,
       ),
     },
-    storage,
+    ai: {
+      exactRecordedOpenAiAndTranscriptCostUsd: exactOpenAiCost,
+      exactRecordedElevenLabsCostUsd: exactElevenLabsCost,
+      chatbotMessageCount: chatMessagesResult.count,
+      callCount: callRecordsResult.count,
+    },
+    infrastructure: {
+      exactRecordedRuntimeCostUsd: exactRuntimeCost,
+      exactRecordedStorageCostUsd: exactStorageCost,
+      exactRecordedDatabaseComputeCostUsd: exactDatabaseComputeCost,
+    },
+    storage: {
+      measuredBytes: storage.estimatedBytes,
+      measuredMb: storage.estimatedMb,
+      tables: storage.tables,
+    },
     knowledge: {
       bases: knowledgeBasesResult.count,
       sources: knowledgeSourcesResult.count,
       chunks: knowledgeChunksResult.count,
       faqs: faqsResult.count,
       products: productsResult.count,
-      exactLedgerCostUsd: exactKnowledgeCost,
-      estimatedSyncCostUsd: estimatedKnowledgeCost,
-      syncRateFallbackUsd: ctoRoundUsd(knowledgeSyncRate),
+      exactRecordedCostUsd: exactKnowledgeCost,
     },
     crm: {
       leads: leadsResult.count,
-      exactLedgerCostUsd: exactLeadCost,
-      estimatedLeadCostUsd: estimatedLeadCost,
-      leadRateFallbackUsd: ctoRoundUsd(leadRate),
+      exactRecordedCostUsd: exactLeadCost,
     },
     exactLedgerByCategory: exactByCategory,
     costBuckets,
-    missingCostWarnings,
+    exactDataCoverage,
+    pricingModelWorkspace: ctoBuildPricingWorkspace({ costBuckets }),
     rawTableReadErrors: [
       phoneNumbersResult,
       callRecordsResult,
@@ -2176,13 +2323,13 @@ async function buildCtoOrgCostBaseline({ organizationId, start, end } = {}) {
     ]
       .filter((r) => !r.ok)
       .map((r) => ({ table: r.table, error: r.error })),
-    nextActions: [
-      "Schedule daily /api/billing-usage/reconcile/twilio-number-rentals for exact phone rental accrual.",
-      "Backfill /api/billing-usage/record/twilio-number-purchase or Twilio account usage for exact number procurement cost.",
-      "Ensure runtime logs OpenAI realtime tokens, ElevenLabs usage, Railway seconds, and chatbot token usage for every session.",
-      "Schedule daily storage snapshots so storage cost becomes historical/exact instead of current-footprint estimate.",
-      "Use this endpoint for CTO pricing baseline; use vendor-rate-sync/status only for rate-card coverage health.",
-    ],
+    nextExactDataActions: exactDataCoverage
+      .filter(
+        (row) =>
+          String(row.status || "").includes("needs") ||
+          String(row.status || "").includes("partial"),
+      )
+      .map((row) => ({ area: row.area, action: row.requiredAction })),
   };
 }
 
