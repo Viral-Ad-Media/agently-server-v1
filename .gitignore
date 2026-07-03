@@ -4,3 +4,12 @@ node_modules/
 dist/
 prev/
 .env.agently-billing
+# Local secrets and generated billing reports
+.env
+.env.*
+!.env.example
+*.local.backup
+.env.example.local.backup
+cto-*.md
+full-cost-reconcile-*.json
+billing-report-*/
