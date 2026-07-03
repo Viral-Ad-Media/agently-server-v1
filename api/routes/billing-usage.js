@@ -35,6 +35,9 @@ const {
   getMarginRiskReport,
   getRecommendedCustomerPricing,
 } = require("../../lib/vendor-rate-sync");
+const {
+  runOrgFullCostReconciliation,
+} = require("../../lib/org-full-cost-reconciler");
 
 const router = express.Router();
 
@@ -3087,6 +3090,48 @@ router.get("/production-cost-summary", async (req, res, next) => {
       period: range,
       ...report,
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post("/reconcile/org-full-cost", async (req, res, next) => {
+  try {
+    if (!parseBool(process.env.USAGE_RECONCILE_ENABLED)) {
+      return res.status(403).json({
+        error: {
+          message:
+            "Full organization cost reconciliation is disabled. Set USAGE_RECONCILE_ENABLED=true on the backend to enable provider backfill.",
+        },
+      });
+    }
+    const body = req.body || {};
+    const organizationId = cleanOrgId(
+      body.organizationId ||
+        body.organization_id ||
+        req.query.organizationId ||
+        req.query.organization_id ||
+        req.query.orgId ||
+        req.query.org_id,
+    );
+    if (!organizationId) {
+      return res
+        .status(400)
+        .json({ error: { message: "organizationId is required." } });
+    }
+    const result = await runOrgFullCostReconciliation({
+      organizationId,
+      start: body.start || req.query.start || req.query.from || "onboarding",
+      end: body.end || req.query.end || new Date().toISOString(),
+      force: parseBool(body.force ?? req.query.force ?? true),
+      applyWallet: parseBool(
+        body.applyWallet ??
+          body.apply_wallet ??
+          req.query.applyWallet ??
+          req.query.apply_wallet,
+      ),
+    });
+    res.json(result);
   } catch (err) {
     next(err);
   }
