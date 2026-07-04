@@ -1,10 +1,37 @@
 #!/usr/bin/env node
 "use strict";
 
+/**
+ * reconcile-all-orgs-cost.js
+ *
+ * Runs the existing per-organization full-cost reconciliation
+ * (lib/org-full-cost-reconciler.js -> runOrgFullCostReconciliation) across
+ * EVERY organization in the database, one at a time, and writes one
+ * consolidated JSON report plus a plain-text summary table to stdout.
+ *
+ * This is the "run sync in case any organization's data increases" job.
+ * It does not replace live-call metering (that must work continuously via
+ * agently-ws-server); this is the batch backstop that guarantees every org
+ * has Twilio + OpenAI + ElevenLabs + Railway + Supabase usage reconciled
+ * even for periods where live metering was down, missing, or the org
+ * onboarded before metering existed.
+ *
+ * Usage:
+ *   node scripts/reconcile-all-orgs-cost.js [--from onboarding|iso] [--to iso]
+ *     [--providers all|twilio,openai,elevenlabs,railway,supabase]
+ *     [--apply-wallet false] [--force true] [--concurrency 1]
+ *     [--out reconcile-results/all-orgs-cost.json]
+ *
+ * Recommended: run this nightly (cron / Railway cron job / GitHub Action)
+ * so every registered organization's usage ledger stays current without
+ * anyone remembering to trigger it manually per org.
+ */
+
 require("dotenv").config();
 
 const fs = require("fs");
 const path = require("path");
+const { getSupabase } = require("../lib/supabase");
 const {
   PROVIDER_RECONCILIATION_STEPS,
   normalizeProviderSteps,
@@ -33,119 +60,134 @@ function bool(value, fallback = false) {
   return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
 }
 
-function isoOrNull(value) {
-  const raw = String(value || "").trim();
-  if (!raw || ["onboarding", "all", "all_time"].includes(raw.toLowerCase())) {
-    return null;
+async function fetchAllOrganizations() {
+  const db = getSupabase();
+  const pageSize = 500;
+  let from = 0;
+  const orgs = [];
+  for (;;) {
+    const { data, error } = await db
+      .from("organizations")
+      .select("id,name,plan,subscription_status,created_at")
+      .order("created_at", { ascending: true })
+      .range(from, from + pageSize - 1);
+    if (error) throw error;
+    if (!data || data.length === 0) break;
+    orgs.push(...data);
+    if (data.length < pageSize) break;
+    from += pageSize;
   }
-  const d = new Date(raw);
-  return Number.isNaN(d.getTime()) ? null : d.toISOString();
-}
-
-function buildWindows(start, end, chunkDays) {
-  const from = isoOrNull(start);
-  const to = isoOrNull(end) || new Date().toISOString();
-  const days = Math.max(Number(chunkDays) || 0, 0);
-  if (!from || !days) return [{ start: start || "onboarding", end: to }];
-  const windows = [];
-  let cursor = new Date(from);
-  const finalEnd = new Date(to);
-  while (cursor < finalEnd) {
-    const windowStart = cursor.toISOString();
-    const next = new Date(cursor.getTime() + days * 24 * 60 * 60 * 1000);
-    const windowEnd = next < finalEnd ? next.toISOString() : finalEnd.toISOString();
-    windows.push({ start: windowStart, end: windowEnd });
-    cursor = next;
-  }
-  return windows.length ? windows : [{ start: from, end: to }];
-}
-
-function usage(exitCode = 0) {
-  const text = `Usage:
-  node scripts/reconcile-org-cost.js --organization-id <uuid> [--from onboarding|iso] [--to iso] [--providers all|twilio,openai] [--chunk-days 7] [--apply-wallet false] [--force true] [--out reconcile-results/org-cost.json]
-
-Examples:
-  node scripts/reconcile-org-cost.js --organization-id 747cf733-dd0d-42ba-87ab-bfea84590142 --from onboarding --providers all
-  node scripts/reconcile-org-cost.js --organization-id 747cf733-dd0d-42ba-87ab-bfea84590142 --from 2026-06-01 --to 2026-07-01 --providers twilio --chunk-days 7
-
-Allowed providers: ${PROVIDER_RECONCILIATION_STEPS.join(", ")}, all
-`;
-  console.log(text);
-  process.exit(exitCode);
+  return orgs;
 }
 
 async function main() {
   const args = parseArgs(process.argv);
-  if (args.help || args.h) usage(0);
+  if (args.help || args.h) {
+    console.log(`Usage:
+  node scripts/reconcile-all-orgs-cost.js [--from onboarding|iso] [--to iso]
+    [--providers all|twilio,openai,elevenlabs,railway,supabase]
+    [--apply-wallet false] [--force true] [--concurrency 1]
+    [--out reconcile-results/all-orgs-cost.json]
 
-  const organizationId = String(
-    args["organization-id"] || args.organizationId || args.org || "",
-  ).trim();
-  if (!organizationId) usage(1);
+Allowed providers: ${PROVIDER_RECONCILIATION_STEPS.join(", ")}, all`);
+    process.exit(0);
+  }
 
-  const selected = normalizeProviderSteps(args.providers || args.provider || "all");
-  const providerRuns = selected.includes("mappings")
-    ? selected
-    : ["mappings", ...selected];
   const start = args.from || args.start || "onboarding";
   const end = args.to || args.end || new Date().toISOString();
-  const windows = buildWindows(start, end, args["chunk-days"] || args.chunkDays);
+  const providers = normalizeProviderSteps(
+    args.providers || args.provider || "all",
+  );
   const force = bool(args.force, true);
   const applyWallet = bool(args["apply-wallet"] ?? args.applyWallet, false);
-  const startedAt = new Date().toISOString();
-  const results = [];
+  const concurrency = Math.max(1, Number(args.concurrency || 1));
 
-  for (const provider of providerRuns) {
-    const providerWindows = provider === "mappings" ? [windows[0]] : windows;
-    for (const window of providerWindows) {
+  console.log(`[reconcile-all-orgs] loading organizations...`);
+  const orgs = await fetchAllOrganizations();
+  console.log(`[reconcile-all-orgs] found ${orgs.length} organizations`);
+
+  const results = [];
+  let cursor = 0;
+
+  async function worker() {
+    for (;;) {
+      const idx = cursor;
+      cursor += 1;
+      if (idx >= orgs.length) return;
+      const org = orgs[idx];
+      const label = `${org.name || "unnamed"} (${org.id})`;
       console.log(
-        `[billing-reconcile] org=${organizationId} provider=${provider} start=${window.start} end=${window.end}`,
+        `[reconcile-all-orgs] (${idx + 1}/${orgs.length}) reconciling ${label}`,
       );
-      const result = await runOrgFullCostReconciliation({
-        organizationId,
-        start: window.start,
-        end: window.end,
-        providers: [provider],
-        force,
-        applyWallet,
-      });
-      results.push({ provider, window, result });
-      if (!result.ok) {
+      try {
+        const result = await runOrgFullCostReconciliation({
+          organizationId: org.id,
+          start,
+          end,
+          providers,
+          force,
+          applyWallet,
+        });
+        results.push({
+          organizationId: org.id,
+          organizationName: org.name || "",
+          plan: org.plan || "",
+          ok: result.ok !== false,
+          steps: result.steps || result,
+          errors: result.errors || [],
+        });
+      } catch (err) {
         console.warn(
-          `[billing-reconcile] provider=${provider} completed with errors: ${JSON.stringify(result.errors || [])}`,
+          `[reconcile-all-orgs] FAILED for ${label}: ${err.message || err}`,
         );
+        results.push({
+          organizationId: org.id,
+          organizationName: org.name || "",
+          plan: org.plan || "",
+          ok: false,
+          error: err.message || String(err),
+        });
       }
     }
   }
 
+  const startedAt = new Date().toISOString();
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+  const finishedAt = new Date().toISOString();
+
   const report = {
-    ok: results.every((item) => item.result?.ok !== false),
-    source: "scripts/reconcile-org-cost.js",
-    organizationId,
-    requestedProviders: selected,
-    executedProviders: providerRuns,
-    windowCount: windows.length,
+    source: "scripts/reconcile-all-orgs-cost.js",
+    startedAt,
+    finishedAt,
+    organizationCount: orgs.length,
+    requestedProviders: providers,
+    window: { start, end },
     force,
     applyWallet,
-    startedAt,
-    finishedAt: new Date().toISOString(),
+    succeeded: results.filter((r) => r.ok).length,
+    failed: results.filter((r) => !r.ok).length,
     results,
   };
 
-  const out = args.out || args.output;
-  if (out) {
-    const outputPath = path.resolve(process.cwd(), out);
-    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-    fs.writeFileSync(outputPath, JSON.stringify(report, null, 2));
-    console.log(`[billing-reconcile] wrote ${outputPath}`);
-  } else {
-    console.log(JSON.stringify(report, null, 2));
-  }
+  const outPath = path.resolve(
+    process.cwd(),
+    args.out || args.output || "reconcile-results/all-orgs-cost.json",
+  );
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.writeFileSync(outPath, JSON.stringify(report, null, 2));
 
-  process.exit(report.ok ? 0 : 2);
+  console.log(
+    `\n[reconcile-all-orgs] done. ${report.succeeded}/${orgs.length} organizations reconciled successfully.`,
+  );
+  if (report.failed) {
+    console.log(
+      `[reconcile-all-orgs] ${report.failed} organization(s) had errors — see ${outPath}`,
+    );
+  }
+  console.log(`[reconcile-all-orgs] full report written to ${outPath}`);
 }
 
 main().catch((err) => {
-  console.error("[billing-reconcile] failed", err?.message || String(err));
+  console.error("[reconcile-all-orgs] fatal error:", err.message || err);
   process.exit(1);
 });
