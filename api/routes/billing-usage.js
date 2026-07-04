@@ -17,6 +17,7 @@ const {
   logRailwayRuntimeUsage,
   logKnowledgeSyncUsage,
   logLeadStorageUsage,
+  logOpenAIUsage,
 } = require("../../lib/usage-ledger");
 const { getSupabase } = require("../../lib/supabase");
 const {
@@ -2664,9 +2665,57 @@ router.post("/events", async (req, res, next) => {
         .status(400)
         .json({ error: { message: "provider and service are required." } });
     }
+
+    const organizationId = cleanOrgId(
+      event.organizationId || event.organization_id,
+    );
+    const provider = String(event.provider || "").toLowerCase();
+    const metadata = event.metadata || {};
+
+    // WebSocket/runtime paths often post raw OpenAI usage metadata. Route those
+    // through logOpenAIUsage so token components are separated for accurate costing.
+    if (provider === "openai" && (metadata.usage || event.usage)) {
+      const inserted = await logOpenAIUsage({
+        organizationId,
+        userId: event.userId || event.user_id || null,
+        service: event.service,
+        eventType: event.eventType || event.event_type || "openai_tokens",
+        model: event.model || metadata.model || metadata.usage?.model || null,
+        usage: event.usage || metadata.usage || null,
+        inputTokens:
+          event.inputTokens || event.input_tokens || metadata.input_tokens,
+        outputTokens:
+          event.outputTokens || event.output_tokens || metadata.output_tokens,
+        cachedInputTokens:
+          event.cachedInputTokens ||
+          event.cached_input_tokens ||
+          metadata.cached_input_tokens,
+        audioInputTokens:
+          event.audioInputTokens ||
+          event.audio_input_tokens ||
+          metadata.audio_input_tokens,
+        audioOutputTokens:
+          event.audioOutputTokens ||
+          event.audio_output_tokens ||
+          metadata.audio_output_tokens,
+        callId: event.callId || event.call_id || null,
+        chatbotId: event.chatbotId || event.chatbot_id || null,
+        voiceAgentId: event.voiceAgentId || event.voice_agent_id || null,
+        knowledgeBaseId:
+          event.knowledgeBaseId || event.knowledge_base_id || null,
+        leadId: event.leadId || event.lead_id || null,
+        externalId: event.externalId || event.external_id || null,
+        metadata: {
+          ...metadata,
+          source: event.source || "internal_manual_backend_event",
+        },
+      });
+      return res.status(201).json({ ok: true, event: inserted });
+    }
+
     const inserted = await insertUsageEvent({
       ...event,
-      organizationId: cleanOrgId(event.organizationId || event.organization_id),
+      organizationId,
       source: event.source || "internal_manual_backend_event",
     });
     res.status(201).json({ ok: true, event: inserted });
