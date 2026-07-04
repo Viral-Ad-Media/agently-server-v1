@@ -95,7 +95,9 @@ Allowed providers: ${PROVIDER_RECONCILIATION_STEPS.join(", ")}, all`);
 
   const start = args.from || args.start || "onboarding";
   const end = args.to || args.end || new Date().toISOString();
-  const providers = normalizeProviderSteps(args.providers || args.provider || "all");
+  const providers = normalizeProviderSteps(
+    args.providers || args.provider || "all",
+  );
   const force = bool(args.force, true);
   const applyWallet = bool(args["apply-wallet"] ?? args.applyWallet, false);
   const concurrency = Math.max(1, Number(args.concurrency || 1));
@@ -174,9 +176,13 @@ Allowed providers: ${PROVIDER_RECONCILIATION_STEPS.join(", ")}, all`);
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   fs.writeFileSync(outPath, JSON.stringify(report, null, 2));
 
-  console.log(`\n[reconcile-all-orgs] done. ${report.succeeded}/${orgs.length} organizations reconciled successfully.`);
+  console.log(
+    `\n[reconcile-all-orgs] done. ${report.succeeded}/${orgs.length} organizations reconciled successfully.`,
+  );
   if (report.failed) {
-    console.log(`[reconcile-all-orgs] ${report.failed} organization(s) had errors — see ${outPath}`);
+    console.log(
+      `[reconcile-all-orgs] ${report.failed} organization(s) had errors — see ${outPath}`,
+    );
   }
   console.log(`[reconcile-all-orgs] full report written to ${outPath}`);
 }
