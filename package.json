@@ -9,7 +9,11 @@
   "scripts": {
     "dev": "node dev-server.js",
     "build": "echo 'No build step'",
-    "lint": "echo 'OK'"
+    "lint": "echo 'OK'",
+    "billing:audit-org": "node scripts/billing-audit-org.js",
+    "billing:phase2-provider-sync": "node scripts/billing-phase2-provider-sync.js",
+    "billing:phase3-metering-audit": "node scripts/billing-phase3-metering-audit.js",
+    "billing:reconcile-org": "node scripts/reconcile-org-cost.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",

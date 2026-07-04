@@ -13,3 +13,6 @@ prev/
 cto-*.md
 full-cost-reconcile-*.json
 billing-report-*/
+# Billing local outputs and secrets
+reconcile-results/
+*.zip
