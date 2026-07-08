@@ -630,6 +630,42 @@ function mediaStreamUrlPreview(params = {}) {
   return mediaStreamUrl(params);
 }
 
+// The lightweight/fast-path agent fetches used for greeting construction
+// (a plain `voice_agents.select("*")`, sometimes joined to `organizations`)
+// never include the assigned Knowledge Base's actual customer-facing name.
+// preparedOpeningGreetingForCall()'s fallback chain for organizationName is:
+//   knowledge_base_business_name -> knowledge_base_name -> agent.business_name
+//   -> agent.name -> organization.name -> ""
+// Without this enrichment, the first three are always undefined, so it
+// bottoms out at agent.name - producing greetings like "this is Mimi from
+// Mimi" instead of "this is Mimi from Viral-Ad Media". This is a single
+// indexed lookup by primary key (fast) so it's safe to call on every
+// greeting-building path without meaningfully affecting call-setup latency.
+async function attachKnowledgeBaseIdentity(db, agent) {
+  if (!agent?.knowledge_base_id) return agent;
+  if (agent.knowledge_base_business_name || agent.knowledge_base_name) {
+    return agent;
+  }
+  try {
+    const { data: kb, error } = await db
+      .from("knowledge_bases")
+      .select("name,business_name")
+      .eq("id", agent.knowledge_base_id)
+      .maybeSingle();
+    if (!error && kb) {
+      agent.knowledge_base_business_name = kb.business_name || "";
+      agent.knowledge_base_name = kb.name || "";
+    }
+  } catch (err) {
+    console.warn("[outbound-call] knowledge base identity lookup failed", {
+      agentId: agent?.id || "",
+      knowledgeBaseId: agent?.knowledge_base_id || "",
+      error: err?.message || String(err),
+    });
+  }
+  return agent;
+}
+
 function preparedOpeningGreetingForCall({
   agent = {},
   organization = null,
@@ -859,13 +895,14 @@ async function lookupAgentByPhone(toPhone) {
       .maybeSingle();
 
     if (!error && numberRow?.voice_agents?.is_active) {
-      return {
+      const agent = {
         ...numberRow.voice_agents,
         organization_id: numberRow.organization_id,
         twilio_number_id: numberRow.id,
         twilio_phone_number: numberRow.phone_number,
         twilio_phone_sid: numberRow.phone_sid,
       };
+      return attachKnowledgeBaseIdentity(db, agent);
     }
   } catch (_) {
     // Migration may not be applied yet; safely fall back to legacy lookup.
@@ -878,7 +915,7 @@ async function lookupAgentByPhone(toPhone) {
     .eq("is_active", true)
     .maybeSingle();
 
-  return agent;
+  return attachKnowledgeBaseIdentity(db, agent);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1024,6 +1061,7 @@ async function handleOutboundTwiMl(req, res) {
     agent = data || null;
   }
   if (!agent) agent = await lookupAgentByPhone(fromPhone);
+  agent = await attachKnowledgeBaseIdentity(db, agent);
 
   let organization = null;
   if (agent?.organization_id) {
@@ -3280,13 +3318,14 @@ router.post(
       });
     }
 
-    const { data: agent } = await db
+    const { data: agentRow } = await db
       .from("voice_agents")
       .select("*")
       .eq("id", actualAgentId)
       .eq("organization_id", organizationId)
       .eq("is_active", true)
       .maybeSingle();
+    const agent = await attachKnowledgeBaseIdentity(db, agentRow);
     if (!agent)
       return res.status(404).json({
         error: {
@@ -5144,13 +5183,14 @@ router.post(
     const db = getSupabase();
     const targetAgentId =
       voiceAgentId || req.organization.active_voice_agent_id;
-    const { data: agent } = await db
+    const { data: agentRow } = await db
       .from("voice_agents")
       .select("*")
       .eq("id", targetAgentId)
       .eq("organization_id", req.orgId)
       .eq("is_active", true)
       .single();
+    const agent = await attachKnowledgeBaseIdentity(db, agentRow);
 
     let outboundFromNumber = normalizePhone(
       req.body?.fromNumber ||
@@ -5398,11 +5438,12 @@ router.post(
       req.body?.CallSid || req.query?.CallSid || `web-${Date.now()}`;
 
     const db = getSupabase();
-    const { data: agent } = await db
+    const { data: agentRow } = await db
       .from("voice_agents")
       .select("*")
       .eq("id", agentId)
       .maybeSingle();
+    const agent = await attachKnowledgeBaseIdentity(db, agentRow);
     if (!agent) {
       res.setHeader("Content-Type", "text/xml");
       return res.send(hangupTwiml("Voice agent not found."));
@@ -5442,12 +5483,13 @@ router.get(
   asyncHandler(async (req, res) => {
     const db = getSupabase();
     const agentId = req.query.agentId || req.organization.active_voice_agent_id;
-    const { data: agent } = await db
+    const { data: agentRow } = await db
       .from("voice_agents")
       .select("*")
       .eq("id", agentId)
       .eq("organization_id", req.orgId)
       .single();
+    const agent = await attachKnowledgeBaseIdentity(db, agentRow);
 
     if (!agent) {
       return res
