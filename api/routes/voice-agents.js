@@ -16,6 +16,248 @@ const {
 
 const router = express.Router();
 
+const LEGACY_VOICE_FALLBACK = {
+  Domi: "Zephyr",
+  Bella: "Kore",
+  Josh: "Puck",
+  Arnold: "Charon",
+  "Wavenet-F": "Kore",
+  "Wavenet-D": "Puck",
+  "Polly-Joanna": "Kore",
+  "Polly-Matthew": "Puck",
+  alloy: "Zephyr",
+  ash: "Puck",
+  ballad: "Charon",
+  coral: "Kore",
+  echo: "Puck",
+  fable: "Kore",
+  nova: "Kore",
+  onyx: "Charon",
+  sage: "Zephyr",
+  shimmer: "Kore",
+  verse: "Puck",
+};
+
+function extractMissingColumn(error) {
+  const message = `${error?.message || ""} ${error?.details || ""} ${error?.hint || ""}`;
+  const quoted = message.match(/['"]([a-zA-Z0-9_]+)['"]\s+column/i);
+  if (quoted?.[1]) return quoted[1];
+  const direct = message.match(
+    /column\s+["']?([a-zA-Z0-9_]+)["']?\s+does not exist/i,
+  );
+  if (direct?.[1]) return direct[1];
+  const pgrst = message.match(
+    /Could not find the ['"]([a-zA-Z0-9_]+)['"] column/i,
+  );
+  if (pgrst?.[1]) return pgrst[1];
+  return null;
+}
+
+function isVoiceConstraintError(error) {
+  const message =
+    `${error?.message || ""} ${error?.details || ""} ${error?.hint || ""}`.toLowerCase();
+  return (
+    message.includes("voice") &&
+    (message.includes("check") ||
+      message.includes("constraint") ||
+      message.includes("violates"))
+  );
+}
+
+function buildVoiceAgentCorePayload({ body, organizationId }) {
+  return {
+    organization_id: organizationId,
+    name: body.name || "New AI Agent",
+    direction: body.direction || "inbound",
+    // Keep the requested voice first. If the live DB still has the old
+    // Zephyr/Puck/Charon/Kore/Fenrir check constraint, insertVoiceAgentSafely
+    // retries with the compatible legacy value instead of failing the create.
+    voice: body.voice || process.env.DEFAULT_AGENT_VOICE || "Domi",
+    language: body.language || "English",
+    greeting:
+      body.greeting ||
+      "Hello, thank you for calling. How can I help you today?",
+    tone: body.tone || "Professional",
+    business_hours: body.businessHours || "9am-5pm Monday-Friday",
+    escalation_phone: body.escalationPhone || "",
+    voicemail_fallback: body.voicemailFallback ?? true,
+    data_capture_fields: body.dataCaptureFields || [
+      "name",
+      "phone",
+      "email",
+      "reason",
+    ],
+    rules: body.rules || {
+      autoBook: false,
+      autoEscalate: true,
+      captureAllLeads: true,
+    },
+    is_active: true,
+  };
+}
+
+function normalizeVoiceProvider(value) {
+  const provider = String(value || "")
+    .trim()
+    .toLowerCase();
+  return provider === "openai" || provider === "elevenlabs" ? provider : null;
+}
+
+function buildVoiceAgentOptionalPayload({ body, knowledgeBaseId }) {
+  const optional = {
+    voice_provider: normalizeVoiceProvider(
+      body.voiceProvider ||
+        body.voice_provider ||
+        process.env.VOICE_PROVIDER_DEFAULT,
+    ),
+    voice_id: body.voiceId || body.voice_id || null,
+    voice_catalog_id: body.voiceCatalogId || body.voice_catalog_id || null,
+    voice_settings: body.voiceSettings || body.voice_settings || {},
+    voicemail_behavior:
+      body.voicemailBehavior ||
+      body.voicemail_behavior ||
+      body.voicemail_settings?.action ||
+      body.voicemailSettings?.action ||
+      "hangup",
+    voicemail_message:
+      body.voicemailMessage ||
+      body.voicemail_message ||
+      body.voicemail_settings?.message ||
+      body.voicemailSettings?.message ||
+      "",
+    voicemail_callback_delay_minutes: Number(
+      body.voicemailCallbackDelayMinutes ||
+        body.voicemail_callback_delay_minutes ||
+        body.voicemail_settings?.callbackDelayMinutes ||
+        body.voicemailSettings?.callbackDelayMinutes ||
+        60,
+    ),
+    voicemail_max_redial_attempts: Number(
+      body.voicemailMaxRedialAttempts ||
+        body.voicemail_max_redial_attempts ||
+        body.voicemail_settings?.maxRedialAttempts ||
+        body.voicemailSettings?.maxRedialAttempts ||
+        1,
+    ),
+    voicemail_settings: body.voicemailSettings || body.voicemail_settings || {},
+    call_screening_enabled: body.callScreeningEnabled !== false,
+    call_screening_message:
+      body.callScreeningMessage || body.call_screening_message || "",
+    call_screening_settings:
+      body.callScreeningSettings || body.call_screening_settings || {},
+    updated_at: new Date().toISOString(),
+  };
+
+  if (Array.isArray(body.callPurposes)) {
+    optional.call_purposes = body.callPurposes;
+  }
+  if (knowledgeBaseId) {
+    optional.knowledge_base_id = knowledgeBaseId;
+  }
+  return optional;
+}
+
+async function insertVoiceAgentSafely(db, payload) {
+  let current = { ...payload };
+  const warnings = [];
+
+  for (let attempt = 0; attempt < 14; attempt += 1) {
+    const { data, error } = await db
+      .from("voice_agents")
+      .insert(current)
+      .select()
+      .single();
+
+    if (!error && data) return { data, warnings };
+
+    const missingColumn = extractMissingColumn(error);
+    if (
+      missingColumn &&
+      Object.prototype.hasOwnProperty.call(current, missingColumn)
+    ) {
+      delete current[missingColumn];
+      warnings.push(
+        `Removed unsupported voice_agents.${missingColumn} during create retry.`,
+      );
+      continue;
+    }
+
+    if (isVoiceConstraintError(error)) {
+      const previousVoice = current.voice;
+      const fallback = LEGACY_VOICE_FALLBACK[previousVoice] || "Zephyr";
+      if (previousVoice !== fallback) {
+        current.voice = fallback;
+        warnings.push(
+          `Voice ${previousVoice} was rejected by the live DB constraint. Retried with ${fallback}.`,
+        );
+        continue;
+      }
+    }
+
+    throw error;
+  }
+
+  throw new Error("Unable to create voice agent after schema-safe retries.");
+}
+
+async function updateVoiceAgentOptionalFieldsSafely(db, agentId, updates) {
+  let current = { ...updates };
+  const warnings = [];
+
+  for (let attempt = 0; attempt < 14; attempt += 1) {
+    if (!Object.keys(current).length) return warnings;
+
+    const { error } = await db
+      .from("voice_agents")
+      .update(current)
+      .eq("id", agentId);
+
+    if (!error) return warnings;
+
+    const missingColumn = extractMissingColumn(error);
+    if (
+      missingColumn &&
+      Object.prototype.hasOwnProperty.call(current, missingColumn)
+    ) {
+      delete current[missingColumn];
+      warnings.push(
+        `Skipped unsupported voice_agents.${missingColumn} during optional create update.`,
+      );
+      continue;
+    }
+
+    warnings.push(
+      `Optional voice agent fields were not saved: ${error?.message || String(error)}`,
+    );
+    return warnings;
+  }
+
+  return warnings;
+}
+
+// ── GET /api/voice-agents ────────────────────────────────────
+router.get(
+  "/",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const { data, error } = await db
+      .from("voice_agents")
+      .select("*")
+      .eq("organization_id", req.orgId)
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      console.error("[voice-agents:create] list failed:", error);
+      return res
+        .status(500)
+        .json({ error: { message: "Failed to load voice agents." } });
+    }
+
+    res.json((data || []).map((row) => serializeAgent(row, [])));
+  }),
+);
+
 // ── POST /api/voice-agents ───────────────────────────────────
 router.post(
   "/",
@@ -40,92 +282,75 @@ router.post(
       });
     }
 
-    const insertPayload = {
-      organization_id: req.orgId,
-      name: body.name || "New AI Agent",
-      direction: body.direction || "inbound",
-      voice: body.voice || process.env.DEFAULT_AGENT_VOICE || "alloy",
-      voice_provider:
-        body.voiceProvider || process.env.VOICE_PROVIDER_DEFAULT || null,
-      voice_id: body.voiceId || null,
-      voice_catalog_id: body.voiceCatalogId || null,
-      voice_settings: body.voiceSettings || body.voice_settings || {},
-      language: body.language || "English",
-      greeting:
-        body.greeting ||
-        "Hello, thank you for calling. How can I help you today?",
-      tone: body.tone || "Professional",
-      business_hours: body.businessHours || "9am-5pm Monday-Friday",
-      escalation_phone: body.escalationPhone || "",
-      voicemail_fallback: body.voicemailFallback ?? true,
-      voicemail_behavior:
-        body.voicemailBehavior ||
-        body.voicemail_settings?.action ||
-        body.voicemailSettings?.action ||
-        "hangup",
-      voicemail_message:
-        body.voicemailMessage ||
-        body.voicemail_settings?.message ||
-        body.voicemailSettings?.message ||
-        "",
-      voicemail_callback_delay_minutes: Number(
-        body.voicemailCallbackDelayMinutes ||
-          body.voicemail_settings?.callbackDelayMinutes ||
-          body.voicemailSettings?.callbackDelayMinutes ||
-          60,
-      ),
-      voicemail_max_redial_attempts: Number(
-        body.voicemailMaxRedialAttempts ||
-          body.voicemail_settings?.maxRedialAttempts ||
-          body.voicemailSettings?.maxRedialAttempts ||
-          1,
-      ),
-      voicemail_settings:
-        body.voicemailSettings || body.voicemail_settings || {},
-      call_screening_enabled: body.callScreeningEnabled !== false,
-      call_screening_message:
-        body.callScreeningMessage || body.call_screening_message || "",
-      call_screening_settings:
-        body.callScreeningSettings || body.call_screening_settings || {},
-      data_capture_fields: body.dataCaptureFields || [
-        "name",
-        "phone",
-        "email",
-        "reason",
-      ],
-      rules: body.rules || {
-        autoBook: false,
-        autoEscalate: true,
-        captureAllLeads: true,
-      },
-      is_active: true,
-    };
-    if (defaultKnowledgeBase?.id) {
-      insertPayload.knowledge_base_id = defaultKnowledgeBase.id;
-    }
-
-    const { data: agent, error } = await db
-      .from("voice_agents")
-      .insert(insertPayload)
-      .select()
-      .single();
-
-    if (error) {
-      return res
-        .status(500)
-        .json({ error: { message: "Failed to create voice agent." } });
-    }
-
-    if (defaultKnowledgeBase?.id) {
-      await assignVoiceAgentKnowledgeBase(db, {
+    try {
+      const corePayload = buildVoiceAgentCorePayload({
+        body,
         organizationId: req.orgId,
-        agentId: agent.id,
-        knowledgeBaseId: defaultKnowledgeBase.id,
       });
-      agent.knowledge_base_id = defaultKnowledgeBase.id;
-    }
 
-    res.status(201).json(serializeAgent(agent, []));
+      const { data: agent, warnings: insertWarnings } =
+        await insertVoiceAgentSafely(db, corePayload);
+
+      const optionalWarnings = await updateVoiceAgentOptionalFieldsSafely(
+        db,
+        agent.id,
+        buildVoiceAgentOptionalPayload({
+          body,
+          knowledgeBaseId: defaultKnowledgeBase?.id || null,
+        }),
+      );
+
+      if (defaultKnowledgeBase?.id) {
+        const assignResult = await assignVoiceAgentKnowledgeBase(db, {
+          organizationId: req.orgId,
+          agentId: agent.id,
+          knowledgeBaseId: defaultKnowledgeBase.id,
+        });
+        if (assignResult?.ok) {
+          agent.knowledge_base_id = defaultKnowledgeBase.id;
+        }
+      }
+
+      if (insertWarnings.length || optionalWarnings.length) {
+        console.warn("[voice-agents:create] schema-safe create warnings:", {
+          organizationId: req.orgId,
+          agentId: agent.id,
+          warnings: [...insertWarnings, ...optionalWarnings],
+        });
+      }
+
+      const { data: refreshed } = await db
+        .from("voice_agents")
+        .select("*")
+        .eq("id", agent.id)
+        .eq("organization_id", req.orgId)
+        .maybeSingle();
+
+      res.status(201).json(serializeAgent(refreshed || agent, []));
+    } catch (error) {
+      console.error("[voice-agents:create] failed:", {
+        organizationId: req.orgId,
+        message: error?.message,
+        code: error?.code,
+        details: error?.details,
+        hint: error?.hint,
+      });
+      return res.status(500).json({
+        error: {
+          message:
+            "Failed to create voice agent. The backend is reachable, but the database rejected the agent record. Apply the voice_agents schema drift migration and try again.",
+          details:
+            process.env.NODE_ENV !== "production"
+              ? {
+                  message: error?.message,
+                  code: error?.code,
+                  details: error?.details,
+                  hint: error?.hint,
+                }
+              : undefined,
+        },
+      });
+    }
   }),
 );
 

@@ -13,7 +13,8 @@
     "billing:audit-org": "node scripts/billing-ledger-audit.js",
     "billing:reconcile-org": "node scripts/reconcile-org-cost.js",
     "billing:phase2-provider-sync": "node scripts/billing-phase2-provider-sync.js",
-    "billing:phase3-metering-audit": "node scripts/billing-phase3-metering-audit.js"
+    "billing:phase3-metering-audit": "node scripts/billing-phase3-metering-audit.js",
+        "crm:smoke": "node scripts/lead-crm-smoke-test.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",

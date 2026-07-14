@@ -4,6 +4,7 @@ const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
 const { asyncHandler } = require("../../middleware/error");
 const { getOpenAI } = require("../../lib/openai-client");
+const { recordLeadActivity } = require("../../lib/lead-crm-events");
 const {
   getWalletCreditStatus,
   insufficientCreditPayload,
@@ -165,15 +166,53 @@ async function captureLead({ chatbotId, organizationId, lead, reason = "" }) {
     );
     const { data, error } = await db
       .from("leads")
-      .update({ ...row, tags })
+      .update({ ...row, tags, last_activity_at: new Date().toISOString() })
       .eq("id", existing.id)
       .select()
       .maybeSingle();
     if (error) throw error;
+    try {
+      await recordLeadActivity(db, {
+        leadId: data.id,
+        organizationId: orgId,
+        activityType: "chat",
+        title: "Chatbot lead updated",
+        body: row.reason,
+        channel: "chat",
+        direction: "inbound",
+        provider: "agently_chatbot",
+        chatbotId,
+        voiceAgentId,
+        metadata: { deduped: true, tags },
+      });
+    } catch (e) {
+      console.warn("[chatbot-public] CRM activity skipped:", e.message);
+    }
     return { ...data, _deduped: true };
   }
-  const { data, error } = await db.from("leads").insert(row).select().single();
+  const { data, error } = await db
+    .from("leads")
+    .insert({ ...row, last_activity_at: new Date().toISOString() })
+    .select()
+    .single();
   if (error) throw error;
+  try {
+    await recordLeadActivity(db, {
+      leadId: data.id,
+      organizationId: orgId,
+      activityType: "chat",
+      title: "Chatbot lead captured",
+      body: row.reason,
+      channel: "chat",
+      direction: "inbound",
+      provider: "agently_chatbot",
+      chatbotId,
+      voiceAgentId,
+      metadata: { deduped: false, tags: row.tags },
+    });
+  } catch (e) {
+    console.warn("[chatbot-public] CRM activity skipped:", e.message);
+  }
   return { ...data, _deduped: false };
 }
 
