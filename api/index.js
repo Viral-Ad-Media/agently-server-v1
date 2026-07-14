@@ -19,6 +19,7 @@ const app = express();
 
 const DEFAULT_ALLOWED_ORIGINS = [
   "https://agentlycall.vercel.app",
+  "https://www.agentlycall.com/",
   // "https://agently-v1.vercel.app",
   // "https://agently1.vercel.app",
   "http://localhost:3000",
