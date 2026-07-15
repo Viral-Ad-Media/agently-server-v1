@@ -4,6 +4,7 @@ const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
 const { requireAuth } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
+const { requireWalletCredit } = require("../../lib/billing-credit-enforcement");
 const {
   listVoiceCatalog,
   resolveVoice,
@@ -235,6 +236,7 @@ router.get(
 router.post(
   "/test-voice",
   requireAuth,
+  requireWalletCredit({ action: "voice_preview" }),
   asyncHandler(async (req, res) => {
     const body = req.body || {};
     const voiceId = body.elevenlabs_voice_id || body.voice_id || body.voiceId;

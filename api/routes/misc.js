@@ -14,8 +14,13 @@ const {
   sendContactEmail,
   sendOrganizationDeletionRequestEmail,
 } = require("../../lib/email");
+const {
+  reconcileOrganizationNumberRetention,
+  getNumberRetentionStatus,
+} = require("../../lib/number-retention");
 
 const router = express.Router();
+const dashboardSelectCache = new Map();
 
 function parseBillingDemoBool(value) {
   return ["1", "true", "yes", "on"].includes(String(value || "").toLowerCase());
@@ -438,6 +443,22 @@ router.get(
       .reduce((sum, invoice) => sum + Number(invoice.amount || 0), 0);
 
     const wallet = await loadCustomerWalletSummary(db, req.orgId, 8);
+    let numberRetention = null;
+    try {
+      // This is idempotent: it starts or resolves the warning state immediately
+      // when the authenticated workspace loads. Only the secured cron route may
+      // perform the irreversible number release.
+      await reconcileOrganizationNumberRetention({
+        organizationId: req.orgId,
+        allowRelease: false,
+      });
+      numberRetention = await getNumberRetentionStatus(req.orgId);
+    } catch (retentionError) {
+      console.warn(
+        "[number-retention] billing summary sync skipped:",
+        retentionError?.message || String(retentionError),
+      );
+    }
 
     const plan = org?.plan || req.organization?.plan || "Starter";
     const minuteLimit =
@@ -476,6 +497,7 @@ router.get(
         autoChargeWalletEnabled: parseBillingDemoBool(
           process.env.BILLING_AUTO_CHARGE_WALLET,
         ),
+        numberRetention,
         minimums: {
           callUsd: Number(process.env.BILLING_MIN_CALL_CREDIT_USD || 1),
           chatUsd: Number(process.env.BILLING_MIN_CHAT_CREDIT_USD || 0.05),
@@ -1007,32 +1029,68 @@ router.get(
     const db = getSupabase();
     const orgId = req.orgId;
 
-    const safeRows = async (table, select = "*") => {
-      const { data, error } = await db
-        .from(table)
-        .select(select)
-        .eq("organization_id", orgId);
-      if (error) {
-        console.warn(
-          `[dashboard/metrics] ${table} unavailable:`,
-          error.message,
-        );
-        return [];
+    const safeRows = async (table, selectCandidates = ["*"]) => {
+      const candidates = Array.isArray(selectCandidates)
+        ? [...selectCandidates]
+        : [selectCandidates];
+      const cachedSelect = dashboardSelectCache.get(table);
+
+      if (cachedSelect) {
+        const cachedIndex = candidates.indexOf(cachedSelect);
+        if (cachedIndex >= 0) candidates.splice(cachedIndex, 1);
+        candidates.unshift(cachedSelect);
       }
-      return Array.isArray(data) ? data : [];
+
+      let lastError = null;
+
+      for (const select of candidates) {
+        const { data, error } = await db
+          .from(table)
+          .select(select)
+          .eq("organization_id", orgId);
+
+        if (!error) {
+          dashboardSelectCache.set(table, select);
+          return Array.isArray(data) ? data : [];
+        }
+
+        lastError = error;
+        const message = String(error.message || "").toLowerCase();
+        const isSchemaMismatch =
+          message.includes("does not exist") ||
+          message.includes("schema cache") ||
+          message.includes("could not find the");
+
+        if (cachedSelect === select) dashboardSelectCache.delete(table);
+        if (!isSchemaMismatch) break;
+      }
+
+      console.warn(
+        `[dashboard/metrics] ${table} unavailable:`,
+        lastError?.message || "Unknown query error",
+      );
+      return [];
     };
 
     const [leads, chatMessages, calls, chunks] = await Promise.all([
-      safeRows(
-        "leads",
+      safeRows("leads", [
         "id,status,source,lead_source,channel,metadata,created_at",
-      ),
-      safeRows("chat_messages", "id,role,sender,source,created_at"),
-      safeRows(
-        "call_records",
+        "id,status,source,channel,metadata,created_at",
+        "id,status,source,created_at",
+        "id,status,created_at",
+      ]),
+      safeRows("chat_messages", [
+        "id,role,sender,source,created_at",
+        "id,role,source,created_at",
+        "id,role,created_at",
+      ]),
+      safeRows("call_records", [
         "id,duration,duration_seconds,recording_duration,status,outcome,created_at,timestamp",
-      ),
-      safeRows("knowledge_chunks", "id,content,created_at"),
+        "id,duration,recording_duration,status,outcome,created_at,timestamp",
+        "id,duration,outcome,created_at,timestamp",
+        "id,duration,outcome,created_at",
+      ]),
+      safeRows("knowledge_chunks", ["id,content,created_at"]),
     ]);
 
     const normalizeSource = (row) => {

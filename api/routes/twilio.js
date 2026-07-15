@@ -42,7 +42,6 @@ const {
   searchAvailableNumbers,
   purchasePhoneNumber,
   updateNumberWebhooks,
-  releasePhoneNumber,
   // listOwnedNumbers intentionally REMOVED — returns ALL master-account numbers
   // (data leak across all orgs). Number isolation is handled in the route directly.
   // DO NOT re-add listOwnedNumbers to routes. See /numbers/owned route for details.
@@ -78,6 +77,7 @@ const {
   purchaseIncomingNumber,
   listIncomingNumbers,
   fetchIncomingNumber,
+  releaseIncomingNumber,
   configureTwilioIncomingNumber,
   applyVoiceDialingPermissions,
   buildManualSmsGeoInstructions,
@@ -630,42 +630,6 @@ function mediaStreamUrlPreview(params = {}) {
   return mediaStreamUrl(params);
 }
 
-// The lightweight/fast-path agent fetches used for greeting construction
-// (a plain `voice_agents.select("*")`, sometimes joined to `organizations`)
-// never include the assigned Knowledge Base's actual customer-facing name.
-// preparedOpeningGreetingForCall()'s fallback chain for organizationName is:
-//   knowledge_base_business_name -> knowledge_base_name -> agent.business_name
-//   -> agent.name -> organization.name -> ""
-// Without this enrichment, the first three are always undefined, so it
-// bottoms out at agent.name - producing greetings like "this is Mimi from
-// Mimi" instead of "this is Mimi from Viral-Ad Media". This is a single
-// indexed lookup by primary key (fast) so it's safe to call on every
-// greeting-building path without meaningfully affecting call-setup latency.
-async function attachKnowledgeBaseIdentity(db, agent) {
-  if (!agent?.knowledge_base_id) return agent;
-  if (agent.knowledge_base_business_name || agent.knowledge_base_name) {
-    return agent;
-  }
-  try {
-    const { data: kb, error } = await db
-      .from("knowledge_bases")
-      .select("name,business_name")
-      .eq("id", agent.knowledge_base_id)
-      .maybeSingle();
-    if (!error && kb) {
-      agent.knowledge_base_business_name = kb.business_name || "";
-      agent.knowledge_base_name = kb.name || "";
-    }
-  } catch (err) {
-    console.warn("[outbound-call] knowledge base identity lookup failed", {
-      agentId: agent?.id || "",
-      knowledgeBaseId: agent?.knowledge_base_id || "",
-      error: err?.message || String(err),
-    });
-  }
-  return agent;
-}
-
 function preparedOpeningGreetingForCall({
   agent = {},
   organization = null,
@@ -895,14 +859,13 @@ async function lookupAgentByPhone(toPhone) {
       .maybeSingle();
 
     if (!error && numberRow?.voice_agents?.is_active) {
-      const agent = {
+      return {
         ...numberRow.voice_agents,
         organization_id: numberRow.organization_id,
         twilio_number_id: numberRow.id,
         twilio_phone_number: numberRow.phone_number,
         twilio_phone_sid: numberRow.phone_sid,
       };
-      return attachKnowledgeBaseIdentity(db, agent);
     }
   } catch (_) {
     // Migration may not be applied yet; safely fall back to legacy lookup.
@@ -915,7 +878,7 @@ async function lookupAgentByPhone(toPhone) {
     .eq("is_active", true)
     .maybeSingle();
 
-  return attachKnowledgeBaseIdentity(db, agent);
+  return agent;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1061,7 +1024,6 @@ async function handleOutboundTwiMl(req, res) {
     agent = data || null;
   }
   if (!agent) agent = await lookupAgentByPhone(fromPhone);
-  agent = await attachKnowledgeBaseIdentity(db, agent);
 
   let organization = null;
   if (agent?.organization_id) {
@@ -3318,14 +3280,13 @@ router.post(
       });
     }
 
-    const { data: agentRow } = await db
+    const { data: agent } = await db
       .from("voice_agents")
       .select("*")
       .eq("id", actualAgentId)
       .eq("organization_id", organizationId)
       .eq("is_active", true)
       .maybeSingle();
-    const agent = await attachKnowledgeBaseIdentity(db, agentRow);
     if (!agent)
       return res.status(404).json({
         error: {
@@ -3818,6 +3779,11 @@ router.get(
       }
 
       for (const row of numberRows || []) {
+        if (
+          String(row.lifecycle_status || "active").toLowerCase() === "released"
+        ) {
+          continue;
+        }
         const agent = row.voice_agents || null;
         const sid = row.phone_sid;
         if (sid) seenSids.add(sid);
@@ -4002,6 +3968,8 @@ router.get(
 
     const visibleRows = (rows || []).filter(
       (row) =>
+        String(row?.lifecycle_status || "active").toLowerCase() !==
+          "released" &&
         row?.is_platform_test_number !== true &&
         String(row?.source || row?.number_type || "") !== "platform_test" &&
         String(row?.purchase_origin || "") !== "platform_beta_test_pool",
@@ -4536,16 +4504,44 @@ router.delete(
   requireAdmin,
   asyncHandler(async (req, res) => {
     const { sid } = req.params;
-
     const db = getSupabase();
 
-    // Clear from voice agents and many-to-many assignment rows first.
+    const { data: numberRow, error: numberLookupError } = await db
+      .from("twilio_phone_numbers")
+      .select("id,organization_id,phone_sid,phone_number,account_sid")
+      .eq("organization_id", req.orgId)
+      .eq("phone_sid", sid)
+      .maybeSingle();
+
+    if (numberLookupError && numberLookupError.code !== "PGRST116") {
+      return res.status(500).json({
+        error: { message: "Unable to load this business number." },
+      });
+    }
+
+    try {
+      await releaseIncomingNumber({
+        accountSid: numberRow?.account_sid || masterSid(),
+        phoneSid: sid,
+      });
+    } catch (releaseError) {
+      if (Number(releaseError?.status || 0) !== 404) {
+        const mapped = mapTwilioError(
+          releaseError,
+          "Could not release this business number.",
+        );
+        return res.status(400).json({ error: mapped });
+      }
+    }
+
+    const releasedAt = new Date().toISOString();
+
     await db
       .from("voice_agents")
       .update({
         twilio_phone_number: "",
         twilio_phone_sid: "",
-        updated_at: new Date().toISOString(),
+        updated_at: releasedAt,
       })
       .eq("twilio_phone_sid", sid)
       .eq("organization_id", req.orgId);
@@ -4556,15 +4552,46 @@ router.delete(
         .delete()
         .eq("organization_id", req.orgId)
         .eq("phone_sid", sid);
-    } catch (err) {
+      if (numberRow?.id) {
+        await db
+          .from("agent_phone_number_assignments")
+          .delete()
+          .eq("organization_id", req.orgId)
+          .eq("phone_number_id", numberRow.id);
+      }
+    } catch (assignmentError) {
       console.warn(
-        "[twilio/numbers/delete] assignment cleanup skipped:",
-        err.message || String(err),
+        "[numbers/delete] assignment cleanup skipped:",
+        assignmentError?.message || String(assignmentError),
       );
     }
 
-    await releasePhoneNumber(sid);
-    res.json({ success: true });
+    if (numberRow?.id) {
+      const { error: lifecycleError } = await db
+        .from("twilio_phone_numbers")
+        .update({
+          lifecycle_status: "released",
+          released_at: releasedAt,
+          release_reason: "customer_requested",
+          assigned_voice_agent_id: null,
+          provider_release_error: null,
+          updated_at: releasedAt,
+        })
+        .eq("id", numberRow.id)
+        .eq("organization_id", req.orgId);
+
+      if (lifecycleError) {
+        // Compatibility fallback for environments where the lifecycle migration
+        // has not yet been applied. The provider release has already succeeded.
+        await db
+          .from("twilio_phone_numbers")
+          .delete()
+          .eq("id", numberRow.id)
+          .eq("organization_id", req.orgId);
+      }
+    }
+
+    res.json({ success: true, releasedAt });
   }),
 );
 
@@ -5183,14 +5210,13 @@ router.post(
     const db = getSupabase();
     const targetAgentId =
       voiceAgentId || req.organization.active_voice_agent_id;
-    const { data: agentRow } = await db
+    const { data: agent } = await db
       .from("voice_agents")
       .select("*")
       .eq("id", targetAgentId)
       .eq("organization_id", req.orgId)
       .eq("is_active", true)
       .single();
-    const agent = await attachKnowledgeBaseIdentity(db, agentRow);
 
     let outboundFromNumber = normalizePhone(
       req.body?.fromNumber ||
@@ -5438,12 +5464,11 @@ router.post(
       req.body?.CallSid || req.query?.CallSid || `web-${Date.now()}`;
 
     const db = getSupabase();
-    const { data: agentRow } = await db
+    const { data: agent } = await db
       .from("voice_agents")
       .select("*")
       .eq("id", agentId)
       .maybeSingle();
-    const agent = await attachKnowledgeBaseIdentity(db, agentRow);
     if (!agent) {
       res.setHeader("Content-Type", "text/xml");
       return res.send(hangupTwiml("Voice agent not found."));
@@ -5483,13 +5508,12 @@ router.get(
   asyncHandler(async (req, res) => {
     const db = getSupabase();
     const agentId = req.query.agentId || req.organization.active_voice_agent_id;
-    const { data: agentRow } = await db
+    const { data: agent } = await db
       .from("voice_agents")
       .select("*")
       .eq("id", agentId)
       .eq("organization_id", req.orgId)
       .single();
-    const agent = await attachKnowledgeBaseIdentity(db, agentRow);
 
     if (!agent) {
       return res

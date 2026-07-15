@@ -6,7 +6,6 @@ try {
 } catch (_) {}
 
 const express = require("express");
-const path = require("path");
 const app = express();
 
 // ═══════════════════════════════════════════════════════════════
@@ -113,16 +112,6 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// Public in-house chatbot avatar library used by the embeddable widget.
-// User-uploaded private avatars are intentionally not served here.
-app.use(
-  "/chatbot-avatars",
-  express.static(path.join(__dirname, "..", "public", "chatbot-avatars"), {
-    maxAge: "7d",
-    immutable: true,
-  }),
-);
-
 // ═══════════════════════════════════════════════════════════════
 // HEALTH CHECK + DIAGNOSTIC
 // Hit this endpoint first when debugging — tells you which env
@@ -213,7 +202,6 @@ safeMount(
 safeMount("/api/messenger", () => require("./routes/messenger"), "messenger");
 safeMount("/api/calls", () => require("./routes/calls"), "calls");
 safeMount("/api/leads", () => require("./routes/leads"), "leads");
-safeMount("/api/leads-crm", () => require("./routes/leads-crm"), "leads-crm");
 safeMount("/api/outreach", () => require("./routes/outreach"), "outreach");
 safeMount(
   "/api/call-schedules",
@@ -255,6 +243,12 @@ safeMount(
   "/api/billing-usage",
   () => require("./routes/billing-usage"),
   "billing-usage",
+);
+
+safeMount(
+  "/api/internal/number-retention",
+  () => require("./routes/number-retention"),
+  "number-retention",
 );
 
 safeMount("/api", () => require("./routes/misc"), "misc");

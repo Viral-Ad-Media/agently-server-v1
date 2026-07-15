@@ -4,6 +4,7 @@ const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
 const { requireAuth } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
+const { requireWalletCredit } = require("../../lib/billing-credit-enforcement");
 const {
   listVoiceCatalog,
   resolveVoice,
@@ -105,6 +106,7 @@ router.get(
 router.post(
   "/preview",
   requireAuth,
+  requireWalletCredit({ action: "voice_preview" }),
   asyncHandler(async (req, res) => {
     const db = getSupabase();
     const provider = String(
@@ -167,13 +169,35 @@ router.post(
       modelId: req.body?.modelId || req.body?.model_id || voice.modelId,
       outputFormat: req.body?.outputFormat || req.body?.output_format,
       voiceSettings: req.body?.voiceSettings || req.body?.voice_settings || {},
+      usageContext: {
+        organizationId: req.orgId,
+        userId: req.user?.id,
+        service: "voice_preview",
+        route: "voices.preview",
+        metadata: { endpoint: req.originalUrl || req.path },
+      },
     });
+
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Voice-Provider", "elevenlabs");
+    res.setHeader("X-Voice-Id", voice.voiceId);
+
+    if (wantsJsonAudio(req)) {
+      return res.json({
+        success: true,
+        provider: "elevenlabs",
+        voice_id: voice.voiceId,
+        voiceId: voice.voiceId,
+        modelId: audio.modelId,
+        outputFormat: audio.outputFormat,
+        mimeType: audio.mimeType || "audio/mpeg",
+        audioBase64: audio.buffer.toString("base64"),
+        size: audio.buffer.length,
+      });
+    }
 
     res.setHeader("Content-Type", audio.mimeType || "audio/mpeg");
     res.setHeader("Content-Length", String(audio.buffer.length));
-    res.setHeader("Cache-Control", "private, max-age=86400");
-    res.setHeader("X-Voice-Provider", "elevenlabs");
-    res.setHeader("X-Voice-Id", voice.voiceId);
     res.setHeader("X-Voice-Preview-Cache-Key", audio.cacheKey || "");
     res.setHeader("X-ElevenLabs-Model", audio.modelId || "");
     res.setHeader("X-ElevenLabs-Output-Format", audio.outputFormat || "");
