@@ -309,6 +309,56 @@ router.get(
   }),
 );
 
+// ── GET /:agentId/knowledge-context ──────────────────────────────
+// The frontend (AgentSettings.tsx) has been calling this to show which
+// Knowledge Base sources ground a voice agent's answers. It never existed
+// on the backend before, which is why it always 503'd.
+router.get(
+  "/:agentId/knowledge-context",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const agent = await loadAgent(db, req.orgId, req.params.agentId);
+    if (!agent)
+      return res.status(404).json({
+        success: false,
+        error: { code: "AGENT_NOT_FOUND", message: "Agent not found." },
+      });
+
+    const enabled =
+      agent.use_knowledge_base !== false && Boolean(agent.knowledge_base_id);
+    if (!enabled) {
+      return res.json({
+        use_knowledge_base: agent.use_knowledge_base !== false,
+        enabled: false,
+        knowledge_base_id: agent.knowledge_base_id || null,
+        sources: [],
+        chunks: [],
+      });
+    }
+
+    const { data: sources, error: sourcesError } = await db
+      .from("knowledge_sources")
+      .select("id,title,url,scrape_status,is_primary,created_at")
+      .eq("organization_id", req.orgId)
+      .eq("knowledge_base_id", agent.knowledge_base_id)
+      .order("is_primary", { ascending: false })
+      .order("created_at", { ascending: true });
+    if (sourcesError) throw sourcesError;
+
+    res.json({
+      use_knowledge_base: true,
+      enabled: true,
+      knowledge_base_id: agent.knowledge_base_id,
+      sources: (sources || []).map((source) => ({
+        ...source,
+        status: source.scrape_status || "unknown",
+      })),
+      chunks: [],
+    });
+  }),
+);
+
 router.patch(
   "/:agentId/voice-config",
   requireAuth,
@@ -499,7 +549,7 @@ router.post(
         text: normalizeOpenAIPreviewText(
           body.text ||
             agent.greeting ||
-            "Hello, this is an OpenAI voice test from Agently.",
+            "Hello! This is a voice preview from Agently!",
         ),
         model:
           body.model ||
@@ -542,6 +592,7 @@ router.post(
           mimeType: audio.mimeType || "audio/mpeg",
           audioBase64: audio.buffer.toString("base64"),
           size: audio.buffer.length,
+          previewText: audio.text,
         });
       }
       res.setHeader("Content-Type", audio.mimeType || "audio/mpeg");
@@ -560,7 +611,7 @@ router.post(
     const text = normalizePreviewText(
       body.text ||
         agent.greeting ||
-        "Hello, this is an ElevenLabs voice test from Agently.",
+        "Hello! This is a voice preview from Agently!",
     );
     const audio = await synthesizeElevenLabsPreview({
       voiceId: voice.voiceId,
@@ -588,6 +639,7 @@ router.post(
         mimeType: audio.mimeType || "audio/mpeg",
         audioBase64: audio.buffer.toString("base64"),
         size: audio.buffer.length,
+        previewText: audio.text,
       });
     }
     res.setHeader("Content-Type", audio.mimeType || "audio/mpeg");

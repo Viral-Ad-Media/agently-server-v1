@@ -11,9 +11,61 @@ const {
   synthesizeElevenLabsPreview,
   normalizePreviewText,
 } = require("../../lib/elevenlabs");
+const { synthesizeOpenAIPreview } = require("../../lib/openai-voices");
 
 const router = express.Router();
 const ELEVENLABS_API_BASE = "https://api.elevenlabs.io/v1";
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isElevenLabsQuotaError(error) {
+  const message = String(error?.message || "").toLowerCase();
+  const code = String(
+    error?.code || error?.raw?.detail?.status || "",
+  ).toLowerCase();
+  return (
+    code.includes("quota") ||
+    code.includes("credit") ||
+    message.includes("exceeds your quota") ||
+    message.includes("credits remaining") ||
+    message.includes("quota exceeded") ||
+    message.includes("insufficient credits")
+  );
+}
+
+async function resolvePreviewVoice({ db, voiceId, modelId }) {
+  const requested = String(voiceId || "").trim();
+  if (!requested) {
+    const error = new Error("voice_id is required.");
+    error.status = 400;
+    error.code = "VOICE_ID_REQUIRED";
+    throw error;
+  }
+
+  if (!UUID_PATTERN.test(requested)) {
+    return {
+      voiceId: requested,
+      modelId:
+        modelId || process.env.ELEVENLABS_DEFAULT_MODEL || "eleven_flash_v2_5",
+    };
+  }
+
+  return resolveVoice({ db, provider: "elevenlabs", voiceId: requested });
+}
+
+function sendQuotaUnavailable(res, error) {
+  const providerMessage = String(error?.message || "").trim();
+  return res.status(503).json({
+    success: false,
+    error: {
+      code: "ELEVENLABS_QUOTA_UNAVAILABLE",
+      message:
+        "The ElevenLabs API key configured on the backend cannot generate this preview because its provider quota is unavailable. This is separate from the organization's Agently wallet balance.",
+      details: { providerMessage: providerMessage || undefined },
+    },
+  });
+}
 
 function apiKey() {
   return String(process.env.ELEVENLABS_API_KEY || "").trim();
@@ -126,37 +178,60 @@ async function sendPreviewAudio(
   { voiceId, text, modelId, outputFormat, voiceSettings },
 ) {
   const db = getSupabase();
-  const voice = await resolveVoice({ db, provider: "elevenlabs", voiceId });
-  const audio = await synthesizeElevenLabsPreview({
-    voiceId: voice.voiceId,
-    text: normalizePreviewText(
-      text || "Hello, this is an ElevenLabs voice test from Agently.",
-    ),
-    modelId: modelId || voice.modelId,
-    outputFormat,
-    voiceSettings: normalizeVoiceSettings(voiceSettings || {}),
-    usageContext: {
-      organizationId: req.orgId,
-      userId: req.user?.id,
-      service: "voice_preview",
-      route: "elevenlabs.preview",
-      metadata: { endpoint: req.originalUrl || req.path },
-    },
-  });
+  const voice = await resolvePreviewVoice({ db, voiceId, modelId });
+
+  let audio;
+  let providerUsed = "elevenlabs";
+  try {
+    audio = await synthesizeElevenLabsPreview({
+      voiceId: voice.voiceId,
+      text: normalizePreviewText(
+        text || "Hello! This is a voice preview from Agently!",
+      ),
+      modelId: modelId || voice.modelId,
+      outputFormat,
+      voiceSettings: normalizeVoiceSettings(voiceSettings || {}),
+      usageContext: {
+        organizationId: req.orgId,
+        userId: req.user?.id,
+        service: "voice_preview",
+        route: "elevenlabs.preview",
+        metadata: { endpoint: req.originalUrl || req.path },
+      },
+    });
+  } catch (error) {
+    if (!isElevenLabsQuotaError(error)) throw error;
+    try {
+      audio = await synthesizeOpenAIPreview({
+        voiceId: process.env.OPENAI_TTS_DEFAULT_VOICE || "alloy",
+        text: normalizePreviewText(
+          text || "Hello! This is a voice preview from Agently!",
+        ),
+      });
+      providerUsed = "openai-fallback";
+    } catch (fallbackError) {
+      return sendQuotaUnavailable(res, error);
+    }
+  }
 
   res.setHeader("Cache-Control", "no-store");
-  res.setHeader("X-Voice-Provider", "elevenlabs");
+  res.setHeader("X-Voice-Provider", providerUsed);
   res.setHeader("X-Voice-Id", voice.voiceId);
+  if (providerUsed === "openai-fallback") {
+    res.setHeader("X-Voice-Fallback-Reason", "elevenlabs_quota_unavailable");
+  }
 
   if (wantsJsonAudio(req)) {
     return res.json({
       success: true,
-      provider: "elevenlabs",
+      provider: providerUsed,
       voice_id: voice.voiceId,
       voiceId: voice.voiceId,
       mimeType: audio.mimeType || "audio/mpeg",
       audioBase64: audio.buffer.toString("base64"),
       size: audio.buffer.length,
+      previewText: audio.text || text,
+      fallback: providerUsed === "openai-fallback",
     });
   }
 
@@ -170,7 +245,7 @@ router.get(
   requireAuth,
   asyncHandler(async (req, res) => {
     const db = getSupabase();
-    const source = String(req.query.source || "api").toLowerCase();
+    const source = String(req.query.source || "auto").toLowerCase();
     const result = await listVoiceCatalog({
       db,
       provider: "elevenlabs",

@@ -2484,6 +2484,88 @@ router.post(
   }),
 );
 
+async function rollbackPurchasedNumberAfterBillingFailure({
+  db,
+  organizationId,
+  accountSid,
+  savedNumber,
+  billingError,
+}) {
+  const releasedAt = new Date().toISOString();
+  let providerReleased = false;
+  let providerReleaseError = null;
+
+  try {
+    await releaseIncomingNumber({
+      accountSid,
+      phoneSid: savedNumber.phone_sid,
+    });
+    providerReleased = true;
+  } catch (error) {
+    if (Number(error?.status || 0) === 404) {
+      providerReleased = true;
+    } else {
+      providerReleaseError = error?.message || String(error);
+    }
+  }
+
+  await db
+    .from("voice_agents")
+    .update({
+      twilio_phone_number: "",
+      twilio_phone_sid: "",
+      updated_at: releasedAt,
+    })
+    .eq("organization_id", organizationId)
+    .eq("twilio_phone_sid", savedNumber.phone_sid);
+
+  try {
+    await db
+      .from("agent_phone_number_assignments")
+      .delete()
+      .eq("organization_id", organizationId)
+      .eq("phone_sid", savedNumber.phone_sid);
+    if (savedNumber.id) {
+      await db
+        .from("agent_phone_number_assignments")
+        .delete()
+        .eq("organization_id", organizationId)
+        .eq("phone_number_id", savedNumber.id);
+    }
+  } catch (_) {
+    // Older schemas may not have the assignment table yet.
+  }
+
+  const lifecycle = providerReleased ? "released" : "release_pending";
+  const updatePayload = {
+    lifecycle_status: lifecycle,
+    released_at: providerReleased ? releasedAt : null,
+    release_reason: "billing_wallet_post_failed",
+    assigned_voice_agent_id: null,
+    provider_release_error: providerReleaseError,
+    updated_at: releasedAt,
+  };
+  const { error: lifecycleError } = await db
+    .from("twilio_phone_numbers")
+    .update(updatePayload)
+    .eq("id", savedNumber.id)
+    .eq("organization_id", organizationId);
+
+  if (lifecycleError) {
+    await db
+      .from("twilio_phone_numbers")
+      .delete()
+      .eq("id", savedNumber.id)
+      .eq("organization_id", organizationId);
+  }
+
+  return {
+    providerReleased,
+    providerReleaseError,
+    billingError: billingError?.message || String(billingError),
+  };
+}
+
 router.post(
   "/numbers/purchase",
   requireAuth,
@@ -2528,6 +2610,15 @@ router.post(
           error: { message: "Voice agent not found for this organization." },
         });
     }
+
+    const creditAllowed = await ensureWalletCreditOrRespond(req, res, {
+      organizationId,
+      action: "number_purchase",
+      minimumUsd: Number(
+        process.env.BILLING_MIN_NUMBER_PURCHASE_CREDIT_USD || 3.84,
+      ),
+    });
+    if (creditAllowed !== true) return;
 
     const db = getSupabase();
     try {
@@ -2628,8 +2719,9 @@ router.post(
           phoneSid: saved.phone_sid,
         },
       });
+      let billingEvent = null;
       try {
-        await insertUsageEvent({
+        billingEvent = await insertUsageEvent({
           organizationId,
           userId: req.user?.id || null,
           provider: "twilio",
@@ -2649,10 +2741,22 @@ router.post(
           },
         });
       } catch (billingErr) {
-        console.warn(
-          "[twilio/numbers/purchase] billing meter skipped:",
-          billingErr.message || String(billingErr),
+        const rollback = await rollbackPurchasedNumberAfterBillingFailure({
+          db,
+          organizationId,
+          accountSid: account.account_sid,
+          savedNumber: saved,
+          billingError: billingErr,
+        });
+        const error = new Error(
+          rollback.providerReleased
+            ? "The number purchase was reversed because the required wallet deduction could not be posted. No number was retained."
+            : "The wallet deduction failed and the number could not be released automatically. Agently marked it for urgent cleanup.",
         );
+        error.code = "NUMBER_PURCHASE_BILLING_FAILED";
+        error.status = 503;
+        error.details = rollback;
+        throw error;
       }
       res.json({
         success: true,
@@ -2662,8 +2766,18 @@ router.post(
         number: saved,
         readiness,
         voicePermissionResult,
+        billing: billingEvent?.billing || null,
       });
     } catch (err) {
+      if (err.code === "NUMBER_PURCHASE_BILLING_FAILED") {
+        return res.status(err.status || 503).json({
+          error: {
+            code: err.code,
+            message: err.message,
+            details: err.details || null,
+          },
+        });
+      }
       const mapped = mapTwilioError(
         err,
         "Could not purchase and configure this Twilio number.",
@@ -5119,29 +5233,38 @@ router.get(
 
 // ─────────────────────────────────────────────────────────────
 // ── INTERNAL: Vercel Cron billing sync trigger ────────────────
-// Called only by the Vercel Cron job configured in vercel.json.
-// Protected by a shared secret (CRON_SECRET env var).
+// Called by the Vercel Cron job configured in vercel.json.
+// Vercel Cron sends a GET request with `Authorization: Bearer
+// <CRON_SECRET>` — it does NOT send a custom header and does NOT POST.
+// This also still accepts POST + `x-cron-secret` so it can be triggered
+// manually or from an external scheduler if you ever move off Vercel Cron.
 // ─────────────────────────────────────────────────────────────
-router.post(
-  "/_internal/billing-sync",
-  asyncHandler(async (req, res) => {
-    const secret = (process.env.CRON_SECRET || "").trim();
-    const provided = (req.headers["x-cron-secret"] || "").trim();
-    if (!secret || provided !== secret) {
-      return res.status(401).json({ error: { message: "Unauthorized" } });
-    }
-    try {
-      const tracker = require("../../lib/billing-tracker");
-      void tracker.runOnce();
-      return res.json({ success: true, triggered: new Date().toISOString() });
-    } catch (err) {
-      console.error("[billing-sync cron] error:", err && err.message);
-      return res
-        .status(500)
-        .json({ error: { message: "Billing sync failed." } });
-    }
-  }),
-);
+function verifyCronRequest(req) {
+  const secret = (process.env.CRON_SECRET || "").trim();
+  if (!secret) return false;
+  const authHeader = String(req.headers.authorization || "").trim();
+  const bearerMatch = authHeader === `Bearer ${secret}`;
+  const legacyHeaderMatch =
+    String(req.headers["x-cron-secret"] || "").trim() === secret;
+  return bearerMatch || legacyHeaderMatch;
+}
+
+async function runBillingSyncCron(req, res) {
+  if (!verifyCronRequest(req)) {
+    return res.status(401).json({ error: { message: "Unauthorized" } });
+  }
+  try {
+    const tracker = require("../../lib/billing-tracker");
+    void tracker.runOnce();
+    return res.json({ success: true, triggered: new Date().toISOString() });
+  } catch (err) {
+    console.error("[billing-sync cron] error:", err && err.message);
+    return res.status(500).json({ error: { message: "Billing sync failed." } });
+  }
+}
+
+router.get("/_internal/billing-sync", asyncHandler(runBillingSyncCron));
+router.post("/_internal/billing-sync", asyncHandler(runBillingSyncCron));
 
 // ─────────────────────────────────────────────────────────────
 // ── PROTECTED: Initiate Outbound Call ────────────────────────

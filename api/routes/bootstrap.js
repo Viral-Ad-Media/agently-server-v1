@@ -60,12 +60,14 @@ router.get(
         .from("invoices")
         .select("*")
         .eq("organization_id", orgId)
-        .order("date", { ascending: false }),
+        .order("date", { ascending: false })
+        .limit(50),
       db
         .from("leads")
         .select("*")
         .eq("organization_id", orgId)
-        .order("created_at", { ascending: false }),
+        .order("created_at", { ascending: false })
+        .limit(250),
       db
         .from("call_records")
         .select("*")
@@ -80,6 +82,23 @@ router.get(
         .order("created_at", { ascending: true })
         .limit(100),
     ]);
+
+    const baseQueries = [
+      ["voice agents", agentsResult],
+      ["chatbots", chatbotsResult],
+      ["members", membersResult],
+      ["invoices", invoicesResult],
+      ["leads", leadsResult],
+      ["calls", callsResult],
+      ["messages", messagesResult],
+    ];
+    const failedQuery = baseQueries.find(([, result]) => result?.error);
+    if (failedQuery) {
+      const [label, result] = failedQuery;
+      const error = result.error;
+      error.message = `[bootstrap] ${label}: ${error.message || "query failed"}`;
+      throw error;
+    }
 
     const org = req.organization;
     await ensureDefaultKnowledgeBaseForOrg(db, org);

@@ -4,7 +4,11 @@ const express = require("express");
 const bcrypt = require("bcryptjs");
 const { v4: uuidv4 } = require("uuid");
 const { getSupabase } = require("../../lib/supabase");
-const { signToken } = require("../../lib/auth");
+const {
+  signToken,
+  primeSessionCache,
+  isMissingRowError,
+} = require("../../lib/auth");
 const { serializeUser } = require("../../lib/serializers");
 const { sendMagicLinkEmail, sendWelcomeEmail } = require("../../lib/email");
 const { requireAuth } = require("../../middleware/auth");
@@ -24,11 +28,12 @@ function isOrganizationDeletionRequested(org) {
 
 async function getUserOrganization(db, organizationId) {
   if (!organizationId) return null;
-  const { data: org } = await db
+  const { data: org, error } = await db
     .from("organizations")
-    .select("id,name,outbound_call_limits")
+    .select("*")
     .eq("id", organizationId)
-    .single();
+    .maybeSingle();
+  if (error && !isMissingRowError(error)) throw error;
   return org || null;
 }
 
@@ -53,11 +58,13 @@ router.post(
       .from("users")
       .select("id, name, email, role, avatar, password_hash, organization_id")
       .eq("email", email.toLowerCase().trim())
-      .single();
+      .maybeSingle();
+
+    if (error && !isMissingRowError(error)) throw error;
 
     // Use a generic message for both "not found" and "wrong password"
     // to avoid leaking which emails are registered.
-    if (error || !user || !user.password_hash) {
+    if (!user || !user.password_hash) {
       return res
         .status(401)
         .json({ error: { message: "Invalid email or password." } });
@@ -81,6 +88,19 @@ router.post(
     }
 
     const token = signToken({ userId: user.id, orgId: user.organization_id });
+    if (org) {
+      primeSessionCache(token, {
+        user: {
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          role: user.role,
+          avatar: user.avatar,
+          organization_id: user.organization_id,
+        },
+        organization: org,
+      });
+    }
 
     return res.json({ token, user: serializeUser(user) });
   }),
@@ -193,6 +213,17 @@ router.post(
     }
 
     const token = signToken({ userId: user.id, orgId: org.id });
+    primeSessionCache(token, {
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        avatar: user.avatar,
+        organization_id: user.organization_id,
+      },
+      organization: org,
+    });
 
     return res.status(201).json({ token, user: serializeUser(user) });
   }),
@@ -359,6 +390,19 @@ router.post(
       userId: user.id,
       orgId: user.organization_id,
     });
+    if (org) {
+      primeSessionCache(authToken, {
+        user: {
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          role: user.role,
+          avatar: user.avatar,
+          organization_id: user.organization_id,
+        },
+        organization: org,
+      });
+    }
 
     return res.json({ token: authToken, user: serializeUser(user) });
   }),

@@ -10,6 +10,33 @@ const { serializeCall, serializeLead } = require("../../lib/serializers");
 
 const router = express.Router();
 
+const CALL_METRICS_CACHE_TTL_MS = Math.max(
+  5000,
+  Number(process.env.CALL_LOG_METRICS_CACHE_MS || 15000),
+);
+const callMetricsCache = new Map();
+
+async function loadCallMetricRows(db, organizationId) {
+  const cached = callMetricsCache.get(organizationId);
+  if (cached && cached.expiresAt > Date.now()) return cached.rows;
+
+  const { data, error } = await db
+    .from("call_records")
+    .select(
+      "id,status,outcome,duration,recording_duration,started_at,answered_at,ended_at,completed_at,metadata,call_category,disposition,answered_by,voicemail_detected,screening_detected,tags",
+    )
+    .eq("organization_id", organizationId)
+    .limit(1000);
+  if (error) throw error;
+
+  const rows = Array.isArray(data) ? data : [];
+  callMetricsCache.set(organizationId, {
+    rows,
+    expiresAt: Date.now() + CALL_METRICS_CACHE_TTL_MS,
+  });
+  return rows;
+}
+
 function forwardToTwilioRoute(targetUrl) {
   return (req, res, next) => {
     const originalUrl = req.url;
@@ -1074,42 +1101,35 @@ router.get(
     const runBySid = new Map();
     let outboundRunIds = new Set();
 
-    if (callIds.length) {
-      const { data: runs, error: runsError } = await db
-        .from("lead_outreach_runs")
-        .select(
-          "id, schedule_id, call_record_id, twilio_call_sid, target_name, target_phone, destination_phone, status, call_duration",
-        )
-        .eq("organization_id", req.orgId)
-        .in("call_record_id", callIds);
-      if (!runsError) {
-        (runs || []).forEach((run) => {
-          if (run.call_record_id) {
-            runByCallId.set(run.call_record_id, run);
-            outboundRunIds.add(run.call_record_id);
-          }
-          if (run.twilio_call_sid) runBySid.set(run.twilio_call_sid, run);
-        });
-      }
-    }
+    const runSelect =
+      "id, schedule_id, call_record_id, twilio_call_sid, target_name, target_phone, destination_phone, status, call_duration";
+    const [runsResult, sidRunsResult, metricRows] = await Promise.all([
+      callIds.length
+        ? db
+            .from("lead_outreach_runs")
+            .select(runSelect)
+            .eq("organization_id", req.orgId)
+            .in("call_record_id", callIds)
+        : Promise.resolve({ data: [], error: null }),
+      callSids.length
+        ? db
+            .from("lead_outreach_runs")
+            .select(runSelect)
+            .eq("organization_id", req.orgId)
+            .in("twilio_call_sid", callSids)
+        : Promise.resolve({ data: [], error: null }),
+      loadCallMetricRows(db, req.orgId),
+    ]);
 
-    if (callSids.length) {
-      const { data: sidRuns, error: sidRunsError } = await db
-        .from("lead_outreach_runs")
-        .select(
-          "id, schedule_id, call_record_id, twilio_call_sid, target_name, target_phone, destination_phone, status, call_duration",
-        )
-        .eq("organization_id", req.orgId)
-        .in("twilio_call_sid", callSids);
-      if (!sidRunsError) {
-        (sidRuns || []).forEach((run) => {
-          if (run.call_record_id) {
-            runByCallId.set(run.call_record_id, run);
-            outboundRunIds.add(run.call_record_id);
-          }
-          if (run.twilio_call_sid) runBySid.set(run.twilio_call_sid, run);
-        });
+    for (const run of [
+      ...(Array.isArray(runsResult.data) ? runsResult.data : []),
+      ...(Array.isArray(sidRunsResult.data) ? sidRunsResult.data : []),
+    ]) {
+      if (run.call_record_id) {
+        runByCallId.set(run.call_record_id, run);
+        outboundRunIds.add(run.call_record_id);
       }
+      if (run.twilio_call_sid) runBySid.set(run.twilio_call_sid, run);
     }
 
     const reconciliationUpdates = [];
@@ -1179,15 +1199,7 @@ router.get(
       );
     }
 
-    const { data: metricRows, error: metricError } = await db
-      .from("call_records")
-      .select(
-        "id,status,outcome,duration,recording_duration,started_at,answered_at,ended_at,completed_at,metadata,call_category,disposition,answered_by,voicemail_detected,screening_detected,tags",
-      )
-      .eq("organization_id", req.orgId)
-      .limit(1000);
-    if (metricError) throw metricError;
-    const metrics = (metricRows || []).reduce(
+    const metrics = metricRows.reduce(
       (acc, row) => {
         const status = derivedStatus(row);
         const duration = durationSeconds(row);

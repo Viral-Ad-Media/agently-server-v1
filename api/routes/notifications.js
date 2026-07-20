@@ -196,7 +196,6 @@ function buildMessageNotification(call) {
     "message_captured",
     "callerMessage",
     "caller_message",
-    "message",
   ]);
   if (!message) return null;
   return {
@@ -223,10 +222,11 @@ function buildMessageNotification(call) {
 
 function buildScheduleNotification(schedule) {
   const status = normalizeStatus(schedule.status);
-  if (!TERMINAL_COMPLETED.has(status) && !TERMINAL_FAILED.has(status))
-    return null;
+  // Successful schedules belong in Outreach history. Only failed schedules
+  // should create notification-center alerts.
+  if (!TERMINAL_FAILED.has(status)) return null;
 
-  const failed = TERMINAL_FAILED.has(status);
+  const failed = true;
   const directRecipients = parseJsonish(schedule.direct_recipients, []);
   const recipientCount = Array.isArray(directRecipients)
     ? directRecipients.length
@@ -317,6 +317,11 @@ function groupUnansweredQuestions(questions) {
 
 async function ensureDerivedNotifications(db, orgId, userId) {
   try {
+    // Do not flood a newly opened account with the entire historical backlog.
+    // The notification center is for recent, actionable items.
+    const recentCutoff = new Date(
+      Date.now() - 7 * 24 * 60 * 60 * 1000,
+    ).toISOString();
     const [callsResult, schedulesResult, questionsResult] = await Promise.all([
       db
         .from("call_records")
@@ -324,6 +329,7 @@ async function ensureDerivedNotifications(db, orgId, userId) {
           "id, voice_agent_id, caller_name, caller_phone, direction, status, duration, timestamp, created_at, completed_at, ended_at, metadata",
         )
         .eq("organization_id", orgId)
+        .gte("created_at", recentCutoff)
         .order("created_at", { ascending: false })
         .limit(40),
       db
@@ -332,6 +338,7 @@ async function ensureDerivedNotifications(db, orgId, userId) {
           "id, voice_agent_id, name, status, schedule_type, direct_recipients, created_at, updated_at",
         )
         .eq("organization_id", orgId)
+        .gte("created_at", recentCutoff)
         .order("created_at", { ascending: false })
         .limit(30),
       db
@@ -340,6 +347,7 @@ async function ensureDerivedNotifications(db, orgId, userId) {
           "id, voice_agent_id, call_record_id, question, status, is_resolved, created_at",
         )
         .eq("organization_id", orgId)
+        .gte("created_at", recentCutoff)
         .order("created_at", { ascending: false })
         .limit(80),
     ]);
@@ -552,7 +560,8 @@ router.get(
   requireAuth,
   asyncHandler(async (req, res) => {
     const db = getSupabase();
-    await ensureDerivedNotifications(db, req.orgId, req.user && req.user.id);
+    // The bell polls this endpoint every minute. Counting must stay read-only;
+    // derived notification creation happens only when the list is opened.
     const metrics = await getNotificationMetrics(db, req.orgId);
     await maybeSendUnreadThresholdEmail(db, req, metrics);
     res.json({ success: true, unreadCount: metrics.unread, metrics });

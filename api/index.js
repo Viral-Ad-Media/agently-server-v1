@@ -6,6 +6,7 @@ try {
 } catch (_) {}
 
 const express = require("express");
+const { errorHandler } = require("../middleware/error");
 const app = express();
 
 // ═══════════════════════════════════════════════════════════════
@@ -18,7 +19,7 @@ const app = express();
 
 const DEFAULT_ALLOWED_ORIGINS = [
   "https://agentlycall.vercel.app",
-  "https://www.agentlycall.com/",
+  "https://www.agentlycall.com",
   // "https://agently-v1.vercel.app",
   // "https://agently1.vercel.app",
   "http://localhost:3000",
@@ -109,7 +110,7 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "4mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 // ═══════════════════════════════════════════════════════════════
@@ -126,7 +127,10 @@ app.get("/health", (_req, res) => {
     allowedOrigins: ALLOWED_ORIGINS,
     envCheck: {
       SUPABASE_URL: !!process.env.SUPABASE_URL,
-      SUPABASE_SERVICE_KEY: !!process.env.SUPABASE_SERVICE_KEY,
+      SUPABASE_SERVICE_KEY: !!(
+        process.env.SUPABASE_SERVICE_KEY ||
+        process.env.SUPABASE_SERVICE_ROLE_KEY
+      ),
       JWT_SECRET: !!process.env.JWT_SECRET,
       OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
       ELEVENLABS_API_KEY: !!process.env.ELEVENLABS_API_KEY,
@@ -176,6 +180,17 @@ function safeMount(prefix, loader, label) {
 }
 
 safeMount("/api/auth", () => require("./routes/auth"), "auth");
+safeMount("/api/blog", () => require("./routes/blog"), "blog");
+safeMount(
+  "/api/super-admin",
+  () => require("./routes/super-admin"),
+  "super-admin",
+);
+safeMount(
+  "/api/blog-automation",
+  () => require("./routes/blog-automation"),
+  "blog-automation",
+);
 safeMount("/api/bootstrap", () => require("./routes/bootstrap"), "bootstrap");
 safeMount(
   "/api/onboarding",
@@ -272,16 +287,9 @@ app.use((req, res) => {
 
 // Top-level error handler — re-applies CORS so browsers get a proper
 // response even when a route throws.
-app.use((err, req, res, _next) => {
+app.use((err, req, res, next) => {
   setCorsHeaders(req, res);
-  console.error("[app] unhandled error:", err && err.stack ? err.stack : err);
-  const status = err.status || err.statusCode || 500;
-  res.status(status).json({
-    error: {
-      message: err.message || "Internal server error.",
-      ...(process.env.NODE_ENV !== "production" && { stack: err.stack }),
-    },
-  });
+  return errorHandler(err, req, res, next);
 });
 
 // ═══════════════════════════════════════════════════════════════

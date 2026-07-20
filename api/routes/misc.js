@@ -18,9 +18,19 @@ const {
   reconcileOrganizationNumberRetention,
   getNumberRetentionStatus,
 } = require("../../lib/number-retention");
+const { isAutoWalletChargeEnabled } = require("../../lib/usage-ledger");
 
 const router = express.Router();
 const dashboardSelectCache = new Map();
+const warningThrottle = new Map();
+
+function warnThrottled(key, ...args) {
+  const now = Date.now();
+  const previous = warningThrottle.get(key) || 0;
+  if (now - previous < 15000) return;
+  warningThrottle.set(key, now);
+  console.warn(...args);
+}
 
 function parseBillingDemoBool(value) {
   return ["1", "true", "yes", "on"].includes(String(value || "").toLowerCase());
@@ -52,7 +62,30 @@ async function loadCustomerWalletSummary(db, organizationId, limit = 8) {
   if (!organizationId) return emptyWallet;
 
   try {
-    let wallet = null;
+    // The navbar must use the authoritative wallet row. Do not read the
+    // reporting view first: a view or future materialized summary can lag the
+    // transaction that just posted. Totals may still be read from the view,
+    // but balance_usd always comes directly from billing_wallets.
+    const { data: rawWallet, error: rawWalletError } = await db
+      .from("billing_wallets")
+      .select("id,currency,balance_usd,minimum_recharge_usd,status,updated_at")
+      .eq("organization_id", organizationId)
+      .maybeSingle();
+    if (rawWalletError) throw rawWalletError;
+
+    let wallet = rawWallet
+      ? {
+          enabled: true,
+          walletId: rawWallet.id,
+          currency: rawWallet.currency || "USD",
+          balanceUsd: Number(rawWallet.balance_usd || 0),
+          minimumRechargeUsd: Number(rawWallet.minimum_recharge_usd || 30),
+          status: rawWallet.status || "active",
+          latestTransactionAt: rawWallet.updated_at || null,
+          recentTransactions: [],
+        }
+      : { ...emptyWallet };
+
     const { data: walletRows, error: walletViewError } = await db
       .from("billing_admin_wallet_overview")
       .select("*")
@@ -62,43 +95,14 @@ async function loadCustomerWalletSummary(db, organizationId, limit = 8) {
     if (!walletViewError && Array.isArray(walletRows) && walletRows.length) {
       const row = walletRows[0];
       wallet = {
-        enabled: true,
-        walletId: row.wallet_id || row.id || null,
-        currency: row.currency || "USD",
-        balanceUsd: Number(row.wallet_balance_usd ?? row.balance_usd ?? 0),
-        minimumRechargeUsd: Number(row.minimum_recharge_usd ?? 30),
-        status: row.wallet_status || row.status || "active",
+        ...wallet,
         totalCreditsUsd: Number(
           row.total_credit_usd ?? row.total_credits_usd ?? 0,
         ),
         totalDebitsUsd: Number(
           row.total_debit_usd ?? row.total_debits_usd ?? 0,
         ),
-        latestTransactionAt: row.latest_transaction_at || null,
-        recentTransactions: [],
       };
-    }
-
-    if (!wallet) {
-      const { data: rawWallet } = await db
-        .from("billing_wallets")
-        .select(
-          "id,currency,balance_usd,minimum_recharge_usd,status,updated_at",
-        )
-        .eq("organization_id", organizationId)
-        .maybeSingle();
-      wallet = rawWallet
-        ? {
-            enabled: true,
-            walletId: rawWallet.id,
-            currency: rawWallet.currency || "USD",
-            balanceUsd: Number(rawWallet.balance_usd || 0),
-            minimumRechargeUsd: Number(rawWallet.minimum_recharge_usd || 30),
-            status: rawWallet.status || "active",
-            latestTransactionAt: rawWallet.updated_at || null,
-            recentTransactions: [],
-          }
-        : emptyWallet;
     }
 
     const { data: txRows } = await db
@@ -421,11 +425,13 @@ router.get(
       .eq("id", req.orgId)
       .single();
 
-    const { data: invoices = [] } = await db
+    const { data: invoiceRows, error: invoicesError } = await db
       .from("invoices")
       .select("id,amount,status,pdf_url,date,created_at")
       .eq("organization_id", req.orgId)
       .order("date", { ascending: false });
+    if (invoicesError) throw invoicesError;
+    const invoices = Array.isArray(invoiceRows) ? invoiceRows : [];
 
     const serializedInvoices = invoices.map((invoice) => ({
       id: invoice.id,
@@ -443,6 +449,14 @@ router.get(
       .reduce((sum, invoice) => sum + Number(invoice.amount || 0), 0);
 
     const wallet = await loadCustomerWalletSummary(db, req.orgId, 8);
+    wallet.creditEnforcementMode = currentCreditEnforcementMode();
+    wallet.autoChargeWalletEnabled = isAutoWalletChargeEnabled();
+    wallet.minimums = {
+      callUsd: Number(process.env.BILLING_MIN_CALL_CREDIT_USD || 1),
+      chatUsd: Number(process.env.BILLING_MIN_CHAT_CREDIT_USD || 0.05),
+      hardStopBalanceUsd: -maxNegativeBalanceUsd(),
+      maxNegativeBalanceUsd: maxNegativeBalanceUsd(),
+    };
     let numberRetention = null;
     try {
       // This is idempotent: it starts or resolves the warning state immediately
@@ -454,7 +468,8 @@ router.get(
       });
       numberRetention = await getNumberRetentionStatus(req.orgId);
     } catch (retentionError) {
-      console.warn(
+      warnThrottled(
+        "number-retention-billing-summary",
         "[number-retention] billing summary sync skipped:",
         retentionError?.message || String(retentionError),
       );
@@ -494,9 +509,7 @@ router.get(
           process.env.BILLING_DEMO_TOPUP_ENABLED,
         ),
         creditEnforcementMode: currentCreditEnforcementMode(),
-        autoChargeWalletEnabled: parseBillingDemoBool(
-          process.env.BILLING_AUTO_CHARGE_WALLET,
-        ),
+        autoChargeWalletEnabled: isAutoWalletChargeEnabled(),
         numberRetention,
         minimums: {
           callUsd: Number(process.env.BILLING_MIN_CALL_CREDIT_USD || 1),
@@ -1065,7 +1078,8 @@ router.get(
         if (!isSchemaMismatch) break;
       }
 
-      console.warn(
+      warnThrottled(
+        `dashboard-metrics-${table}`,
         `[dashboard/metrics] ${table} unavailable:`,
         lastError?.message || "Unknown query error",
       );
