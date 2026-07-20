@@ -156,6 +156,7 @@ const LANG_NAMES = {
 };
 
 const CHATBOT_AVATAR_PREFIX = "agently-avatar:";
+const CHATBOT_AVATAR_UPLOAD_PREFIX = "agently-upload:";
 const WIDGET_AVATAR_FILES = {
   "ava-garden": "ava-garden.jpg",
   "mina-studio": "mina-studio.jpg",
@@ -184,13 +185,29 @@ function escapeHtml(value) {
     .replace(/'/g, "&#39;");
 }
 
+function isSafeDataImageSrc(value) {
+  const src = String(value || "").trim();
+  return /^data:image\/(png|jpe?g|webp|gif|svg\+xml);(base64,|charset=utf-8,|utf8,)/i.test(
+    src,
+  );
+}
+
 function getWidgetAvatarHtml(avatarLabel) {
   const value = String(avatarLabel || "A");
+  if (value.startsWith(CHATBOT_AVATAR_UPLOAD_PREFIX)) {
+    const dataUri = value.slice(CHATBOT_AVATAR_UPLOAD_PREFIX.length);
+    if (isSafeDataImageSrc(dataUri)) {
+      return `<img src="${escapeHtml(dataUri)}" alt="" loading="eager" decoding="async"/>`;
+    }
+  }
+  if (isSafeDataImageSrc(value)) {
+    return `<img src="${escapeHtml(value)}" alt="" loading="eager" decoding="async"/>`;
+  }
   if (value.startsWith(CHATBOT_AVATAR_PREFIX)) {
     const avatarId = value.slice(CHATBOT_AVATAR_PREFIX.length);
     const fileName = WIDGET_AVATAR_FILES[avatarId];
     if (fileName)
-      return `<img src="/chatbot-avatars/${escapeHtml(fileName)}" alt=""/>`;
+      return `<img src="/chatbot-avatars/${escapeHtml(fileName)}" alt="" loading="eager" decoding="async"/>`;
   }
   return escapeHtml(value.slice(0, 2).toUpperCase() || "A");
 }

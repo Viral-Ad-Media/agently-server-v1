@@ -71,6 +71,7 @@ const {
 const { mapTwilioError } = require("../../lib/twilio-errors");
 const { checkOpenAIRealtimeProvider } = require("../../lib/ai-provider-health");
 const voiceBehavior = require("../../lib/voice-behavior");
+const { loadVoiceContext } = require("../../lib/context-builder");
 const {
   ensureTenantTwilioAccount,
   searchAvailableRecommendedNumbers,
@@ -399,6 +400,9 @@ function mediaStreamUrl(params) {
       "organizationName",
       "knowledgeBaseId",
       "knowledgeBaseName",
+      "accountSid",
+      "twilioAccountSid",
+      "fromAccountSid",
       "openAiVoice",
       "selectedVoiceId",
       "selectedVoiceName",
@@ -438,6 +442,7 @@ function buildRealtimeTwiml({
   platformTestEventId,
   precomputedOpeningGreeting = "",
   precomputedNormalizedPurpose = "",
+  accountSid = "",
 }) {
   const normalizedPurpose =
     precomputedNormalizedPurpose ||
@@ -537,6 +542,9 @@ function buildRealtimeTwiml({
     agentId: agent.id,
     callRecordId,
     callSid: callSid || "",
+    accountSid: accountSid || "",
+    twilioAccountSid: accountSid || "",
+    fromAccountSid: accountSid || "",
     direction: direction || "inbound",
     callerPhone: callerPhone || "",
     recipientPhone: recipientPhone || callerPhone || "",
@@ -627,6 +635,78 @@ function outboundPurposeFromBody(body = {}) {
     callPurpose: DEFAULT_OUTBOUND_TEST_PURPOSE,
     callPurposeWarning: "No call purpose supplied; using default test purpose.",
   };
+}
+
+async function preloadOutboundCallContext({
+  db,
+  organizationId,
+  agent,
+  query,
+  assignmentContext,
+}) {
+  const required =
+    String(
+      process.env.OUTBOUND_CONTEXT_PREFLIGHT_REQUIRED || "true",
+    ).toLowerCase() !== "false";
+  try {
+    const voiceContext = await loadVoiceContext(
+      db,
+      organizationId,
+      { ...agent, direction: "outbound" },
+      query || "outbound call",
+      { assignmentContext: assignmentContext || "" },
+    );
+    if (!voiceContext) throw new Error("Voice context was not returned.");
+    const selectedKb = voiceContext.selectedKnowledgeBase || null;
+    return {
+      ok: true,
+      required,
+      agent: selectedKb
+        ? {
+            ...agent,
+            knowledge_base_id:
+              voiceContext.selectedKnowledgeBaseId ||
+              agent.knowledge_base_id ||
+              null,
+            knowledge_base_name:
+              selectedKb.name || agent.knowledge_base_name || "",
+            knowledge_base_business_name:
+              selectedKb.business_name ||
+              selectedKb.name ||
+              agent.knowledge_base_business_name ||
+              "",
+          }
+        : agent,
+      summary: {
+        knowledgeBaseId: voiceContext.selectedKnowledgeBaseId || null,
+        knowledgeBaseName: selectedKb?.name || null,
+        faqCount: Array.isArray(voiceContext.faqs)
+          ? voiceContext.faqs.length
+          : 0,
+        chunkCount: Array.isArray(voiceContext.relevantChunks)
+          ? voiceContext.relevantChunks.length
+          : 0,
+        systemPromptChars: String(voiceContext.systemPrompt || "").length,
+      },
+    };
+  } catch (err) {
+    const error = err?.message || String(err);
+    if (required) {
+      const failure = new Error(
+        "Call context could not be prepared before dialing.",
+      );
+      failure.status = 503;
+      failure.code = "CALL_CONTEXT_NOT_READY";
+      failure.detail = error;
+      throw failure;
+    }
+    console.warn("[outbound-call] context preflight warning", {
+      organizationId,
+      agentId: agent?.id || "",
+      error,
+    });
+    return { ok: false, required, agent, summary: { error } };
+  }
 }
 
 function encodeOutboundTwiMlUrl(base, params = {}) {
@@ -976,6 +1056,15 @@ async function handleOutboundTwiMl(req, res) {
   const agentId = req.query?.agentId || req.body?.agentId || "";
   const callRecordIdFromQuery =
     req.query?.callRecordId || req.body?.callRecordId || "";
+  let accountSid = String(
+    req.query?.accountSid ||
+      req.body?.accountSid ||
+      req.query?.twilioAccountSid ||
+      req.body?.twilioAccountSid ||
+      req.query?.fromAccountSid ||
+      req.body?.fromAccountSid ||
+      "",
+  ).trim();
   const leadId = req.query?.leadId || req.body?.leadId || "";
   const callPurpose = req.query?.callPurpose || req.body?.callPurpose || "";
   const precomputedOpeningGreeting = String(
@@ -1099,6 +1188,24 @@ async function handleOutboundTwiMl(req, res) {
     }
   }
 
+  if (!accountSid && agent?.organization_id && fromPhone) {
+    try {
+      const { data: numberRow } = await db
+        .from("twilio_phone_numbers")
+        .select("account_sid")
+        .eq("organization_id", agent.organization_id)
+        .eq("phone_number", fromPhone)
+        .maybeSingle();
+      accountSid = String(numberRow?.account_sid || "").trim();
+    } catch (err) {
+      console.warn("[outbound-twiml] number account lookup skipped", {
+        organizationId: agent.organization_id,
+        fromPhone,
+        error: err.message || String(err),
+      });
+    }
+  }
+
   if (!agent) {
     res.setHeader("Content-Type", "text/xml");
     return res.send(
@@ -1118,6 +1225,8 @@ async function handleOutboundTwiMl(req, res) {
       metadata: {
         twilioTo: toPhone,
         twilioFrom: fromPhone,
+        accountSid: accountSid || null,
+        account_sid_last4: accountSid ? accountSid.slice(-4) : null,
         leadId: leadId || null,
         recipientName: recipientName || null,
         targetName: targetName || recipientName || null,
@@ -1158,6 +1267,7 @@ async function handleOutboundTwiMl(req, res) {
     platformTestEventId,
     precomputedOpeningGreeting,
     precomputedNormalizedPurpose,
+    accountSid,
   });
   res.setHeader("Content-Type", "text/xml");
   res.send(twiml);
@@ -3549,13 +3659,14 @@ router.post(
       });
     }
 
-    const { data: agent } = await db
+    const { data: agentRow } = await db
       .from("voice_agents")
       .select("*")
       .eq("id", actualAgentId)
       .eq("organization_id", organizationId)
       .eq("is_active", true)
       .maybeSingle();
+    let agent = agentRow || null;
     if (!agent)
       return res.status(404).json({
         error: {
@@ -3611,6 +3722,17 @@ router.post(
     });
     console.log("[outbound-call] callPurpose", callPurpose);
 
+    const preflightContext = await preloadOutboundCallContext({
+      db,
+      organizationId,
+      agent,
+      query: [callPurpose, recipientName, targetName, toPhone]
+        .filter(Boolean)
+        .join(" "),
+      assignmentContext: customInstructions,
+    });
+    agent = preflightContext.agent || agent;
+
     const aiProvider = await checkOpenAIRealtimeProvider();
     if (!aiProvider.success) {
       console.warn(
@@ -3640,6 +3762,7 @@ router.post(
         initiatedBy: req.user?.id || null,
         fromNumberId: number.id,
         fromNumber: number.phone_number,
+        fromAccountSid: number.account_sid || account.account_sid || null,
         toPhone,
         leadId,
         recipientName,
@@ -3650,6 +3773,7 @@ router.post(
         maxCallSeconds: maxCallSeconds || null,
         platformTestMode,
         platformTestEventId: platformTestEventId || null,
+        preflightContext: preflightContext.summary || null,
       },
     });
 
@@ -3692,6 +3816,7 @@ router.post(
       recipientName,
       targetName,
       callerPhone: number.phone_number,
+      accountSid: number.account_sid || account.account_sid || undefined,
       leadId,
       callPurpose,
       normalizedPurpose,
@@ -3710,6 +3835,7 @@ router.post(
       recipientName,
       targetName,
       callerPhone: number.phone_number,
+      accountSid: number.account_sid || account.account_sid || undefined,
       leadId,
       callPurpose,
       normalizedPurpose,
@@ -5529,13 +5655,14 @@ router.post(
     const db = getSupabase();
     const targetAgentId =
       voiceAgentId || req.organization.active_voice_agent_id;
-    const { data: agent } = await db
+    const { data: agentRow } = await db
       .from("voice_agents")
       .select("*")
       .eq("id", targetAgentId)
       .eq("organization_id", req.orgId)
       .eq("is_active", true)
       .single();
+    let agent = agentRow || null;
 
     let outboundFromNumber = normalizePhone(
       req.body?.fromNumber ||
@@ -5645,6 +5772,17 @@ router.post(
       }
     }
 
+    const preflightContext = await preloadOutboundCallContext({
+      db,
+      organizationId: req.orgId,
+      agent,
+      query: [callPurpose, recipientName, targetName, toPhone]
+        .filter(Boolean)
+        .join(" "),
+      assignmentContext: customInstructions,
+    });
+    agent = preflightContext.agent || agent;
+
     const record = await createCallRecord({
       organizationId: req.orgId,
       voiceAgentId: agent.id,
@@ -5655,6 +5793,9 @@ router.post(
       status: "queued",
       metadata: {
         initiatedBy: req.user?.id || null,
+        fromNumberId: number?.id || null,
+        fromNumber: outboundFromNumber,
+        fromAccountSid: number?.account_sid || null,
         leadId,
         recipientName,
         targetName,
@@ -5664,6 +5805,7 @@ router.post(
         maxCallSeconds: maxCallSeconds || null,
         platformTestMode,
         platformTestEventId: platformTestEventId || null,
+        preflightContext: preflightContext.summary || null,
       },
     });
 
@@ -5696,6 +5838,7 @@ router.post(
       recipientName,
       targetName,
       callerPhone: outboundFromNumber,
+      accountSid: number?.account_sid || undefined,
       leadId,
       callPurpose,
       normalizedPurpose,
@@ -5714,6 +5857,7 @@ router.post(
       recipientName,
       targetName,
       callerPhone: outboundFromNumber,
+      accountSid: number?.account_sid || undefined,
       leadId,
       callPurpose,
       normalizedPurpose,

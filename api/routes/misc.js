@@ -38,9 +38,20 @@ function parseBillingDemoBool(value) {
 
 function currentCreditEnforcementMode() {
   const mode = String(
-    process.env.BILLING_CREDIT_ENFORCEMENT_MODE || "observe",
+    process.env.BILLING_CREDIT_ENFORCEMENT_MODE || "block",
   ).toLowerCase();
-  return ["observe", "warn", "block"].includes(mode) ? mode : "observe";
+  const normalized = ["observe", "warn", "block"].includes(mode)
+    ? mode
+    : "block";
+  if (
+    normalized !== "block" &&
+    String(
+      process.env.BILLING_ALLOW_CREDIT_OBSERVE_MODE || "",
+    ).toLowerCase() !== "true"
+  ) {
+    return "block";
+  }
+  return normalized;
 }
 
 function maxNegativeBalanceUsd() {
@@ -48,7 +59,7 @@ function maxNegativeBalanceUsd() {
   return Number.isFinite(n) ? Math.max(0, n) : 1;
 }
 
-async function loadCustomerWalletSummary(db, organizationId, limit = 8) {
+async function loadCustomerWalletSummary(db, organizationId, limit = 150) {
   const emptyWallet = {
     enabled: true,
     currency: "USD",
@@ -112,7 +123,7 @@ async function loadCustomerWalletSummary(db, organizationId, limit = 8) {
       )
       .eq("organization_id", organizationId)
       .order("created_at", { ascending: false })
-      .limit(Math.min(Math.max(Number(limit) || 8, 1), 25));
+      .limit(Math.min(Math.max(Number(limit) || 150, 1), 250));
 
     wallet.recentTransactions = (txRows || []).map((tx) => ({
       id: tx.id,
@@ -139,7 +150,7 @@ async function loadCustomerWalletSummary(db, organizationId, limit = 8) {
       )
       .eq("organization_id", organizationId)
       .order("created_at", { ascending: false })
-      .limit(Math.min(Math.max(Number(limit) || 8, 1), 25));
+      .limit(Math.min(Math.max(Number(limit) || 150, 1), 250));
 
     const recentUsageCharges = (chargeRows || []).map((charge) => ({
       id: charge.id,
@@ -448,12 +459,19 @@ router.get(
       .filter((invoice) => invoice.status !== "Paid")
       .reduce((sum, invoice) => sum + Number(invoice.amount || 0), 0);
 
-    const wallet = await loadCustomerWalletSummary(db, req.orgId, 8);
+    const wallet = await loadCustomerWalletSummary(db, req.orgId, 150);
     wallet.creditEnforcementMode = currentCreditEnforcementMode();
     wallet.autoChargeWalletEnabled = isAutoWalletChargeEnabled();
     wallet.minimums = {
       callUsd: Number(process.env.BILLING_MIN_CALL_CREDIT_USD || 1),
       chatUsd: Number(process.env.BILLING_MIN_CHAT_CREDIT_USD || 0.05),
+      voicePreviewUsd: Number(
+        process.env.BILLING_MIN_VOICE_PREVIEW_CREDIT_USD || 0.05,
+      ),
+      knowledgeSyncUsd: Number(
+        process.env.BILLING_MIN_KNOWLEDGE_SYNC_CREDIT_USD || 0.25,
+      ),
+      activeUsd: Number(process.env.BILLING_MIN_ACTIVE_CREDIT_USD || 1),
       hardStopBalanceUsd: -maxNegativeBalanceUsd(),
       maxNegativeBalanceUsd: maxNegativeBalanceUsd(),
     };
@@ -520,6 +538,13 @@ router.get(
           knowledgeSyncUsd: Number(
             process.env.BILLING_MIN_KNOWLEDGE_SYNC_CREDIT_USD || 0.25,
           ),
+          activeUsd: Number(process.env.BILLING_MIN_ACTIVE_CREDIT_USD || 1),
+          voicePreviewUsd: Number(
+            process.env.BILLING_MIN_VOICE_PREVIEW_CREDIT_USD || 0.05,
+          ),
+          knowledgeSyncUsd: Number(
+            process.env.BILLING_MIN_KNOWLEDGE_SYNC_CREDIT_USD || 0.25,
+          ),
           maxNegativeBalanceUsd: maxNegativeBalanceUsd(),
           hardStopBalanceUsd: -maxNegativeBalanceUsd(),
         },
@@ -580,7 +605,7 @@ router.post(
       });
     }
 
-    const wallet = await loadCustomerWalletSummary(db, req.orgId, 8);
+    const wallet = await loadCustomerWalletSummary(db, req.orgId, 150);
     res.json({
       success: true,
       source: "billing_admin_top_up_wallet",
