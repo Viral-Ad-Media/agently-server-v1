@@ -86,6 +86,7 @@ const {
   lowRiskCountries,
   normalizeCountryList,
   evaluateNumberRecommendation,
+  isRecommendedForAutomaticPurchase,
   twilioRequest,
   apiBaseUrl,
   masterSid,
@@ -340,6 +341,16 @@ function normalizePhone(phone) {
   return String(phone || "").trim();
 }
 
+function phoneDigits(phone) {
+  return String(phone || "").replace(/\D/g, "");
+}
+
+function maskSid(sid) {
+  const value = String(sid || "");
+  if (!value) return "";
+  return `${value.slice(0, 6)}...${value.slice(-4)}`;
+}
+
 function safeXmlText(value) {
   return String(value || "")
     .replace(/&/g, "&amp;")
@@ -550,8 +561,9 @@ function buildRealtimeTwiml({
         ? agent?.knowledge_base_business_name ||
             agent?.knowledge_base_name ||
             agent?.business_name ||
-            agent?.name ||
             organization?.name ||
+            organization?.business_name ||
+            organization?.company_name ||
             ""
         : organization?.name ||
             organization?.business_name ||
@@ -644,14 +656,15 @@ function preparedOpeningGreetingForCall({
   const organizationName = voiceBehavior.cleanOrganizationNameForSpeech(
     agent?.knowledge_base_id
       ? agent?.knowledge_base_business_name ||
-          agent?.knowledge_base_name ||
           agent?.business_name ||
-          agent?.name ||
-          organization?.name ||
-          ""
-      : organization?.name ||
           organization?.business_name ||
           organization?.company_name ||
+          organization?.name ||
+          agent?.knowledge_base_name ||
+          ""
+      : organization?.business_name ||
+          organization?.company_name ||
+          organization?.name ||
           "",
   );
   const cleanRecipientName = voiceBehavior.cleanRecipientNameForSpeech(
@@ -1976,174 +1989,25 @@ function defaultOutboundVoiceCountries(country) {
     process.env.TWILIO_LOW_RISK_VOICE_COUNTRIES ||
     process.env.DEFAULT_OUTBOUND_VOICE_COUNTRIES ||
     "US";
-  const lowRisk = new Set(lowRiskCountries().map(normalizeCountry));
-  const values = [country, ...String(raw).split(",")]
-    .map(normalizeCountry)
-    .filter(Boolean)
-    .filter((iso) => lowRisk.has(iso));
-  return [...new Set(values.length ? values : ["US"])];
+  return [
+    ...new Set(
+      [country, ...String(raw).split(",")]
+        .map(normalizeCountry)
+        .filter(Boolean),
+    ),
+  ];
 }
 
-function sellableNumberCountries() {
-  const supported = new Set(supportedCountries().map(normalizeCountry));
-  return lowRiskCountries()
-    .map(normalizeCountry)
-    .filter((iso) => supported.has(iso));
-}
-
-function strictTenantNumberPurchaseEnabled() {
-  return envBool("TWILIO_STRICT_TENANT_NUMBER_PURCHASE", true);
-}
-
-function digitsOnly(value) {
-  return String(value || "").replace(/\D/g, "");
-}
-
-function nanpTollFreeType(phoneNumber) {
-  const digits = digitsOnly(phoneNumber);
-  const area =
-    digits.length === 11 && digits.startsWith("1")
-      ? digits.slice(1, 4)
-      : digits.slice(0, 3);
-  return ["800", "833", "844", "855", "866", "877", "888"].includes(area);
-}
-
-function candidateNumberTypes(type, phoneNumber) {
-  const requested = String(type || "").trim();
-  if (requested) return [requested];
-  return nanpTollFreeType(phoneNumber)
-    ? ["TollFree", "Local"]
-    : ["Local", "TollFree"];
-}
-
-function availableNumberMatches(candidate, phoneNumber) {
-  return (
-    normalizePhone(candidate?.phoneNumber || candidate?.phone_number || "") ===
-    normalizePhone(phoneNumber)
-  );
-}
-
-function purchasableRecommendationStatus(candidate) {
-  return (
-    candidate &&
-    candidate.recommendationStatus === "recommended" &&
-    candidate.restrictionLevel === "low" &&
-    String(
-      candidate.addressRequirements || candidate.addressRequired || "none",
-    ).toLowerCase() === "none" &&
-    candidate.capabilities?.voice === true
-  );
-}
-
-async function assertTenantNumberIsPurchasable({
-  accountSid,
-  phoneNumber,
-  country,
-  type,
-  requiresSms = false,
-}) {
-  if (!strictTenantNumberPurchaseEnabled()) return null;
-
-  const normalizedCountry = normalizeCountry(country || "US");
-  const allowedCountries = sellableNumberCountries();
-  if (!allowedCountries.includes(normalizedCountry)) {
-    const err = new Error(
-      `Agently tenant purchases are currently limited to low-restriction countries: ${allowedCountries.join(", ")}.`,
-    );
-    err.status = 400;
-    err.code = "NUMBER_COUNTRY_NOT_SELLABLE";
-    err.details = { country: normalizedCountry, allowedCountries };
-    throw err;
-  }
-
-  const contains = digitsOnly(phoneNumber).slice(-7);
-  let lastSearchError = null;
-  for (const candidateType of candidateNumberTypes(type, phoneNumber)) {
-    try {
-      const candidates = await searchAvailableRecommendedNumbers({
-        accountSid,
-        country: normalizedCountry,
-        type: candidateType,
-        contains: contains || undefined,
-        requiresVoice: true,
-        requiresSms,
-        showAdvancedRestrictedNumbers: false,
-        limit: 40,
-      });
-      const match = candidates.find((candidate) =>
-        availableNumberMatches(candidate, phoneNumber),
-      );
-      if (match && purchasableRecommendationStatus(match)) {
-        return { ...match, searchedType: candidateType };
-      }
-    } catch (err) {
-      lastSearchError = err;
-    }
-  }
-
-  const err = new Error(
-    "This number is no longer available or does not meet Agently's low-restriction voice-purchase rules. Search again and choose a recommended number.",
-  );
-  err.status = 400;
-  err.code = "NUMBER_NOT_RECOMMENDED_FOR_TENANT_PURCHASE";
-  err.details = {
-    phoneNumber,
-    country: normalizedCountry,
-    searchedContains: contains,
-    lastSearchError: lastSearchError?.message || null,
-  };
-  throw err;
-}
-
-async function resolveDefaultVoiceAgentForNumberPurchase(
-  db,
-  organizationId,
-  requestedAgentId,
-) {
-  const normalizedRequested = String(requestedAgentId || "").trim();
-  if (normalizedRequested) {
-    const { data: agent } = await db
-      .from("voice_agents")
-      .select("id,name,direction,is_active")
-      .eq("id", normalizedRequested)
-      .eq("organization_id", organizationId)
-      .eq("is_active", true)
-      .maybeSingle();
-    return agent || null;
-  }
-
-  const { data: agents } = await db
-    .from("voice_agents")
-    .select("id,name,direction,is_active,created_at")
-    .eq("organization_id", organizationId)
-    .eq("is_active", true)
-    .order("created_at", { ascending: true })
-    .limit(20);
-
-  const list = Array.isArray(agents) ? agents : [];
-  return (
-    list.find(
-      (agent) => String(agent.direction || "").toLowerCase() === "inbound",
-    ) ||
-    list.find(
-      (agent) => String(agent.direction || "").toLowerCase() === "both",
-    ) ||
-    list[0] ||
-    null
-  );
-}
-
-function voiceCountriesForNumber(number, _destinationCountry) {
-  const lowRisk = new Set(lowRiskCountries().map(normalizeCountry));
+function voiceCountriesForNumber(number, destinationCountry) {
   return new Set(
     [
       ...jsonArray(number?.selected_outbound_voice_countries),
       normalizeCountry(number?.iso_country),
+      normalizeCountry(destinationCountry),
       ...defaultOutboundVoiceCountries(number?.iso_country),
     ]
       .map(normalizeCountry)
-      .filter(Boolean)
-      .filter((iso) => lowRisk.has(iso)),
+      .filter(Boolean),
   );
 }
 
@@ -2593,13 +2457,12 @@ router.post(
     const requiresVoice = req.body?.requiresVoice !== false;
     const country = normalizeCountry(req.body?.country || "US");
 
-    const allowedCountries = sellableNumberCountries();
-    if (!allowedCountries.includes(country)) {
+    if (!supportedCountries().includes(country)) {
       return res.status(400).json({
         error: {
           code: "UNSUPPORTED_COUNTRY",
-          message: `Agently is currently limited to low-restriction voice-ready number purchases in: ${allowedCountries.join(", ")}.`,
-          supportedCountries: allowedCountries,
+          message: `Agently is not currently configured to sell numbers in ${country}.`,
+          supportedCountries: supportedCountries(),
         },
       });
     }
@@ -2624,7 +2487,7 @@ router.post(
       });
       res.json({
         numbers,
-        supportedCountries: sellableNumberCountries(),
+        supportedCountries: supportedCountries(),
         lowRiskVoiceCountries: lowRiskCountries(),
       });
     } catch (err) {
@@ -2728,12 +2591,11 @@ router.post(
     const country = normalizeCountry(
       req.body?.country || req.body?.selectedCountry || "US",
     );
-    let agentId =
+    const agentId =
       req.body?.agentId ||
       req.body?.voiceAgentId ||
       req.organization?.active_voice_agent_id ||
       null;
-    const lowRiskCountrySet = new Set(lowRiskCountries().map(normalizeCountry));
     const selectedOutboundVoiceCountries = [
       ...new Set(
         [
@@ -2741,8 +2603,7 @@ router.post(
           ...(req.body?.selectedOutboundVoiceCountries || []),
         ]
           .map(normalizeCountry)
-          .filter(Boolean)
-          .filter((iso) => lowRiskCountrySet.has(iso)),
+          .filter(Boolean),
       ),
     ];
 
@@ -2750,26 +2611,17 @@ router.post(
       return res
         .status(400)
         .json({ error: { message: "phoneNumber is required." } });
-    const db = getSupabase();
-    const autoAssignedAgent = await resolveDefaultVoiceAgentForNumberPurchase(
-      db,
-      organizationId,
-      agentId,
-    );
-    if (agentId && !autoAssignedAgent) {
-      return res.status(404).json({
-        error: { message: "Voice agent not found for this organization." },
-      });
-    }
-    if (!agentId && autoAssignedAgent?.id) agentId = autoAssignedAgent.id;
-    if (!agentId) {
-      return res.status(400).json({
-        error: {
-          code: "ACTIVE_VOICE_AGENT_REQUIRED",
-          message:
-            "Create or activate a voice agent before purchasing a business number. Agently only sells tenant numbers that can be connected immediately.",
-        },
-      });
+    if (agentId) {
+      const { data: agent } = await getSupabase()
+        .from("voice_agents")
+        .select("id,name")
+        .eq("id", agentId)
+        .eq("organization_id", organizationId)
+        .maybeSingle();
+      if (!agent)
+        return res.status(404).json({
+          error: { message: "Voice agent not found for this organization." },
+        });
     }
 
     const creditAllowed = await ensureWalletCreditOrRespond(req, res, {
@@ -2781,95 +2633,186 @@ router.post(
     });
     if (creditAllowed !== true) return;
 
+    const db = getSupabase();
     try {
       const account = await ensureTenantTwilioAccount({
         organizationId,
         organizationName: req.organization?.name,
         createIfMissing: true,
       });
-      const purchaseRecommendation = await assertTenantNumberIsPurchasable({
+
+      const purchaseType = req.body?.type || req.body?.numberType || "Local";
+      const exactDigits = phoneDigits(phoneNumber);
+      const candidateDigits = exactDigits.slice(-7) || exactDigits;
+      const safeCandidates = await searchAvailableRecommendedNumbers({
         accountSid: account.account_sid,
-        phoneNumber,
         country,
-        type: req.body?.type || req.body?.numberType || "Local",
+        contains: candidateDigits || undefined,
+        requiresVoice: true,
         requiresSms: false,
+        showAdvancedRestrictedNumbers: false,
+        limit: 40,
+        type: purchaseType,
       });
+      const selectedCandidate = safeCandidates.find(
+        (candidate) => phoneDigits(candidate.phoneNumber) === exactDigits,
+      );
+      if (!selectedCandidate) {
+        return res.status(400).json({
+          error: {
+            code: "NUMBER_NOT_SAFE_FOR_AUTOMATIC_ACTIVATION",
+            message:
+              "That number is no longer available or does not pass Agently's automatic voice-readiness rules. Search again and choose a recommended voice number.",
+          },
+        });
+      }
+
       const purchased = await purchaseIncomingNumber({
         accountSid: account.account_sid,
         phoneNumber,
         friendlyName: `${req.organization?.name || "Agently"} ${phoneNumber}`,
         agentId,
       });
-      const configured = await configureTwilioIncomingNumber(purchased.sid, {
-        accountSid: account.account_sid,
-        supportsSms: !!(
-          purchased.capabilities?.SMS || purchased.capabilities?.sms
-        ),
-      }).catch((configureErr) => {
-        console.warn(
-          "[twilio/numbers/purchase] post-purchase webhook configure failed",
-          {
-            organizationId,
-            phoneNumber,
+
+      let configured = purchased;
+      try {
+        configured = await configureTwilioIncomingNumber(purchased.sid, {
+          accountSid: account.account_sid,
+          supportsSms: !!(
+            purchased.capabilities?.SMS ||
+            purchased.capabilities?.sms ||
+            selectedCandidate.capabilities?.sms
+          ),
+        });
+      } catch (configureErr) {
+        let released = false;
+        try {
+          await releaseIncomingNumber({
+            accountSid: account.account_sid,
             phoneSid: purchased.sid,
-            accountSidLast4: String(account.account_sid || "").slice(-4),
-            error: configureErr.message || String(configureErr),
-          },
+          });
+          released = true;
+        } catch (releaseErr) {
+          console.error(
+            "[twilio-number-purchase] configuration rollback failed",
+            {
+              organizationId,
+              phoneSid: purchased.sid,
+              accountSid: maskSid(account.account_sid),
+              configureError: configureErr?.message || String(configureErr),
+              releaseError: releaseErr?.message || String(releaseErr),
+            },
+          );
+        }
+        const mapped = mapTwilioError(
+          configureErr,
+          "The number was purchased but could not be configured for Agently calls.",
         );
-        return null;
-      });
-      const incoming = configured || purchased;
+        return res.status(502).json({
+          error: {
+            ...mapped,
+            code: "NUMBER_CONFIGURATION_FAILED",
+            released,
+            message: released
+              ? "Agently could not activate this number, so the purchase was reversed and the number was not retained. Search again and choose another recommended number."
+              : "Agently could not activate this number and could not release it automatically. Please contact support before using this number.",
+          },
+        });
+      }
+
       const normalized = {
-        phoneSid: incoming.sid || purchased.sid,
+        phoneSid: configured.sid || purchased.sid,
         phoneNumber:
-          incoming.phone_number || purchased.phone_number || phoneNumber,
+          configured.phone_number || purchased.phone_number || phoneNumber,
         accountSid:
-          incoming.account_sid || purchased.account_sid || account.account_sid,
-        country: incoming.iso_country || purchased.iso_country || country,
+          configured.account_sid ||
+          purchased.account_sid ||
+          account.account_sid,
+        country: configured.iso_country || purchased.iso_country || country,
         capabilities: {
           voice: !!(
-            incoming.capabilities?.voice ?? purchased.capabilities?.voice
+            configured.capabilities?.voice || purchased.capabilities?.voice
           ),
           sms: !!(
-            incoming.capabilities?.SMS ||
-            incoming.capabilities?.sms ||
+            configured.capabilities?.SMS ||
+            configured.capabilities?.sms ||
             purchased.capabilities?.SMS ||
             purchased.capabilities?.sms
           ),
           mms: !!(
-            incoming.capabilities?.MMS ||
-            incoming.capabilities?.mms ||
+            configured.capabilities?.MMS ||
+            configured.capabilities?.mms ||
             purchased.capabilities?.MMS ||
             purchased.capabilities?.mms
           ),
         },
         addressRequirements:
-          incoming.address_requirements ||
+          configured.address_requirements ||
           purchased.address_requirements ||
           "none",
         voiceUrl:
-          incoming.voice_url ||
+          configured.voice_url ||
           purchased.voice_url ||
           `${apiBaseUrl()}/api/twilio/voice-inbound`,
         voiceFallbackUrl:
-          incoming.voice_fallback_url ||
+          configured.voice_fallback_url ||
           purchased.voice_fallback_url ||
           `${apiBaseUrl()}/api/twilio/voice-inbound`,
         statusCallback:
-          incoming.status_callback ||
+          configured.status_callback ||
           purchased.status_callback ||
           `${apiBaseUrl()}/api/twilio/call-status`,
         smsUrl:
-          incoming.sms_url ||
+          configured.sms_url ||
           purchased.sms_url ||
           `${apiBaseUrl()}/api/twilio/sms-inbound`,
         smsFallbackUrl:
-          incoming.sms_fallback_url ||
+          configured.sms_fallback_url ||
           purchased.sms_fallback_url ||
           `${apiBaseUrl()}/api/twilio/sms-inbound`,
-        bundleSid: incoming.bundle_sid || purchased.bundle_sid || null,
-        addressSid: incoming.address_sid || purchased.address_sid || null,
+        bundleSid: configured.bundle_sid || purchased.bundle_sid || null,
+        addressSid: configured.address_sid || purchased.address_sid || null,
       };
+
+      const finalRecommendation = isRecommendedForAutomaticPurchase(
+        normalized,
+        {
+          country,
+          requiresVoice: true,
+          requiresSms: false,
+        },
+      );
+      if (!finalRecommendation.safeForAutomaticPurchase) {
+        let released = false;
+        try {
+          await releaseIncomingNumber({
+            accountSid: account.account_sid,
+            phoneSid: normalized.phoneSid,
+          });
+          released = true;
+        } catch (releaseErr) {
+          console.error(
+            "[twilio-number-purchase] restricted-number release failed",
+            {
+              organizationId,
+              phoneSid: normalized.phoneSid,
+              accountSid: maskSid(account.account_sid),
+              recommendation: finalRecommendation,
+              releaseError: releaseErr?.message || String(releaseErr),
+            },
+          );
+        }
+        return res.status(400).json({
+          error: {
+            code: "NUMBER_NOT_SAFE_FOR_AUTOMATIC_ACTIVATION",
+            message: released
+              ? "Agently rejected and released this number because it did not pass automatic voice-readiness checks. Search again and choose another recommended number."
+              : "Agently rejected this number because it did not pass automatic voice-readiness checks, but could not release it automatically. Please contact support before using it.",
+            recommendation: finalRecommendation,
+            released,
+          },
+        });
+      }
       const saved = await saveNumberRecord(db, {
         organizationId,
         twilioAccountId: account.id || null,
@@ -2887,30 +2830,6 @@ router.post(
         phoneSid: saved.phone_sid,
         source: "purchased",
       });
-
-      let outboundAssignment = null;
-      if (autoAssignedAgent?.id) {
-        try {
-          outboundAssignment = await upsertOutboundNumberAssignment({
-            db,
-            organizationId,
-            number: saved,
-            agent: autoAssignedAgent,
-            direction: "both",
-            isDefaultForAgent: true,
-          });
-        } catch (assignmentErr) {
-          console.warn(
-            "[twilio/numbers/purchase] automatic assignment skipped",
-            {
-              organizationId,
-              numberId: saved.id,
-              agentId: autoAssignedAgent.id,
-              error: assignmentErr.message || String(assignmentErr),
-            },
-          );
-        }
-      }
 
       let voicePermissionResult = null;
       try {
@@ -2953,11 +2872,6 @@ router.post(
         metadata: {
           phoneNumber: saved.phone_number,
           phoneSid: saved.phone_sid,
-          accountSid: account.account_sid,
-          autoAssignedAgentId: autoAssignedAgent?.id || null,
-          outboundAssignmentId: outboundAssignment?.id || null,
-          recommendationStatus:
-            purchaseRecommendation?.recommendationStatus || null,
         },
       });
       let billingEvent = null;
@@ -2979,7 +2893,6 @@ router.post(
             account_sid: account.account_sid,
             country,
             purchase_origin: "in_app_purchase",
-            purchase_recommendation: purchaseRecommendation || null,
           },
         });
       } catch (billingErr) {
@@ -3008,14 +2921,6 @@ router.post(
         number: saved,
         readiness,
         voicePermissionResult,
-        assignment: outboundAssignment,
-        autoAssignedAgent: autoAssignedAgent
-          ? {
-              id: autoAssignedAgent.id,
-              name: autoAssignedAgent.name,
-              direction: autoAssignedAgent.direction,
-            }
-          : null,
         billing: billingEvent?.billing || null,
       });
     } catch (err) {
@@ -3818,9 +3723,9 @@ router.post(
     console.log("[outbound-call] mediaStreamUrl", mediaStreamUrl);
     try {
       const result = await makeOutboundCall({
-        accountSid: number.account_sid || undefined,
         from: number.phone_number,
         to: toPhone,
+        accountSid: number.account_sid || account.account_sid,
         twimlUrl,
         statusCallbackUrl: `${base}/api/twilio/call-status`,
         machineDetection: process.env.OUTBOUND_MACHINE_DETECTION ?? "",
@@ -3850,35 +3755,28 @@ router.post(
       });
     } catch (err) {
       const mapped = mapTwilioError(err, "Could not start outbound call.");
-      console.error("[outbound-call] Twilio call create failed", {
+      console.error("[outbound-call] Twilio call creation failed", {
         organizationId,
         callRecordId: record.id,
         fromNumber: number.phone_number,
-        phoneSid: number.phone_sid || null,
-        accountSidLast4: String(number.account_sid || "").slice(-4),
+        fromAccountSid: maskSid(number.account_sid || account.account_sid),
         to: toPhone,
-        mapped,
+        error: mapped,
       });
       try {
         await updateCallRecordById(record.id, {
           status: "failed",
           metadata: {
             error: mapped,
-            provider_error: mapped,
-            outbound_call_failed_at: new Date().toISOString(),
-            account_sid_last4: String(number.account_sid || "").slice(-4),
+            failureStage: "twilio_call_create",
+            fromNumber: number.phone_number,
+            fromAccountSid: maskSid(number.account_sid || account.account_sid),
+            toPhone,
           },
         });
       } catch (_) {}
       res.status(400).json({
-        error: {
-          ...mapped,
-          diagnostic: {
-            callRecordId: record.id,
-            fromNumber: number.phone_number,
-            accountSidLast4: String(number.account_sid || "").slice(-4),
-          },
-        },
+        error: mapped,
         callPurposeWarning: callPurposeWarning || undefined,
       });
     }
@@ -4102,51 +4000,56 @@ router.post(
   }),
 );
 
-// Search available numbers
+// Search available tenant-purchasable numbers.
+// Keep this GET route for older frontend builds, but use the same strict
+// recommendation filter as the POST route. Never expose restricted/manual-setup
+// numbers to tenant purchases by default.
 router.get(
   "/numbers/search",
   requireAuth,
   asyncHandler(async (req, res) => {
-    const {
-      country = "US",
-      type = "Local",
-      areaCode,
-      contains,
-      limit,
-    } = req.query;
-    const normalizedCountry = normalizeCountry(country || "US");
-    const allowedCountries = sellableNumberCountries();
-    if (!allowedCountries.includes(normalizedCountry)) {
+    const organizationId = req.orgId;
+    const country = normalizeCountry(req.query?.country || "US");
+    const requiresSms = String(req.query?.requiresSms || "false") === "true";
+    const requiresVoice =
+      String(req.query?.requiresVoice || "true") !== "false";
+
+    if (!supportedCountries().includes(country)) {
       return res.status(400).json({
         error: {
           code: "UNSUPPORTED_COUNTRY",
-          message: `Agently is currently limited to low-restriction voice-ready number purchases in: ${allowedCountries.join(", ")}.`,
-          supportedCountries: allowedCountries,
+          message: `Agently is not currently configured to sell numbers in ${country}.`,
+          supportedCountries: supportedCountries(),
         },
       });
     }
 
-    const account = await ensureTenantTwilioAccount({
-      organizationId: req.orgId,
-      organizationName: req.organization?.name,
-      createIfMissing: false,
-    });
-    const numbers = await searchAvailableRecommendedNumbers({
-      accountSid: account.account_sid,
-      country: normalizedCountry,
-      type,
-      areaCode,
-      contains,
-      requiresVoice: true,
-      requiresSms: false,
-      showAdvancedRestrictedNumbers: false,
-      limit: parseInt(limit || "20", 10),
-    });
-    res.json({
-      numbers,
-      supportedCountries: allowedCountries,
-      lowRiskVoiceCountries: lowRiskCountries(),
-    });
+    try {
+      const account = await ensureTenantTwilioAccount({
+        organizationId,
+        organizationName: req.organization?.name,
+        createIfMissing: false,
+      });
+      const numbers = await searchAvailableRecommendedNumbers({
+        accountSid: account.account_sid,
+        country,
+        areaCode: req.query?.areaCode,
+        contains: req.query?.contains,
+        requiresSms,
+        requiresVoice,
+        showAdvancedRestrictedNumbers: false,
+        limit: Number(req.query?.limit || 20),
+        type: req.query?.type || req.query?.numberType || "Local",
+      });
+      res.json({
+        numbers,
+        supportedCountries: supportedCountries(),
+        lowRiskVoiceCountries: lowRiskCountries(),
+      });
+    } catch (err) {
+      const mapped = mapTwilioError(err, "Could not search Twilio numbers.");
+      res.status(400).json({ error: mapped });
+    }
   }),
 );
 
@@ -5825,9 +5728,9 @@ router.post(
 
     try {
       const result = await makeOutboundCall({
-        accountSid: number?.account_sid || undefined,
         from: outboundFromNumber,
         to: toPhone,
+        accountSid: number?.account_sid || undefined,
         twimlUrl,
         statusCallbackUrl: `${apiBase}/api/twilio/call-status`,
         machineDetection: process.env.OUTBOUND_MACHINE_DETECTION ?? "",
@@ -5856,35 +5759,28 @@ router.post(
       });
     } catch (err) {
       const mapped = mapTwilioError(err, "Could not start outbound call.");
-      console.error("[outbound-call] Twilio call create failed", {
+      console.error("[outbound-call] Twilio call creation failed", {
         organizationId: req.orgId,
         callRecordId: record.id,
         fromNumber: outboundFromNumber,
-        phoneSid: number?.phone_sid || null,
-        accountSidLast4: String(number?.account_sid || "").slice(-4),
+        fromAccountSid: maskSid(number?.account_sid || ""),
         to: toPhone,
-        mapped,
+        error: mapped,
       });
       try {
         await updateCallRecordById(record.id, {
           status: "failed",
           metadata: {
             error: mapped,
-            provider_error: mapped,
-            outbound_call_failed_at: new Date().toISOString(),
-            account_sid_last4: String(number?.account_sid || "").slice(-4),
+            failureStage: "twilio_call_create",
+            fromNumber: outboundFromNumber,
+            fromAccountSid: maskSid(number?.account_sid || ""),
+            toPhone,
           },
         });
       } catch (_) {}
       res.status(400).json({
-        error: {
-          ...mapped,
-          diagnostic: {
-            callRecordId: record.id,
-            fromNumber: outboundFromNumber,
-            accountSidLast4: String(number?.account_sid || "").slice(-4),
-          },
-        },
+        error: mapped,
         callPurposeWarning: callPurposeWarning || undefined,
       });
     }
