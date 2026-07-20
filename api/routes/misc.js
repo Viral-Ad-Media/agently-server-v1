@@ -119,14 +119,32 @@ async function loadCustomerWalletSummary(db, organizationId, limit = 150) {
     const { data: txRows } = await db
       .from("billing_wallet_transactions")
       .select(
-        "id,transaction_type,amount_usd,balance_before_usd,balance_after_usd,source,external_id,created_at,metadata",
+        "id,organization_id,transaction_type,amount_usd,balance_before_usd,balance_after_usd,source,external_id,reference_id,created_at,metadata",
       )
       .eq("organization_id", organizationId)
       .order("created_at", { ascending: false })
       .limit(Math.min(Math.max(Number(limit) || 150, 1), 250));
 
-    wallet.recentTransactions = (txRows || []).map((tx) => ({
+    const scopedTxRows = Array.isArray(txRows)
+      ? txRows.filter(
+          (tx) => String(tx.organization_id || "") === String(organizationId),
+        )
+      : [];
+    if (Array.isArray(txRows) && scopedTxRows.length !== txRows.length) {
+      warnThrottled(
+        `billing-wallet-cross-org-${organizationId}`,
+        "[billing] discarded cross-organization wallet transaction rows from customer summary",
+        {
+          organizationId,
+          returned: txRows.length,
+          accepted: scopedTxRows.length,
+        },
+      );
+    }
+
+    wallet.recentTransactions = scopedTxRows.map((tx) => ({
       id: tx.id,
+      organizationId: tx.organization_id,
       type: tx.transaction_type,
       amountUsd: Number(tx.amount_usd || 0),
       balanceBeforeUsd:
@@ -138,7 +156,8 @@ async function loadCustomerWalletSummary(db, organizationId, limit = 150) {
           ? null
           : Number(tx.balance_after_usd || 0),
       source: tx.source || "wallet",
-      externalId: tx.external_id || null,
+      externalId: tx.external_id || tx.reference_id || null,
+      referenceId: tx.reference_id || tx.external_id || null,
       createdAt: tx.created_at,
       metadata: tx.metadata || {},
     }));
@@ -146,14 +165,36 @@ async function loadCustomerWalletSummary(db, organizationId, limit = 150) {
     const { data: chargeRows } = await db
       .from("billing_customer_usage_charges")
       .select(
-        "id,provider,service,event_type,unit,quantity,internal_cost_usd,customer_charge_usd,gross_profit_usd,gross_margin_percent,wallet_transaction_id,created_at,metadata",
+        "id,organization_id,provider,service,event_type,unit,quantity,internal_cost_usd,customer_charge_usd,gross_profit_usd,gross_margin_percent,wallet_transaction_id,created_at,metadata",
       )
       .eq("organization_id", organizationId)
       .order("created_at", { ascending: false })
       .limit(Math.min(Math.max(Number(limit) || 150, 1), 250));
 
-    const recentUsageCharges = (chargeRows || []).map((charge) => ({
+    const scopedChargeRows = Array.isArray(chargeRows)
+      ? chargeRows.filter(
+          (charge) =>
+            String(charge.organization_id || "") === String(organizationId),
+        )
+      : [];
+    if (
+      Array.isArray(chargeRows) &&
+      scopedChargeRows.length !== chargeRows.length
+    ) {
+      warnThrottled(
+        `billing-charge-cross-org-${organizationId}`,
+        "[billing] discarded cross-organization usage charge rows from customer summary",
+        {
+          organizationId,
+          returned: chargeRows.length,
+          accepted: scopedChargeRows.length,
+        },
+      );
+    }
+
+    const recentUsageCharges = scopedChargeRows.map((charge) => ({
       id: charge.id,
+      organizationId: charge.organization_id,
       provider: charge.provider || "usage",
       service: charge.service || "usage",
       eventType: charge.event_type || "usage",
@@ -165,6 +206,7 @@ async function loadCustomerWalletSummary(db, organizationId, limit = 150) {
       metadata: charge.metadata || {},
     }));
 
+    wallet.organizationId = organizationId;
     wallet.recentUsageCharges = recentUsageCharges;
     wallet.totalUsageChargesUsd = recentUsageCharges.reduce(
       (sum, charge) => sum + Number(charge.customerChargeUsd || 0),
