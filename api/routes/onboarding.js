@@ -15,6 +15,35 @@ const {
 
 const router = express.Router();
 
+function queueOnboardingKnowledgeSync({
+  organizationId,
+  knowledgeBaseId,
+  knowledgeSourceId,
+  url,
+}) {
+  if (!organizationId || !knowledgeBaseId || !knowledgeSourceId || !url) return;
+  const run = async () => {
+    try {
+      const { scrapeAndStore } = require("../../lib/scraper.service");
+      await scrapeAndStore({
+        url,
+        organizationId,
+        knowledgeBaseId,
+        knowledgeSourceId,
+        voiceAgentId: null,
+        chatbotId: null,
+      });
+    } catch (error) {
+      console.error(
+        "[onboarding] background website scrape failed:",
+        error?.message || error,
+      );
+    }
+  };
+  if (typeof setImmediate === "function") setImmediate(run);
+  else setTimeout(run, 0);
+}
+
 // Voice name migration for onboarding (legacy names → Twilio names)
 const VOICE_MIGRATE = {
   Zephyr: "Domi",
@@ -372,6 +401,58 @@ router.post(
           })
         : null;
 
+    if (
+      knowledgeBase?.id &&
+      primaryKnowledgeSource?.id &&
+      onboardingOrg.website
+    ) {
+      await db
+        .from("knowledge_sources")
+        .update({
+          scrape_status: "scraping",
+          last_error: null,
+          metadata: {
+            ...(primaryKnowledgeSource.metadata || {}),
+            scrapeProgress: {
+              phase: "queued",
+              currentUrl: onboardingOrg.website,
+              pagesDetected: 1,
+              pagesCompleted: 0,
+              pagesFailed: 0,
+              overallPercent: 0,
+              pages: [
+                {
+                  url: onboardingOrg.website,
+                  title: `${onboardingOrg.name} Website`,
+                  status: "queued",
+                  percent: 0,
+                  error: "",
+                },
+              ],
+              updatedAt: new Date().toISOString(),
+            },
+          },
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", primaryKnowledgeSource.id)
+        .eq("organization_id", orgId);
+      await db
+        .from("knowledge_bases")
+        .update({
+          primary_url: onboardingOrg.website,
+          sync_status: "scraping",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", knowledgeBase.id)
+        .eq("organization_id", orgId);
+      queueOnboardingKnowledgeSync({
+        organizationId: orgId,
+        knowledgeBaseId: knowledgeBase.id,
+        knowledgeSourceId: primaryKnowledgeSource.id,
+        url: onboardingOrg.website,
+      });
+    }
+
     // Determine greeting — use provided or build from agent name + business name
     const agentName = agentConfig.name || "Maya";
     const businessName = profile.name || "our business";
@@ -575,6 +656,7 @@ router.post(
       onboardingAgentCreated: true,
       onboardingWarnings: agentCreateWarnings,
       onboardingFaqsCreated: insertedFaqs.length,
+      onboardingKnowledgeSyncStarted: Boolean(primaryKnowledgeSource?.id),
     });
   }),
 );
