@@ -2,6 +2,7 @@
 
 const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
+const { clearSessionCache, primeSessionCache } = require("../../lib/auth");
 const { requireAuth } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 const { generateFaqsFromWebsite } = require("../../lib/openai");
@@ -364,8 +365,10 @@ router.post(
 
     const resolvedTimezone = resolveOnboardingTimezone(profile);
 
-    // Update org profile
-    await db
+    // Update org profile. This must succeed before we continue, otherwise
+    // the customer can finish the wizard but bootstrap will still load the
+    // original onboarding state.
+    const { error: profileUpdateErr } = await db
       .from("organizations")
       .update({
         name: profile.name || "My Business",
@@ -377,6 +380,23 @@ router.post(
         updated_at: new Date().toISOString(),
       })
       .eq("id", orgId);
+
+    if (profileUpdateErr) {
+      console.error(
+        "[onboarding] organization profile update failed:",
+        profileUpdateErr,
+      );
+      return res.status(500).json({
+        error: {
+          message:
+            "We could not save your business profile. Please retry onboarding.",
+          details:
+            process.env.NODE_ENV !== "production"
+              ? profileUpdateErr.message || String(profileUpdateErr)
+              : undefined,
+        },
+      });
+    }
 
     const onboardingOrg = {
       id: orgId,
@@ -595,7 +615,10 @@ router.post(
     }
 
     // Set as active agent and mark onboarding complete only after the agent exists.
-    await db
+    // Check the update and clear/prime the auth session cache immediately.
+    // Without this, /api/bootstrap can reuse the pre-onboarding cached
+    // organization row for a few seconds and send the user back to step 1.
+    const { error: completeUpdateErr } = await db
       .from("organizations")
       .update({
         active_voice_agent_id: agentRow.id,
@@ -603,6 +626,23 @@ router.post(
         updated_at: new Date().toISOString(),
       })
       .eq("id", orgId);
+
+    if (completeUpdateErr) {
+      console.error(
+        "[onboarding] organization completion update failed:",
+        completeUpdateErr,
+      );
+      return res.status(500).json({
+        error: {
+          message:
+            "We created your first agent but could not mark onboarding as complete. Please retry.",
+          details:
+            process.env.NODE_ENV !== "production"
+              ? completeUpdateErr.message || String(completeUpdateErr)
+              : undefined,
+        },
+      });
+    }
 
     // Create default chatbot (non-blocking — don't fail onboarding if this fails)
     try {
@@ -645,14 +685,44 @@ router.post(
       console.warn("Chatbot creation warning (non-fatal):", chatbotErr.message);
     }
 
-    // Return updated org
-    const { data: updatedOrg } = await db
+    // Return updated org and refresh the in-memory auth cache for this token.
+    const { data: updatedOrg, error: updatedOrgErr } = await db
       .from("organizations")
       .select("*")
       .eq("id", orgId)
       .single();
+
+    if (updatedOrgErr || !updatedOrg) {
+      console.error(
+        "[onboarding] updated organization reload failed:",
+        updatedOrgErr,
+      );
+      clearSessionCache(req.authToken);
+      return res.status(500).json({
+        error: {
+          message:
+            "Onboarding completed, but Agently could not reload your workspace. Please refresh the page.",
+          details:
+            process.env.NODE_ENV !== "production"
+              ? updatedOrgErr?.message ||
+                String(updatedOrgErr || "missing organization")
+              : undefined,
+        },
+      });
+    }
+
+    clearSessionCache(req.authToken);
+    if (req.authToken && req.user) {
+      primeSessionCache(req.authToken, {
+        user: req.user,
+        organization: updatedOrg,
+      });
+    }
+
+    res.setHeader("Cache-Control", "no-store");
     res.json({
       ...updatedOrg,
+      onboarded: true,
       onboardingAgentCreated: true,
       onboardingWarnings: agentCreateWarnings,
       onboardingFaqsCreated: insertedFaqs.length,
