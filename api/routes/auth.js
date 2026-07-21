@@ -1,16 +1,17 @@
 "use strict";
 
 const express = require("express");
+const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
 const { v4: uuidv4 } = require("uuid");
 const { getSupabase } = require("../../lib/supabase");
-const {
-  signToken,
-  primeSessionCache,
-  isMissingRowError,
-} = require("../../lib/auth");
+const { signToken } = require("../../lib/auth");
 const { serializeUser } = require("../../lib/serializers");
-const { sendMagicLinkEmail, sendWelcomeEmail } = require("../../lib/email");
+const {
+  sendMagicLinkEmail,
+  sendPasswordResetEmail,
+  sendWelcomeEmail,
+} = require("../../lib/email");
 const { requireAuth } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 
@@ -26,14 +27,53 @@ function isOrganizationDeletionRequested(org) {
   return deletion && deletion.requested === true;
 }
 
+function createResetToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+function hashResetToken(token) {
+  return crypto
+    .createHash("sha256")
+    .update(String(token || ""))
+    .digest("hex");
+}
+
+function resolveFrontendBaseUrl() {
+  const raw =
+    process.env.PASSWORD_RESET_APP_URL ||
+    process.env.FRONTEND_URL ||
+    process.env.PUBLIC_APP_URL ||
+    process.env.APP_URL ||
+    "https://www.agentlycall.com";
+  const cleaned = String(raw)
+    .split(",")[0]
+    .trim()
+    .replace(/^https\/\//i, "https://")
+    .replace(/^http\/\//i, "http://");
+
+  try {
+    const parsed = new URL(cleaned);
+    const pathname =
+      parsed.pathname && parsed.pathname !== "/"
+        ? parsed.pathname.replace(/\/$/, "")
+        : "";
+    return `${parsed.origin}${pathname}`.replace(/\/$/, "");
+  } catch {
+    return "https://www.agentlycall.com";
+  }
+}
+
+function buildPasswordResetUrl(token) {
+  return `${resolveFrontendBaseUrl()}/#/reset-password?resetToken=${encodeURIComponent(token)}`;
+}
+
 async function getUserOrganization(db, organizationId) {
   if (!organizationId) return null;
-  const { data: org, error } = await db
+  const { data: org } = await db
     .from("organizations")
-    .select("*")
+    .select("id,name,outbound_call_limits")
     .eq("id", organizationId)
-    .maybeSingle();
-  if (error && !isMissingRowError(error)) throw error;
+    .single();
   return org || null;
 }
 
@@ -58,13 +98,11 @@ router.post(
       .from("users")
       .select("id, name, email, role, avatar, password_hash, organization_id")
       .eq("email", email.toLowerCase().trim())
-      .maybeSingle();
-
-    if (error && !isMissingRowError(error)) throw error;
+      .single();
 
     // Use a generic message for both "not found" and "wrong password"
     // to avoid leaking which emails are registered.
-    if (!user || !user.password_hash) {
+    if (error || !user || !user.password_hash) {
       return res
         .status(401)
         .json({ error: { message: "Invalid email or password." } });
@@ -88,19 +126,6 @@ router.post(
     }
 
     const token = signToken({ userId: user.id, orgId: user.organization_id });
-    if (org) {
-      primeSessionCache(token, {
-        user: {
-          id: user.id,
-          name: user.name,
-          email: user.email,
-          role: user.role,
-          avatar: user.avatar,
-          organization_id: user.organization_id,
-        },
-        organization: org,
-      });
-    }
 
     return res.json({ token, user: serializeUser(user) });
   }),
@@ -213,17 +238,6 @@ router.post(
     }
 
     const token = signToken({ userId: user.id, orgId: org.id });
-    primeSessionCache(token, {
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        avatar: user.avatar,
-        organization_id: user.organization_id,
-      },
-      organization: org,
-    });
 
     return res.status(201).json({ token, user: serializeUser(user) });
   }),
@@ -390,21 +404,206 @@ router.post(
       userId: user.id,
       orgId: user.organization_id,
     });
-    if (org) {
-      primeSessionCache(authToken, {
-        user: {
-          id: user.id,
-          name: user.name,
-          email: user.email,
-          role: user.role,
-          avatar: user.avatar,
-          organization_id: user.organization_id,
+
+    return res.json({ token: authToken, user: serializeUser(user) });
+  }),
+);
+
+// ─────────────────────────────────────────────────────────────
+// POST /api/auth/password-reset/request
+// Body: { email: string }
+// Sends a time-limited password reset link when the account exists.
+// The response is intentionally generic so registered emails are not exposed.
+// ─────────────────────────────────────────────────────────────
+router.post(
+  "/password-reset/request",
+  asyncHandler(async (req, res) => {
+    const { email } = req.body || {};
+
+    if (!email || typeof email !== "string") {
+      return res.status(400).json({ error: { message: "Email is required." } });
+    }
+
+    const db = getSupabase();
+    const normalizedEmail = email.toLowerCase().trim();
+    const genericResponse = {
+      message:
+        "If an Agently account exists for that email, password reset instructions have been sent.",
+      email: normalizedEmail,
+      resetUrl: null,
+    };
+
+    const { data: user, error: userErr } = await db
+      .from("users")
+      .select("id, name, email, organization_id")
+      .eq("email", normalizedEmail)
+      .maybeSingle();
+
+    if (userErr) {
+      console.warn(
+        "[password-reset] lookup failed:",
+        userErr.message || userErr,
+      );
+      return res.json(genericResponse);
+    }
+
+    if (!user) {
+      return res.json(genericResponse);
+    }
+
+    const org = await getUserOrganization(db, user.organization_id);
+    if (isOrganizationDeletionRequested(org)) {
+      return res.json(genericResponse);
+    }
+
+    const token = createResetToken();
+    const tokenHash = hashResetToken(token);
+    const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+    const resetUrl = buildPasswordResetUrl(token);
+
+    await db
+      .from("password_reset_tokens")
+      .update({ used: true, used_at: new Date().toISOString() })
+      .eq("user_id", user.id)
+      .eq("used", false);
+
+    const { error: insertErr } = await db.from("password_reset_tokens").insert({
+      user_id: user.id,
+      email: normalizedEmail,
+      token_hash: tokenHash,
+      expires_at: expiresAt,
+    });
+
+    if (insertErr) {
+      console.error("[password-reset] token insert failed:", insertErr);
+      return res.status(500).json({
+        error: {
+          message:
+            "Password reset is not fully configured yet. Please apply the password reset database migration and try again.",
         },
-        organization: org,
       });
     }
 
-    return res.json({ token: authToken, user: serializeUser(user) });
+    try {
+      await sendPasswordResetEmail(normalizedEmail, resetUrl, {
+        organizationId: user.organization_id,
+        userId: user.id,
+        route: "auth.password_reset.request",
+        billable: false,
+      });
+    } catch (emailErr) {
+      console.warn(
+        "[password-reset] email failed:",
+        emailErr.message || emailErr,
+      );
+    }
+
+    return res.json({
+      ...genericResponse,
+      resetUrl: process.env.NODE_ENV !== "production" ? resetUrl : null,
+    });
+  }),
+);
+
+// ─────────────────────────────────────────────────────────────
+// POST /api/auth/password-reset/confirm
+// Body: { token: string, password: string }
+// Consumes a reset token and updates the user's password.
+// ─────────────────────────────────────────────────────────────
+router.post(
+  "/password-reset/confirm",
+  asyncHandler(async (req, res) => {
+    const { token, password } = req.body || {};
+
+    if (!token || typeof token !== "string") {
+      return res
+        .status(400)
+        .json({ error: { message: "Reset token is required." } });
+    }
+
+    if (!password || typeof password !== "string" || password.length < 8) {
+      return res.status(400).json({
+        error: { message: "Password must be at least 8 characters." },
+      });
+    }
+
+    const db = getSupabase();
+    const tokenHash = hashResetToken(token.trim());
+
+    const { data: record, error: tokenErr } = await db
+      .from("password_reset_tokens")
+      .select("id, user_id, email, expires_at, used")
+      .eq("token_hash", tokenHash)
+      .eq("used", false)
+      .maybeSingle();
+
+    if (tokenErr || !record) {
+      return res.status(400).json({
+        error: {
+          message: "This reset link is invalid or has already been used.",
+        },
+      });
+    }
+
+    if (new Date(record.expires_at) < new Date()) {
+      await db
+        .from("password_reset_tokens")
+        .update({ used: true, used_at: new Date().toISOString() })
+        .eq("id", record.id);
+      return res.status(400).json({
+        error: {
+          message: "This reset link has expired. Please request a new one.",
+        },
+      });
+    }
+
+    const { data: user, error: userErr } = await db
+      .from("users")
+      .select("id, organization_id")
+      .eq("id", record.user_id)
+      .maybeSingle();
+
+    if (userErr || !user) {
+      return res.status(400).json({
+        error: { message: "This reset link is no longer valid." },
+      });
+    }
+
+    const org = await getUserOrganization(db, user.organization_id);
+    if (isOrganizationDeletionRequested(org)) {
+      return res.status(403).json({
+        error: {
+          message:
+            "This organization is pending deletion. Access has been disabled while the deletion request is processed.",
+        },
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 12);
+    const now = new Date().toISOString();
+
+    const { error: updateErr } = await db
+      .from("users")
+      .update({ password_hash: passwordHash, updated_at: now })
+      .eq("id", user.id);
+
+    if (updateErr) {
+      console.error("[password-reset] password update failed:", updateErr);
+      return res.status(500).json({
+        error: { message: "Unable to update password. Please try again." },
+      });
+    }
+
+    await db
+      .from("password_reset_tokens")
+      .update({ used: true, used_at: now })
+      .eq("user_id", user.id)
+      .eq("used", false);
+
+    return res.json({
+      success: true,
+      message: "Password updated. You can now sign in with your new password.",
+    });
   }),
 );
 
