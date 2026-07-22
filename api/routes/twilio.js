@@ -88,6 +88,7 @@ const {
   normalizeCountryList,
   evaluateNumberRecommendation,
   isRecommendedForAutomaticPurchase,
+  sellableCountries,
   twilioRequest,
   apiBaseUrl,
   masterSid,
@@ -2094,6 +2095,13 @@ function strictNumberReadinessEnabled() {
   return envBool("OUTBOUND_STRICT_NUMBER_READINESS", false);
 }
 
+// PATCH: first sellable country becomes the search default, so adding a
+// country to TWILIO_SUPPORTED_COUNTRIES needs no code change.
+function defaultSearchCountry() {
+  const list = sellableCountries();
+  return list.includes("US") ? "US" : list[0] || "US";
+}
+
 function defaultOutboundVoiceCountries(country) {
   const raw =
     process.env.TWILIO_LOW_RISK_VOICE_COUNTRIES ||
@@ -2565,9 +2573,12 @@ router.post(
       ["Owner", "Admin"].includes(req.user?.role);
     const requiresSms = !!req.body?.requiresSms;
     const requiresVoice = req.body?.requiresVoice !== false;
-    const country = normalizeCountry(req.body?.country || "US");
+    // PATCH: default to every sellable country instead of hardcoding US.
+    const country = normalizeCountry(
+      req.body?.country || defaultSearchCountry(),
+    );
 
-    if (!supportedCountries().includes(country)) {
+    if (!sellableCountries().includes(country)) {
       return res.status(400).json({
         error: {
           code: "UNSUPPORTED_COUNTRY",
@@ -2597,7 +2608,8 @@ router.post(
       });
       res.json({
         numbers,
-        supportedCountries: supportedCountries(),
+        supportedCountries: sellableCountries(),
+        sellableCountries: sellableCountries(),
         lowRiskVoiceCountries: lowRiskCountries(),
       });
     } catch (err) {
@@ -2753,28 +2765,33 @@ router.post(
 
       const purchaseType = req.body?.type || req.body?.numberType || "Local";
       const exactDigits = phoneDigits(phoneNumber);
-      const candidateDigits = exactDigits.slice(-7) || exactDigits;
-      const safeCandidates = await searchAvailableRecommendedNumbers({
-        accountSid: account.account_sid,
-        country,
-        contains: candidateDigits || undefined,
-        requiresVoice: true,
-        requiresSms: false,
-        showAdvancedRestrictedNumbers: false,
-        limit: 40,
-        type: purchaseType,
-      });
-      const selectedCandidate = safeCandidates.find(
-        (candidate) => phoneDigits(candidate.phoneNumber) === exactDigits,
-      );
-      if (!selectedCandidate) {
-        return res.status(400).json({
-          error: {
-            code: "NUMBER_NOT_SAFE_FOR_AUTOMATIC_ACTIVATION",
-            message:
-              "That number is no longer available or does not pass Agently's automatic voice-readiness rules. Search again and choose a recommended voice number.",
-          },
+      // PATCH: pre-flight is now ADVISORY ONLY and never blocks.
+      // Twilio's availability list is a cache, not a lock. Re-searching with a
+      // 7-digit Contains between search and click frequently returned nothing
+      // for numbers that were perfectly available, rejecting good purchases.
+      // The authoritative gate runs AFTER purchase (below) against what Twilio
+      // actually sold, and releases the number automatically if it fails.
+      let selectedCandidate = null;
+      try {
+        const preflight = await searchAvailableRecommendedNumbers({
+          accountSid: account.account_sid,
+          country,
+          contains: exactDigits.slice(-4) || undefined,
+          requiresVoice: true,
+          requiresSms: false,
+          showAdvancedRestrictedNumbers: false,
+          limit: 40,
+          type: purchaseType,
         });
+        selectedCandidate =
+          preflight.find(
+            (candidate) => phoneDigits(candidate.phoneNumber) === exactDigits,
+          ) || null;
+      } catch (preflightError) {
+        console.warn(
+          "[twilio-number-purchase] pre-flight unavailable, continuing:",
+          preflightError?.message || String(preflightError),
+        );
       }
 
       const purchased = await purchaseIncomingNumber({
@@ -2788,10 +2805,13 @@ router.post(
       try {
         configured = await configureTwilioIncomingNumber(purchased.sid, {
           accountSid: account.account_sid,
+          // PATCH: optional-chain selectedCandidate. When the advisory
+          // pre-flight returns null this used to collapse to false, so SMS
+          // webhooks were never attached even on SMS-capable numbers.
           supportsSms: !!(
             purchased.capabilities?.SMS ||
             purchased.capabilities?.sms ||
-            selectedCandidate.capabilities?.sms
+            selectedCandidate?.capabilities?.sms
           ),
         });
       } catch (configureErr) {
@@ -4135,7 +4155,9 @@ router.get(
   requireAuth,
   asyncHandler(async (req, res) => {
     const organizationId = req.orgId;
-    const country = normalizeCountry(req.query?.country || "US");
+    const country = normalizeCountry(
+      req.query?.country || defaultSearchCountry(),
+    );
     const requiresSms = String(req.query?.requiresSms || "false") === "true";
     const requiresVoice =
       String(req.query?.requiresVoice || "true") !== "false";
@@ -4169,7 +4191,8 @@ router.get(
       });
       res.json({
         numbers,
-        supportedCountries: supportedCountries(),
+        supportedCountries: sellableCountries(),
+        sellableCountries: sellableCountries(),
         lowRiskVoiceCountries: lowRiskCountries(),
       });
     } catch (err) {
@@ -4398,7 +4421,10 @@ router.get(
     if (error) {
       console.error("[twilio/numbers] tenant query failed:", error.message);
       return res.status(500).json({
-        error: { message: "Failed to load this tenant's phone numbers." },
+        error: {
+          message:
+            "We couldn't load your phone numbers. Please refresh and try again.",
+        },
       });
     }
 
@@ -4587,7 +4613,9 @@ router.get(
   requireAuth,
   asyncHandler(async (req, res) => {
     const organizationId = req.orgId;
-    const country = normalizeCountry(req.query?.country || "US");
+    const country = normalizeCountry(
+      req.query?.country || defaultSearchCountry(),
+    );
     const requiresSms = String(req.query?.requiresSms || "false") === "true";
     const requiresVoice =
       String(req.query?.requiresVoice || "true") !== "false";
@@ -4622,7 +4650,8 @@ router.get(
       return res.json({
         success: true,
         numbers,
-        supportedCountries: supportedCountries(),
+        supportedCountries: sellableCountries(),
+        sellableCountries: sellableCountries(),
       });
     } catch (err) {
       const mapped = mapTwilioError(err, "Could not search Twilio numbers.");

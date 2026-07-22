@@ -237,16 +237,55 @@ router.post(
     };
     const openaiVoice = voiceMap[voice] || "alloy";
 
+    // PATCH: tts-1 is deprecated; errors were swallowed with no tenant-visible
+    // reason (the frontend only checked resp.ok, so a 402 credit block looked
+    // identical to a dead button); and previews were never metered.
     const { getOpenAI } = require("../../lib/openai");
     const openai = getOpenAI();
-    const mp3 = await openai.audio.speech.create({
-      model: "tts-1",
-      voice: openaiVoice,
-      input: text,
-    });
 
-    const buffer = Buffer.from(await mp3.arrayBuffer());
+    let buffer;
+    try {
+      const speech = await openai.audio.speech.create({
+        model: process.env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts",
+        voice: openaiVoice,
+        input: String(text).slice(0, 600),
+      });
+      buffer = Buffer.from(await speech.arrayBuffer());
+    } catch (err) {
+      console.error("[messenger/voice-preview]", err?.message || err);
+      return res.status(502).json({
+        error: {
+          code: "VOICE_PREVIEW_FAILED",
+          message:
+            "We couldn't play that voice sample just now. Please try again in a moment.",
+        },
+      });
+    }
+
+    // Meter it. Previews were free to tenants before this.
+    try {
+      const { insertUsageEvent } = require("../../lib/usage-ledger");
+      await insertUsageEvent({
+        organizationId: req.orgId,
+        userId: req.user?.id || null,
+        provider: "openai",
+        service: "tts",
+        eventType: "voice_preview",
+        source: "messenger_voice_preview",
+        externalId: `preview-${Date.now()}`,
+        unit: "character",
+        quantity: String(text).length,
+        metadata: { voice: openaiVoice },
+      });
+    } catch (meterErr) {
+      console.warn(
+        "[messenger/voice-preview] metering skipped:",
+        meterErr?.message,
+      );
+    }
+
     res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Cache-Control", "no-store");
     res.send(buffer);
   }),
 );

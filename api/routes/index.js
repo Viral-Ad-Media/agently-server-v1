@@ -16,6 +16,7 @@ const voiceAgentRoutes = require("./routes/voice-agents");
 const chatbotRoutes = require("./routes/chatbots");
 const chatbotDeployRoutes = require("./routes/chatbot-deploy");
 const messengerRoutes = require("./routes/messenger");
+const knowledgeScrapeRoutes = require("./routes/knowledge-scrape");
 const callsRoutes = require("./routes/calls");
 const leadsRoutes = require("./routes/leads");
 const outreachRoutes = require("./routes/outreach");
@@ -84,6 +85,7 @@ app.use("/api/voice-agents", voiceAgentRoutes);
 app.use("/api/chatbots", chatbotRoutes);
 app.use("/api/chatbots", chatbotDeployRoutes); // /deploy + /deploy-status
 app.use("/api/messenger", messengerRoutes);
+app.use("/api/knowledge-scrape", knowledgeScrapeRoutes);
 app.use("/api/calls", callsRoutes);
 app.use("/api/leads", leadsRoutes);
 app.use("/api/outreach", outreachRoutes);

@@ -441,6 +441,24 @@ router.post(
   }),
 );
 
+// PATCH: powers the warning modal. Read-only. Merges the database view with a
+// live carrier listing so orphaned numbers are surfaced too.
+router.post(
+  "/organizations/:organizationId/teardown-preview",
+  asyncHandler(async (req, res) => {
+    const { previewTenantTeardown } = require("../../lib/tenant-teardown");
+    const preview = await previewTenantTeardown({
+      organizationId: String(req.params.organizationId || "").trim(),
+    });
+    await logSecurityEvent(req, "teardown_preview", true, {
+      adminEmail: req.superAdmin.email,
+      organizationId: req.params.organizationId,
+      numbers: preview.totals.numbers,
+    });
+    res.json(preview);
+  }),
+);
+
 router.delete(
   "/users/:userId",
   asyncHandler(async (req, res) => {
@@ -477,6 +495,52 @@ router.delete(
         },
       });
     }
+    // PATCH: organization-scope deletion now releases the tenant's phone
+    // numbers and closes their subaccount BEFORE wiping the database.
+    // Previously this route made no provider call of any kind, so numbers
+    // stayed rented on the master account and kept billing us forever, with
+    // the only record of their existence deleted in the same request.
+    let teardown = null;
+    if (scope === "organization" && user.organization_id) {
+      const { teardownTenant } = require("../../lib/tenant-teardown");
+      try {
+        teardown = await teardownTenant({
+          organizationId: user.organization_id,
+          userId: user.id,
+          userEmail: user.email || null,
+          confirm: requiredConfirm,
+          adminEmail: req.superAdmin.email,
+          allowPartial: req.body?.allowPartial === true,
+        });
+        await logSecurityEvent(req, "account_deleted", true, {
+          adminEmail: req.superAdmin.email,
+          userId,
+          userEmail: user.email,
+          organizationId: user.organization_id,
+          scope,
+          numbersReleased: teardown.numbers.released,
+          subaccountsClosed: teardown.subaccounts.closed.length,
+        });
+        return res.json({ success: true, scope, ...teardown });
+      } catch (err) {
+        // Deliberately fail CLOSED. A tenant left in the database is
+        // recoverable; a forgotten rented number is not.
+        await logSecurityEvent(req, "account_deleted", false, {
+          adminEmail: req.superAdmin.email,
+          userId,
+          organizationId: user.organization_id,
+          reason: err.message,
+        });
+        return res.status(err.status || 500).json({
+          error: {
+            code: err.code || "TEARDOWN_FAILED",
+            message: err.message,
+            details: err.details || null,
+          },
+        });
+      }
+    }
+
     const { data, error } = await db.rpc(
       "billing_admin_delete_user_or_org_everything",
       {

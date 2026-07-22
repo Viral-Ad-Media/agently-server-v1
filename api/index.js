@@ -215,6 +215,13 @@ safeMount(
   "chatbot-deploy",
 );
 safeMount("/api/messenger", () => require("./routes/messenger"), "messenger");
+// PATCH: discovery -> select -> scrape job flow. Replaces the setImmediate()
+// background scrape, which never completed on Vercel serverless.
+safeMount(
+  "/api/knowledge-scrape",
+  () => require("./routes/knowledge-scrape"),
+  "knowledge-scrape",
+);
 safeMount("/api/calls", () => require("./routes/calls"), "calls");
 safeMount("/api/leads", () => require("./routes/leads"), "leads");
 safeMount("/api/outreach", () => require("./routes/outreach"), "outreach");

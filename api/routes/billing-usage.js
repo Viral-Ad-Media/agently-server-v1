@@ -4036,10 +4036,25 @@ router.post("/wallets/:organizationId/top-up", async (req, res, next) => {
       p_metadata: req.body?.metadata || {},
     });
     if (error) throw error;
+
+    // PATCH: settle accrued debt now that funds exist. This is the
+    // "$0.04 outstanding, +$5 top-up, nothing deducted" fix. Charges whose
+    // wallet_transaction_id is NULL were never retried when credit arrived.
+    // Oldest-first, org-scoped, idempotent, and never blocks the credit.
+    const { settleAfterTopUp } = require("../../lib/wallet-settlement");
+    const settlement = await settleAfterTopUp(organizationId, {
+      reason: "wallet_topup_settlement",
+    });
+
     res.json({
       ok: true,
       source: "billing_admin_top_up_wallet",
       transaction: data,
+      settlement: {
+        chargesSettled: settlement.settledCount || 0,
+        amountSettledUsd: settlement.settledUsd || 0,
+        balanceAfterUsd: settlement.balanceAfterUsd ?? null,
+      },
     });
   } catch (err) {
     next(err);
@@ -4368,10 +4383,22 @@ router.post(
         },
       });
       if (error) throw error;
+
+      // PATCH: same settlement pass. All THREE credit paths must call this or
+      // the bug survives on whichever one was missed.
+      const { settleAfterTopUp } = require("../../lib/wallet-settlement");
+      const settlement = await settleAfterTopUp(organizationId, {
+        reason: "manual_credit_settlement",
+      });
+
       res.json({
         ok: true,
         source: "billing_admin_top_up_wallet",
         transaction: data,
+        settlement: {
+          chargesSettled: settlement.settledCount || 0,
+          amountSettledUsd: settlement.settledUsd || 0,
+        },
       });
     } catch (err) {
       next(err);
@@ -4986,5 +5013,58 @@ router.get(
     });
   },
 );
+
+// ── PATCH: settlement visibility and manual control ────────────────────────
+
+/** Read-only. What does this org owe that was never actually taken? */
+router.get("/wallets/:organizationId/outstanding", async (req, res, next) => {
+  try {
+    const organizationId = cleanOrgId(req.params.organizationId);
+    if (!organizationId)
+      return res
+        .status(400)
+        .json({ error: { message: "organizationId is required." } });
+    const { getOutstandingCharges } = require("../../lib/wallet-settlement");
+    res.json(await getOutstandingCharges(organizationId));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Manual settle. ?dryRun=true previews without writing. */
+router.post("/wallets/:organizationId/settle", async (req, res, next) => {
+  try {
+    const organizationId = cleanOrgId(req.params.organizationId);
+    if (!organizationId)
+      return res
+        .status(400)
+        .json({ error: { message: "organizationId is required." } });
+    const { settleOutstandingCharges } = require("../../lib/wallet-settlement");
+    res.json(
+      await settleOutstandingCharges({
+        organizationId,
+        dryRun: req.query?.dryRun === "true" || req.body?.dryRun === true,
+        reason: "manual_admin_settlement",
+      }),
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Cross-org sweep. Called hourly by the Railway scheduler. */
+router.post("/wallets/settle-all", async (req, res, next) => {
+  try {
+    const { sweepAllOrganizations } = require("../../lib/wallet-settlement");
+    res.json(
+      await sweepAllOrganizations({
+        dryRun: req.query?.dryRun === "true" || req.body?.dryRun === true,
+        maxOrgs: Number(req.body?.maxOrgs || 200),
+      }),
+    );
+  } catch (err) {
+    next(err);
+  }
+});
 
 module.exports = router;
