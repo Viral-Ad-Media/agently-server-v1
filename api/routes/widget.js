@@ -41,6 +41,39 @@ router.get("/:id", async (req, res) => {
 
     // Resolve agent name for the lead tag and system prompt.
     let agentName = chatbot.name || chatbot.header_title || "Assistant";
+
+    /*
+     * ISSUE 4 - "make the chatbot unable to open ... we don't bother the
+     * customers visiting the site by opening the chat interface then saying
+     * that the person is owing"
+     *
+     * Agreed, and the old behaviour was worse than untidy: it leaked the site
+     * OWNER's billing state to their customers. A visitor to greenjuicetribe.com
+     * was shown "Your usage wallet balance is $0.31" - not their balance, not
+     * their business, and not something they should ever see.
+     *
+     * Credit is now checked BEFORE the widget renders. If the workspace is out
+     * of credit the panel never opens; tapping the launcher shows a neutral
+     * notice that says nothing about money.
+     */
+    let serviceHalted = false;
+    try {
+      const {
+        getWalletCreditStatus,
+      } = require("../../lib/billing-credit-enforcement");
+      const creditStatus = await getWalletCreditStatus({
+        organizationId: chatbot.organization_id,
+        action: "chatbot_message",
+      });
+      serviceHalted = creditStatus && creditStatus.allowed === false;
+    } catch (creditErr) {
+      // Never take a working widget offline because the credit check itself
+      // failed. Fail OPEN here; the per-message 402 still protects revenue.
+      console.warn(
+        "[widget] credit precheck skipped:",
+        creditErr && creditErr.message,
+      );
+    }
     if (chatbot.voice_agent_id) {
       try {
         const { data: agent } = await db
@@ -92,6 +125,7 @@ router.get("/:id", async (req, res) => {
       placeholder: safeStr(chatbot.placeholder || "Type your message..."),
       avatarLabel: safeStr(chatbot.avatar_label || "A"),
       position: chatbot.position === "left" ? "left" : "right",
+      serviceHalted: serviceHalted === true,
       suggestedPrompts: JSON.stringify(
         Array.isArray(chatbot.suggested_prompts)
           ? chatbot.suggested_prompts
@@ -222,15 +256,24 @@ function buildWidgetHtml(cfg) {
 <title>${cfg.headerTitle.replace(/\\'/g, "'").replace(/\\n/g, "")}</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-html,body{width:100%;height:100%;overflow:hidden;background:transparent !important;font-family:'Segoe UI',system-ui,-apple-system,sans-serif}
+html,body{width:100%;height:100%;overflow:hidden;background:transparent !important;font-family:'Segoe UI',system-ui,-apple-system,sans-serif;-webkit-text-size-adjust:100%}
+/* ISSUE 5 - the iframe is now sized by the HOST page (chatbot-deploy.js), so
+   everything here simply fills the box it is given. The old fixed 370px panel
+   inside a 90vw iframe is what clipped the left edge on phones. Inputs are
+   16px because iOS force-zooms any focused input below that. */
+@media (max-width:640px){
+  #cw{border-radius:0!important}
+  #ci{font-size:16px!important}
+  .btext{font-size:15px!important}
+}
 body{margin:0!important;padding:0!important;display:block!important;visibility:visible!important}
 body>*:not(#agently-root):not(script){display:none!important}
 :root{--a:${cfg.accentColor};--ad:${cfg.accentColor}cc;--al:${cfg.accentColor}18}
-#agently-root{position:absolute!important;bottom:20px!important;${cfg.position}:20px!important;left:auto;right:auto;width:420px;height:800px;max-width:90vw;max-height:90vh;overflow:visible;display:block!important;visibility:visible!important;z-index:2147483647}
-#launcher{position:absolute;bottom:0;${cfg.position}:20px;width:56px;height:56px;background:var(--a);border-radius:50%;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(0,0,0,.22);color:#fff;z-index:2147483646;transition:transform .2s,box-shadow .2s;}
+#agently-root{position:absolute!important;inset:0!important;width:100%;height:100%;overflow:visible;display:block!important;visibility:visible!important;z-index:2147483647}
+#launcher{position:absolute;bottom:20px;${cfg.position}:20px;width:56px;height:56px;background:var(--a);border-radius:50%;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(0,0,0,.22);color:#fff;z-index:2147483646;transition:transform .2s,box-shadow .2s;}
 #launcher:hover{transform:scale(1.08);box-shadow:0 6px 24px rgba(0,0,0,.28)}
 #launcher svg{pointer-events:none}
-#cw{position:absolute;bottom:68px;${cfg.position}:16px;width:370px;max-width:calc(100vw - 32px);height:580px;max-height:calc(100vh - 104px);background:#fff;border-radius:20px;box-shadow:0 12px 48px rgba(0,0,0,.18),0 2px 8px rgba(0,0,0,.08);display:flex;flex-direction:column;overflow:hidden;z-index:2147483647;transform-origin:bottom ${cfg.position};transition:transform .25s cubic-bezier(.34,1.56,.64,1),opacity .2s;}
+#cw{position:absolute;inset:0;width:100%;height:100%;background:#fff;border-radius:20px;box-shadow:0 12px 48px rgba(0,0,0,.18),0 2px 8px rgba(0,0,0,.08);display:flex;flex-direction:column;overflow:hidden;z-index:2147483647;transform-origin:bottom ${cfg.position};transition:transform .25s cubic-bezier(.34,1.56,.64,1),opacity .2s;}
 #cw.hide{transform:scale(.85) translateY(12px);opacity:0;pointer-events:none}
 .hdr{background:var(--a);color:#fff;padding:14px 16px;display:flex;align-items:center;gap:11px;flex-shrink:0;}
 .av{width:36px;height:36px;border-radius:50%;background:rgba(255,255,255,.22);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:14px;flex-shrink:0;letter-spacing:-.02em;overflow:hidden;}
@@ -389,6 +432,7 @@ body>*:not(#agently-root):not(script){display:none!important}
   window.addEventListener('error', function(e){ console.error('Agently widget runtime error', e && e.message ? e.message : e); });
 
   var CID = '${cfg.chatbotId}';
+  var HALTED = ${cfg.serviceHalted};
   var API = '${cfg.apiUrl}';
   var WELCOME = '${cfg.welcomeMessage}';
   var PLACEHOLDER = '${cfg.placeholder}';
@@ -457,12 +501,41 @@ body>*:not(#agently-root):not(script){display:none!important}
 
   var sessionLoaded = false;
 
+  /*
+   * Tells the HOST page to grow or shrink the iframe. Without this the frame
+   * would stay launcher-sized and the panel would be invisible, or stay
+   * panel-sized and blanket the customer's site while closed. See the
+   * postMessage listener emitted by chatbot-deploy.js.
+   */
+  function notifyParent(type) {
+    try {
+      if (window.parent && window.parent !== window) {
+        window.parent.postMessage({
+          channel: 'agently-widget',
+          widgetId: CID,
+          type: type
+        }, '*');
+      }
+    } catch (e) {}
+  }
+
   function toggle() {
+    // ISSUE 4 - halted workspaces never open the panel. The visitor sees a
+    // neutral notice; nothing about the site owner's balance is disclosed.
+    if (HALTED && !isOpen) {
+      try {
+        window.alert('This chat service has been paused. Please contact us directly, or reach Agently support if you own this site.');
+      } catch (e) {}
+      notifyParent('close');
+      return;
+    }
+
     isOpen = !isOpen;
     cw.classList.toggle('hide', !isOpen);
     launcher.setAttribute('aria-expanded', String(isOpen));
     icoChat.style.display = isOpen ? 'none' : '';
     icoClose.style.display = isOpen ? '' : 'none';
+    notifyParent(isOpen ? 'open' : 'close');
     if (isOpen) {
       if (closeClearTimer) { clearTimeout(closeClearTimer); closeClearTimer = null; }
       if (!sessionLoaded) { sessionLoaded = true; loadSession(); }
@@ -471,6 +544,12 @@ body>*:not(#agently-root):not(script){display:none!important}
     } else {
       scheduleSessionClear();
     }
+  }
+
+  if (HALTED) {
+    launcher.style.opacity = '0.55';
+    launcher.style.cursor = 'not-allowed';
+    launcher.setAttribute('title', 'Chat is temporarily unavailable');
   }
 
   launcher.onclick = toggle;
