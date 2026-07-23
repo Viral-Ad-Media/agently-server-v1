@@ -1080,32 +1080,112 @@ router.put(
       ? String(req.body.voiceAgentId || req.body.voice_agent_id)
       : null;
 
+    // ── FIX: "duplicate key value violates unique constraint uq_faqs_kb_question"
+    //
+    // This delete only removes MANUAL rows, then blindly inserts. Migration 001
+    // added a unique index on (knowledge_base_id, lower(btrim(question))) which
+    // spans every source_type — so saving a manual FAQ whose question matches a
+    // SCRAPED one already in the same KB now aborts the whole save. Editing an
+    // onboarding-generated FAQ hits this every time, which is why the chatbot
+    // page could not be saved at all.
+    //
+    // Two changes:
+    //   1. Deduplicate the incoming payload. The editor can legitimately end up
+    //      with two rows reading "New FAQ question" before either is filled in,
+    //      and a self-collision in one insert batch is otherwise fatal.
+    //   2. Upsert on the unique index instead of insert. A manual edit now
+    //      OVERWRITES the scraped answer for the same question, which is what
+    //      the tenant means when they edit it.
+    const seenQuestions = new Set();
+    const cleanFaqs = [];
+    for (const faq of faqs) {
+      const question = String(faq?.question || "").trim();
+      if (!question) continue;
+      const key = question.toLowerCase();
+      if (seenQuestions.has(key)) continue;
+      seenQuestions.add(key);
+      cleanFaqs.push({ question, answer: String(faq?.answer || "").trim() });
+    }
+
+    // Remove manual rows the tenant deleted in the editor. Scraped rows are
+    // left alone; the upsert below takes them over where questions match.
     let deleteQuery = db
       .from("faqs")
       .delete()
       .eq("organization_id", req.orgId)
       .eq("knowledge_base_id", req.params.id)
       .in("source_type", ["manual", "knowledge_base_manual", "chatbot_manual"]);
+    if (cleanFaqs.length) {
+      deleteQuery = deleteQuery.not(
+        "question",
+        "in",
+        `(${cleanFaqs.map((f) => `"${f.question.replace(/"/g, '""')}"`).join(",")})`,
+      );
+    }
     await deleteQuery;
 
-    if (faqs.length) {
-      const rows = faqs.map((faq) => ({
+    if (cleanFaqs.length) {
+      const rows = cleanFaqs.map((faq) => ({
         organization_id: req.orgId,
         knowledge_base_id: req.params.id,
         voice_agent_id: voiceAgentId,
         question: faq.question,
         answer: faq.answer,
         source_type: "knowledge_base_manual",
+        is_published: true,
         metadata: {
           source: "knowledge_base_manual_editor",
           updatedFrom: sourceEditor,
         },
+        updated_at: new Date().toISOString(),
       }));
-      const { error: insertError } = await db.from("faqs").insert(rows);
+
+      const { error: insertError } = await db.from("faqs").upsert(rows, {
+        onConflict: "knowledge_base_id,question",
+        ignoreDuplicates: false,
+      });
+
       if (insertError) {
-        return res.status(500).json({
-          error: { message: insertError.message || "Failed to save FAQs." },
-        });
+        // The unique index is on lower(btrim(question)), which PostgREST cannot
+        // name as a conflict target. If the upsert is rejected for that reason,
+        // fall back to per-row update-then-insert, which respects the index
+        // without needing to name it.
+        console.warn(
+          "[knowledge-bases] FAQ upsert fell back to per-row:",
+          insertError.message,
+        );
+        for (const row of rows) {
+          const { data: existing } = await db
+            .from("faqs")
+            .select("id")
+            .eq("organization_id", req.orgId)
+            .eq("knowledge_base_id", req.params.id)
+            .ilike("question", row.question)
+            .maybeSingle();
+
+          if (existing?.id) {
+            await db
+              .from("faqs")
+              .update({
+                answer: row.answer,
+                source_type: "knowledge_base_manual",
+                is_published: true,
+                metadata: row.metadata,
+                updated_at: row.updated_at,
+              })
+              .eq("id", existing.id);
+          } else {
+            const { error: rowError } = await db.from("faqs").insert(row);
+            if (rowError && rowError.code !== "23505") {
+              return res.status(500).json({
+                error: {
+                  message:
+                    "We couldn't save your FAQs. Please check for duplicate questions and try again.",
+                },
+              });
+            }
+          }
+        }
       }
     }
 
