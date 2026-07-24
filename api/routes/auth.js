@@ -103,16 +103,28 @@ router.post(
     // Use a generic message for both "not found" and "wrong password"
     // to avoid leaking which emails are registered.
     if (error || !user || !user.password_hash) {
-      return res
-        .status(401)
-        .json({ error: { message: "Invalid email or password." } });
+      // Deliberately identical to the wrong-password response below. Telling
+      // the caller which emails exist would let anyone enumerate your customer
+      // list from the login form. The frontend surfaces a "create an account"
+      // action alongside this, which solves the UX without the leak.
+      return res.status(401).json({
+        error: {
+          code: "INVALID_CREDENTIALS",
+          message:
+            "We couldn't sign you in with those details. Check your email and password, or create an account if you're new.",
+        },
+      });
     }
 
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) {
-      return res
-        .status(401)
-        .json({ error: { message: "Invalid email or password." } });
+      return res.status(401).json({
+        error: {
+          code: "INVALID_CREDENTIALS",
+          message:
+            "We couldn't sign you in with those details. Check your email and password, or create an account if you're new.",
+        },
+      });
     }
 
     const org = await getUserOrganization(db, user.organization_id);
