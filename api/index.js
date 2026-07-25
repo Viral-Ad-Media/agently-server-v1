@@ -6,6 +6,7 @@ try {
 } catch (_) {}
 
 const express = require("express");
+const path = require("path");
 const { errorHandler } = require("../middleware/error");
 const app = express();
 
@@ -113,12 +114,12 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "4mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// Serve the bundled preset chatbot avatars from the same origin as the widget.
-// Uploaded avatars remain stored directly in chatbot.avatar_label as data URIs.
+// Serve bundled chatbot preset avatars from the backend domain.
+// The deployed widget iframe is also served from the backend, so relative
+// /chatbot-avatars/... URLs must resolve here, not on the frontend.
 app.use(
   "/chatbot-avatars",
-  express.static(require("path").join(__dirname, "../public/chatbot-avatars"), {
-    fallthrough: false,
+  express.static(path.join(__dirname, "../public/chatbot-avatars"), {
     maxAge: "30d",
     immutable: true,
   }),
@@ -285,6 +286,11 @@ safeMount(
 );
 
 safeMount("/api", () => require("./routes/misc"), "misc");
+safeMount(
+  "/chatbot-avatar",
+  () => require("./routes/chatbot-avatar"),
+  "chatbot-avatar",
+);
 safeMount("/chatbot-widget", () => require("./routes/widget"), "widget");
 
 // ── Start background billing tracker ────────────────────────────────

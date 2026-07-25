@@ -6,6 +6,12 @@ const { requireAuth, requireAdmin } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 const { serializeChatbot } = require("../../lib/serializers");
 const {
+  CHATBOT_AVATAR_UPLOAD_PREFIX,
+  CHATBOT_AVATAR_URL_PREFIX,
+  buildEmbedForChatbot,
+  getApiBaseUrl,
+} = require("../../lib/chatbot-widget-utils");
+const {
   ensureDefaultKnowledgeBaseForOrg,
   verifyKnowledgeBase,
   assignChatbotKnowledgeBase,
@@ -16,8 +22,6 @@ const {
 // cheerio dep does not take down the entire /api/chatbots router at load time.
 
 const router = express.Router();
-const CHATBOT_AVATAR_UPLOAD_PREFIX = "agently-upload:";
-const CHATBOT_AVATAR_URL_PREFIX = "agently-upload-url:";
 const CHATBOT_AVATAR_BUCKET = process.env.CHATBOT_AVATAR_BUCKET || "chatbot-avatars";
 
 function parseAvatarDataUrl(value) {
@@ -30,7 +34,27 @@ function parseAvatarDataUrl(value) {
   return { buffer: Buffer.from(match[2], "base64"), ext, contentType: ext === "jpg" ? "image/jpeg" : `image/${ext}` };
 }
 
-async function persistChatbotAvatar(db, { organizationId, chatbotId, avatarLabel }) {
+async function ensureAvatarBucket(db) {
+  try {
+    await db.storage.createBucket(CHATBOT_AVATAR_BUCKET, {
+      public: true,
+      fileSizeLimit: 1024 * 1024,
+      allowedMimeTypes: ["image/png", "image/jpeg", "image/webp", "image/gif"],
+    });
+  } catch (_) {}
+
+  // If the bucket already existed as private, createBucket will not change it.
+  // Keep trying to mark it public so the direct Supabase URL works too.
+  try {
+    await db.storage.updateBucket(CHATBOT_AVATAR_BUCKET, {
+      public: true,
+      fileSizeLimit: 1024 * 1024,
+      allowedMimeTypes: ["image/png", "image/jpeg", "image/webp", "image/gif"],
+    });
+  } catch (_) {}
+}
+
+async function persistChatbotAvatar(db, { organizationId, chatbotId, avatarLabel, apiBaseUrl }) {
   const parsed = parseAvatarDataUrl(avatarLabel);
   if (!parsed) return avatarLabel;
   if (parsed.buffer.length > 1024 * 1024) {
@@ -38,36 +62,38 @@ async function persistChatbotAvatar(db, { organizationId, chatbotId, avatarLabel
     error.statusCode = 400;
     throw error;
   }
-  await db.storage.createBucket(CHATBOT_AVATAR_BUCKET, { public: true, fileSizeLimit: 1024 * 1024 }).catch(() => null);
-  const objectPath = `${organizationId}/${chatbotId}/avatar.${parsed.ext}`;
+
+  await ensureAvatarBucket(db);
+
+  const fileName = `avatar.${parsed.ext}`;
+  const objectPath = `${organizationId}/${chatbotId}/${fileName}`;
   const { error: uploadError } = await db.storage
     .from(CHATBOT_AVATAR_BUCKET)
-    .upload(objectPath, parsed.buffer, { contentType: parsed.contentType, upsert: true, cacheControl: "3600" });
-  if (uploadError) throw new Error(`Failed to upload chatbot avatar: ${uploadError.message}`);
+    .upload(objectPath, parsed.buffer, {
+      contentType: parsed.contentType,
+      upsert: true,
+      cacheControl: "3600",
+    });
+  if (uploadError) {
+    const error = new Error(`Failed to upload chatbot avatar: ${uploadError.message}`);
+    error.statusCode = 500;
+    throw error;
+  }
+
+  const apiUrl = String(apiBaseUrl || getApiBaseUrl() || "").replace(/\/+$/, "");
+  if (apiUrl) {
+    return `${CHATBOT_AVATAR_URL_PREFIX}${apiUrl}/chatbot-avatar/${encodeURIComponent(chatbotId)}/${encodeURIComponent(fileName)}?v=${Date.now()}`;
+  }
+
+  // Last-resort fallback for local environments that have not configured API_URL.
   const { data } = db.storage.from(CHATBOT_AVATAR_BUCKET).getPublicUrl(objectPath);
   const publicUrl = data?.publicUrl;
   if (!publicUrl) throw new Error("Chatbot avatar uploaded but no public URL was returned.");
   return `${CHATBOT_AVATAR_URL_PREFIX}${publicUrl}?v=${Date.now()}`;
 }
 
-
-function buildEmbedScript(row) {
-  const apiUrl = (process.env.API_URL || "").replace(/\/$/, "");
-  const widgetUrl = `${apiUrl}/chatbot-widget/${row.id}`;
-  const pos = row.position === "left" ? "left" : "right";
-  const opp = pos === "left" ? "right" : "left";
-  return {
-    widgetUrl,
-    embedScript: `<!-- Agently Chat Widget -->
-<iframe
-  id="agently-widget-${row.id}"
-  src="${widgetUrl}"
-  style="position:fixed;bottom:20px;${pos}:20px;${opp}:auto;width:420px;height:700px;max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);border:none;background:transparent;z-index:2147483646;overflow:hidden;"
-  scrolling="no" frameborder="0"
-  allow="microphone *; camera *; autoplay *; clipboard-write *"
-  title="Chat widget"
-></iframe>`,
-  };
+function buildEmbedScript(row, req) {
+  return buildEmbedForChatbot(row, getApiBaseUrl(req));
 }
 
 // ── POST /api/chatbots ────────────────────────────────────────
@@ -81,7 +107,9 @@ router.post(
     const { embedScript, widgetUrl } = buildEmbedScript({
       id: "temp",
       position: body.position || "right",
-    });
+      chat_languages: body.chatLanguages || ["en"],
+      chat_voice: body.chatVoice || "alloy",
+    }, req);
 
     const requestedKnowledgeBaseId =
       body.knowledgeBaseId || body.knowledge_base_id || null;
@@ -140,7 +168,7 @@ router.post(
 
     // Now compute correct embed with real ID
     const { embedScript: realScript, widgetUrl: realUrl } =
-      buildEmbedScript(chatbot);
+      buildEmbedScript(chatbot, req);
     await db
       .from("chatbots")
       .update({ embed_script: realScript, widget_script_url: realUrl })
@@ -153,6 +181,7 @@ router.post(
         organizationId: req.orgId,
         chatbotId: chatbot.id,
         avatarLabel: body.avatarLabel,
+        apiBaseUrl: getApiBaseUrl(req),
       });
       await db.from("chatbots").update({ avatar_label: savedAvatar }).eq("id", chatbot.id).eq("organization_id", req.orgId);
       chatbot.avatar_label = savedAvatar;
@@ -198,6 +227,7 @@ router.patch(
         organizationId: req.orgId,
         chatbotId: id,
         avatarLabel: body.avatarLabel,
+        apiBaseUrl: getApiBaseUrl(req),
       });
     }
     if (body.customPrompt !== undefined)
@@ -213,8 +243,14 @@ router.patch(
     updates.updated_at = new Date().toISOString();
 
     // Always recompute embed script (position may have changed)
-    const tempRow = { id, position: body.position || "right" };
-    const { embedScript, widgetUrl } = buildEmbedScript(tempRow);
+    const tempRow = {
+      id,
+      name: body.name || "My Chatbot",
+      position: body.position || "right",
+      chat_languages: body.chatLanguages || ["en"],
+      chat_voice: body.chatVoice || "alloy",
+    };
+    const { embedScript, widgetUrl } = buildEmbedScript(tempRow, req);
     updates.embed_script = embedScript;
     updates.widget_script_url = widgetUrl;
 
@@ -437,7 +473,7 @@ router.get(
     if (!chatbot)
       return res.status(404).json({ error: { message: "Chatbot not found." } });
 
-    const { embedScript, widgetUrl } = buildEmbedScript(chatbot);
+    const { embedScript, widgetUrl } = buildEmbedScript(chatbot, req);
     res.json({
       chatbot: serializeChatbot(chatbot),
       script: embedScript,

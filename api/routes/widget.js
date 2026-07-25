@@ -227,34 +227,32 @@ function isSafeDataImageSrc(value) {
   );
 }
 
-function getWidgetAvatarHtml(avatarLabel) {
-  const value = String(avatarLabel || "A");
+function getWidgetAvatarHtml(avatarLabel, fallbackInitial) {
+  const value = String(avatarLabel || "");
+  const initial = escapeHtml(String(fallbackInitial || "A").slice(0, 1).toUpperCase() || "A");
+  const media = (src) => `<span class="av-media"><img src="${escapeHtml(src)}" alt="" loading="eager" decoding="async" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"/><span class="av-fallback">${initial}</span></span>`;
+
   if (value.startsWith(CHATBOT_AVATAR_URL_PREFIX)) {
-    const imageUrl = value.slice(CHATBOT_AVATAR_URL_PREFIX.length);
-    if (/^https:\/\//i.test(imageUrl)) {
-      return `<img src="${escapeHtml(imageUrl)}" alt="" loading="eager" decoding="async" onerror="this.style.display='none';this.nextElementSibling.style.display='inline-flex'"/><span class="avatar-fallback" style="display:none">A</span>`;
+    const imageUrl = value.slice(CHATBOT_AVATAR_URL_PREFIX.length).trim();
+    if (/^https?:\/\//i.test(imageUrl) || imageUrl.startsWith("/chatbot-avatar/")) {
+      return media(imageUrl);
     }
   }
   if (value.startsWith(CHATBOT_AVATAR_UPLOAD_PREFIX)) {
     const dataUri = value.slice(CHATBOT_AVATAR_UPLOAD_PREFIX.length);
-    if (isSafeDataImageSrc(dataUri)) {
-      return `<img src="${escapeHtml(dataUri)}" alt="" loading="eager" decoding="async"/>`;
-    }
+    if (isSafeDataImageSrc(dataUri)) return media(dataUri);
   }
-  if (isSafeDataImageSrc(value)) {
-    return `<img src="${escapeHtml(value)}" alt="" loading="eager" decoding="async"/>`;
-  }
+  if (isSafeDataImageSrc(value)) return media(value);
   if (value.startsWith(CHATBOT_AVATAR_PREFIX)) {
     const avatarId = value.slice(CHATBOT_AVATAR_PREFIX.length);
     const fileName = WIDGET_AVATAR_FILES[avatarId];
-    if (fileName)
-      return `<img src="/chatbot-avatars/${escapeHtml(fileName)}" alt="" loading="eager" decoding="async"/>`;
+    if (fileName) return media(`/chatbot-avatars/${fileName}`);
   }
-  return escapeHtml(value.slice(0, 2).toUpperCase() || "A");
+  return initial;
 }
 
 function buildWidgetHtml(cfg) {
-  const avatarHtml = getWidgetAvatarHtml(cfg.avatarLabel);
+  const avatarHtml = getWidgetAvatarHtml(cfg.avatarLabel, cfg.headerTitle || cfg.agentName || "A");
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -274,32 +272,34 @@ html,body{width:100%;height:100%;overflow:hidden;background:transparent !importa
    margins. Nothing about the desktop appearance is touched. */
 @media (max-width:640px){
   #agently-root{
-    inset:0!important;
-    width:100%!important;height:100%!important;
+    inset:12px!important;
+    width:auto!important;height:auto!important;
     max-width:none!important;max-height:none!important;
   }
   #cw{
     inset:0!important;
     width:100%!important;height:100%!important;
     max-width:none!important;max-height:none!important;
-    border-radius:0!important;
+    border-radius:22px!important;
   }
-  #launcher{position:fixed;bottom:20px;${cfg.position}:20px;}
+  #launcher{position:fixed;bottom:16px;${cfg.position}:16px;}
   #ci{font-size:16px!important}
   .btext{font-size:15px!important}
 }
 body{margin:0!important;padding:0!important;display:block!important;visibility:visible!important}
 body>*:not(#agently-root):not(script){display:none!important}
 :root{--a:${cfg.accentColor};--ad:${cfg.accentColor}cc;--al:${cfg.accentColor}18}
-#agently-root{position:absolute!important;bottom:20px!important;${cfg.position}:20px!important;left:auto;right:auto;width:420px;height:800px;max-width:90vw;max-height:90vh;overflow:visible;display:block!important;visibility:visible!important;z-index:2147483647}
+#agently-root{position:absolute!important;bottom:0!important;${cfg.position}:0!important;left:auto;right:auto;width:100%;height:100%;max-width:none;max-height:none;overflow:visible;display:block!important;visibility:visible!important;z-index:2147483647}
 #launcher{position:absolute;bottom:0;${cfg.position}:20px;width:56px;height:56px;background:var(--a);border-radius:50%;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(0,0,0,.22);color:#fff;z-index:2147483646;transition:transform .2s,box-shadow .2s;}
 #launcher:hover{transform:scale(1.08);box-shadow:0 6px 24px rgba(0,0,0,.28)}
 #launcher svg{pointer-events:none}
-#cw{position:absolute;bottom:68px;${cfg.position}:16px;width:370px;max-width:calc(100vw - 32px);height:580px;max-height:calc(100vh - 104px);background:#fff;border-radius:20px;box-shadow:0 12px 48px rgba(0,0,0,.18),0 2px 8px rgba(0,0,0,.08);display:flex;flex-direction:column;overflow:hidden;z-index:2147483647;transform-origin:bottom ${cfg.position};transition:transform .25s cubic-bezier(.34,1.56,.64,1),opacity .2s;}
+#cw{position:absolute;inset:0;width:100%;height:100%;max-width:none;max-height:none;background:#fff;border-radius:22px;box-shadow:0 12px 48px rgba(0,0,0,.18),0 2px 8px rgba(0,0,0,.08);display:flex;flex-direction:column;overflow:hidden;z-index:2147483647;transform-origin:bottom ${cfg.position};transition:transform .25s cubic-bezier(.34,1.56,.64,1),opacity .2s;}
 #cw.hide{transform:scale(.85) translateY(12px);opacity:0;pointer-events:none}
 .hdr{background:var(--a);color:#fff;padding:14px 16px;display:flex;align-items:center;gap:11px;flex-shrink:0;}
 .av{width:36px;height:36px;border-radius:50%;background:rgba(255,255,255,.22);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:14px;flex-shrink:0;letter-spacing:-.02em;overflow:hidden;}
 .av img{width:100%;height:100%;object-fit:cover;display:block;}
+.av-media{width:100%;height:100%;display:block;position:relative}
+.av-fallback{display:none;width:100%;height:100%;align-items:center;justify-content:center;font-weight:800;font-size:14px;}
 .ht{flex:1;min-width:0}.hn{font-weight:700;font-size:14.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .hs{font-size:11px;opacity:.82;margin-top:1px;display:flex;align-items:center;gap:5px}
 .dot{width:7px;height:7px;background:#4ade80;border-radius:50%;flex-shrink:0;animation:pulse 2s infinite}
