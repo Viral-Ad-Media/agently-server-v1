@@ -170,7 +170,32 @@ router.get(
     const messages = messagesResult.data || [];
 
     // Build global dashboard
-    const dashboard = buildDashboard(org, calls, leads, agentRows[0] || null);
+    // ISSUE 10 - chat messages now feed the dashboard so "Chatbot answers"
+    // reflects real activity instead of sitting at 0. Failure here must not
+    // break bootstrap, so it degrades to an empty list.
+    let chatMessages = [];
+    try {
+      const { data: chatRows } = await db
+        .from("chat_messages")
+        .select("id,role,created_at")
+        .eq("organization_id", req.orgId)
+        .gte(
+          "created_at",
+          new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
+        )
+        .limit(5000);
+      chatMessages = chatRows || [];
+    } catch (chatErr) {
+      console.warn("[bootstrap] chat message stats skipped:", chatErr?.message);
+    }
+
+    const dashboard = buildDashboard(
+      org,
+      calls,
+      leads,
+      agentRows[0] || null,
+      chatMessages,
+    );
 
     // Build per‑agent analytics (only if function exists, otherwise empty array)
     let agentStats = [];

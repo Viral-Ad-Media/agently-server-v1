@@ -261,19 +261,34 @@ html,body{width:100%;height:100%;overflow:hidden;background:transparent !importa
    everything here simply fills the box it is given. The old fixed 370px panel
    inside a 90vw iframe is what clipped the left edge on phones. Inputs are
    16px because iOS force-zooms any focused input below that. */
+/* ISSUE 9 - the desktop panel is back to exactly what it was: a 370x580
+   rounded card floating above the launcher. ONLY phones change, and only
+   because a 370px panel cannot fit a 390px screen with the frame's own
+   margins. Nothing about the desktop appearance is touched. */
 @media (max-width:640px){
-  #cw{border-radius:0!important}
+  #agently-root{
+    inset:0!important;
+    width:100%!important;height:100%!important;
+    max-width:none!important;max-height:none!important;
+  }
+  #cw{
+    inset:0!important;
+    width:100%!important;height:100%!important;
+    max-width:none!important;max-height:none!important;
+    border-radius:0!important;
+  }
+  #launcher{position:fixed;bottom:20px;${cfg.position}:20px;}
   #ci{font-size:16px!important}
   .btext{font-size:15px!important}
 }
 body{margin:0!important;padding:0!important;display:block!important;visibility:visible!important}
 body>*:not(#agently-root):not(script){display:none!important}
 :root{--a:${cfg.accentColor};--ad:${cfg.accentColor}cc;--al:${cfg.accentColor}18}
-#agently-root{position:absolute!important;inset:0!important;width:100%;height:100%;overflow:visible;display:block!important;visibility:visible!important;z-index:2147483647}
-#launcher{position:absolute;bottom:20px;${cfg.position}:20px;width:56px;height:56px;background:var(--a);border-radius:50%;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(0,0,0,.22);color:#fff;z-index:2147483646;transition:transform .2s,box-shadow .2s;}
+#agently-root{position:absolute!important;bottom:20px!important;${cfg.position}:20px!important;left:auto;right:auto;width:420px;height:800px;max-width:90vw;max-height:90vh;overflow:visible;display:block!important;visibility:visible!important;z-index:2147483647}
+#launcher{position:absolute;bottom:0;${cfg.position}:20px;width:56px;height:56px;background:var(--a);border-radius:50%;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(0,0,0,.22);color:#fff;z-index:2147483646;transition:transform .2s,box-shadow .2s;}
 #launcher:hover{transform:scale(1.08);box-shadow:0 6px 24px rgba(0,0,0,.28)}
 #launcher svg{pointer-events:none}
-#cw{position:absolute;inset:0;width:100%;height:100%;background:#fff;border-radius:20px;box-shadow:0 12px 48px rgba(0,0,0,.18),0 2px 8px rgba(0,0,0,.08);display:flex;flex-direction:column;overflow:hidden;z-index:2147483647;transform-origin:bottom ${cfg.position};transition:transform .25s cubic-bezier(.34,1.56,.64,1),opacity .2s;}
+#cw{position:absolute;bottom:68px;${cfg.position}:16px;width:370px;max-width:calc(100vw - 32px);height:580px;max-height:calc(100vh - 104px);background:#fff;border-radius:20px;box-shadow:0 12px 48px rgba(0,0,0,.18),0 2px 8px rgba(0,0,0,.08);display:flex;flex-direction:column;overflow:hidden;z-index:2147483647;transform-origin:bottom ${cfg.position};transition:transform .25s cubic-bezier(.34,1.56,.64,1),opacity .2s;}
 #cw.hide{transform:scale(.85) translateY(12px);opacity:0;pointer-events:none}
 .hdr{background:var(--a);color:#fff;padding:14px 16px;display:flex;align-items:center;gap:11px;flex-shrink:0;}
 .av{width:36px;height:36px;border-radius:50%;background:rgba(255,255,255,.22);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:14px;flex-shrink:0;letter-spacing:-.02em;overflow:hidden;}
