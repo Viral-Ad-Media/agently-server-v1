@@ -113,6 +113,17 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "4mb" }));
 app.use(express.urlencoded({ extended: true }));
 
+// Serve the bundled preset chatbot avatars from the same origin as the widget.
+// Uploaded avatars remain stored directly in chatbot.avatar_label as data URIs.
+app.use(
+  "/chatbot-avatars",
+  express.static(require("path").join(__dirname, "../public/chatbot-avatars"), {
+    fallthrough: false,
+    maxAge: "30d",
+    immutable: true,
+  }),
+);
+
 // ═══════════════════════════════════════════════════════════════
 // HEALTH CHECK + DIAGNOSTIC
 // Hit this endpoint first when debugging — tells you which env

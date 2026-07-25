@@ -30,67 +30,43 @@ const router = express.Router();
 function buildEmbed(chatbot, widgetUrl) {
   const pos = chatbot.position || "right";
   const id = `agently-widget-${chatbot.id}`;
+  const safeName = (chatbot.name || "My Chatbot").replace(/-->/g, "");
 
-  /*
-   * ISSUE 5 — "The size of the chat interface when it opens up on mobile is not
-   * proportional at all to the screen size ... almost as if it is about to enter
-   * into the top-left corner of the screen"
-   *
-   * ROOT CAUSE, and it was structural, not cosmetic:
-   *   The embed was a bare <iframe> with INLINE styles:
-   *       width:420px; height:800px; max-width:90vw; max-height:90vh;
-   *   Inline styles cannot carry media queries, so there was no mobile handling
-   *   anywhere in the chain. On a 390px phone the iframe resolves to 90vw =
-   *   351px, while the panel INSIDE it (#cw) is a fixed 370px. The panel is
-   *   19px wider than its own frame, so its left edge is clipped off — exactly
-   *   what your screenshot shows.
-   *
-   *   It was also 351x760 AT ALL TIMES, even closed: a near-fullscreen
-   *   invisible iframe sitting on top of the customer's site, swallowing taps.
-   *
-   * FIX — two parts, because one alone is not enough:
-   *   1. A <style> block (media queries work here; inline styles never could).
-   *   2. postMessage. The widget tells the parent when it opens and closes, and
-   *      the frame is sized to match: collapsed to just the launcher, expanded
-   *      to a panel on desktop or genuine fullscreen on mobile.
-   *
-   * The listener is namespaced to this widget id and validates the message
-   * origin, so a third-party script on the customer's page cannot resize or
-   * open their chat widget.
-   */
-  return `<!-- Agently Chat Widget for: ${(chatbot.name || "My Chatbot").replace(/-->/g, "")} -->
+  return `<!-- Agently Chat Widget for: ${safeName} -->
 <style>
   #${id}{
     position:fixed;
-    bottom:20px;
-    ${pos === "left" ? "left:20px;right:auto;" : "right:20px;left:auto;"}
-    width:96px;height:96px;
-    border:none;background:transparent;
+    bottom:16px;
+    ${pos === "left" ? "left:16px;right:auto;" : "right:16px;left:auto;"}
+    width:72px;
+    height:72px;
+    border:0;
+    background:transparent;
     z-index:2147483646;
-    overflow:hidden;outline:none;display:block;
-    color-scheme:normal;
-    transition:width .28s cubic-bezier(.34,1.2,.64,1),height .28s cubic-bezier(.34,1.2,.64,1),bottom .28s ease,right .28s ease,left .28s ease,border-radius .28s ease;
+    overflow:visible;
+    outline:none;
+    display:block;
+    border-radius:999px;
+    transition:width .24s ease,height .24s ease,border-radius .24s ease,inset .24s ease;
   }
   #${id}[data-agently-open="true"]{
-    width:404px;height:660px;
-    max-width:calc(100vw - 32px);
-    max-height:calc(100vh - 40px);
+    width:min(390px,calc(100vw - 32px));
+    height:min(640px,calc(100dvh - 32px));
+    border-radius:22px;
+    overflow:hidden;
+    box-shadow:0 18px 54px rgba(15,23,42,.22);
   }
-  /* Phones: the panel takes the whole screen. Anything less gets clipped or
-     forces the customer to pinch-zoom to read a reply. */
   @media (max-width:640px){
     #${id}[data-agently-open="true"]{
-      inset:0 !important;
-      width:100vw !important;
-      height:100vh !important;
-      height:100dvh !important;
-      max-width:none !important;
-      max-height:none !important;
-      border-radius:0 !important;
+      top:12px!important;
+      bottom:12px!important;
+      ${pos === "left" ? "left:12px!important;right:12px!important;" : "right:12px!important;left:12px!important;"}
+      width:auto!important;
+      height:auto!important;
+      max-width:none!important;
+      max-height:none!important;
+      border-radius:22px!important;
     }
-  }
-  @media (max-width:640px) and (display-mode:browser){
-    #${id}[data-agently-open="true"]{ height:100dvh !important; }
   }
 </style>
 <iframe
@@ -106,27 +82,21 @@ function buildEmbed(chatbot, widgetUrl) {
 ></iframe>
 <script>
 (function(){
-  var el = document.getElementById("${id}");
-  if (!el) return;
+  var el=document.getElementById("${id}");
+  if(!el)return;
   var origin;
-  try { origin = new URL("${widgetUrl}").origin; } catch (e) { origin = "*"; }
-
-  window.addEventListener("message", function(ev){
-    // Only accept messages from the widget's own origin and for THIS widget.
-    if (origin !== "*" && ev.origin !== origin) return;
-    var d = ev.data;
-    if (!d || d.channel !== "agently-widget" || d.widgetId !== "${chatbot.id}") return;
-
-    if (d.type === "open")  el.setAttribute("data-agently-open","true");
-    if (d.type === "close") el.removeAttribute("data-agently-open");
-
-    // Locks the host page behind a fullscreen mobile panel so the site does
-    // not scroll underneath the conversation.
-    if (window.matchMedia && window.matchMedia("(max-width:640px)").matches) {
-      document.documentElement.style.overflow = d.type === "open" ? "hidden" : "";
-      document.body.style.overflow = d.type === "open" ? "hidden" : "";
+  try{origin=new URL("${widgetUrl}").origin;}catch(e){origin="*";}
+  window.addEventListener("message",function(ev){
+    if(origin!=="*"&&ev.origin!==origin)return;
+    var d=ev.data;
+    if(!d||d.channel!=="agently-widget"||d.widgetId!=="${chatbot.id}")return;
+    if(d.type==="open")el.setAttribute("data-agently-open","true");
+    if(d.type==="close")el.removeAttribute("data-agently-open");
+    if(window.matchMedia&&window.matchMedia("(max-width:640px)").matches){
+      document.documentElement.style.overflow=d.type==="open"?"hidden":"";
+      document.body.style.overflow=d.type==="open"?"hidden":"";
     }
-  }, false);
+  },false);
 })();
 </script>`;
 }
