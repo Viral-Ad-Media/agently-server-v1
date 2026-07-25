@@ -16,6 +16,40 @@ const {
 // cheerio dep does not take down the entire /api/chatbots router at load time.
 
 const router = express.Router();
+const CHATBOT_AVATAR_UPLOAD_PREFIX = "agently-upload:";
+const CHATBOT_AVATAR_URL_PREFIX = "agently-upload-url:";
+const CHATBOT_AVATAR_BUCKET = process.env.CHATBOT_AVATAR_BUCKET || "chatbot-avatars";
+
+function parseAvatarDataUrl(value) {
+  const raw = String(value || "");
+  if (!raw.startsWith(CHATBOT_AVATAR_UPLOAD_PREFIX)) return null;
+  const dataUrl = raw.slice(CHATBOT_AVATAR_UPLOAD_PREFIX.length);
+  const match = dataUrl.match(/^data:image\/(png|jpeg|jpg|webp);base64,([A-Za-z0-9+/=]+)$/i);
+  if (!match) return null;
+  const ext = match[1].toLowerCase() === "jpeg" ? "jpg" : match[1].toLowerCase();
+  return { buffer: Buffer.from(match[2], "base64"), ext, contentType: ext === "jpg" ? "image/jpeg" : `image/${ext}` };
+}
+
+async function persistChatbotAvatar(db, { organizationId, chatbotId, avatarLabel }) {
+  const parsed = parseAvatarDataUrl(avatarLabel);
+  if (!parsed) return avatarLabel;
+  if (parsed.buffer.length > 1024 * 1024) {
+    const error = new Error("Chatbot avatar must be smaller than 1 MB.");
+    error.statusCode = 400;
+    throw error;
+  }
+  await db.storage.createBucket(CHATBOT_AVATAR_BUCKET, { public: true, fileSizeLimit: 1024 * 1024 }).catch(() => null);
+  const objectPath = `${organizationId}/${chatbotId}/avatar.${parsed.ext}`;
+  const { error: uploadError } = await db.storage
+    .from(CHATBOT_AVATAR_BUCKET)
+    .upload(objectPath, parsed.buffer, { contentType: parsed.contentType, upsert: true, cacheControl: "3600" });
+  if (uploadError) throw new Error(`Failed to upload chatbot avatar: ${uploadError.message}`);
+  const { data } = db.storage.from(CHATBOT_AVATAR_BUCKET).getPublicUrl(objectPath);
+  const publicUrl = data?.publicUrl;
+  if (!publicUrl) throw new Error("Chatbot avatar uploaded but no public URL was returned.");
+  return `${CHATBOT_AVATAR_URL_PREFIX}${publicUrl}?v=${Date.now()}`;
+}
+
 
 function buildEmbedScript(row) {
   const apiUrl = (process.env.API_URL || "").replace(/\/$/, "");
@@ -76,7 +110,7 @@ router.post(
       launcher_label: body.launcherLabel || "Chat",
       accent_color: body.accentColor || "#4f46e5",
       position: body.position || "right",
-      avatar_label: body.avatarLabel || "A",
+      avatar_label: parseAvatarDataUrl(body.avatarLabel) ? "A" : (body.avatarLabel || "A"),
       custom_prompt: body.customPrompt || "",
       suggested_prompts: body.suggestedPrompts || [
         "What are your hours?",
@@ -114,6 +148,16 @@ router.post(
     chatbot.embed_script = realScript;
     chatbot.widget_script_url = realUrl;
 
+    if (parseAvatarDataUrl(body.avatarLabel)) {
+      const savedAvatar = await persistChatbotAvatar(db, {
+        organizationId: req.orgId,
+        chatbotId: chatbot.id,
+        avatarLabel: body.avatarLabel,
+      });
+      await db.from("chatbots").update({ avatar_label: savedAvatar }).eq("id", chatbot.id).eq("organization_id", req.orgId);
+      chatbot.avatar_label = savedAvatar;
+    }
+
     if (selectedKnowledgeBase?.id) {
       await assignChatbotKnowledgeBase(db, {
         organizationId: req.orgId,
@@ -149,7 +193,13 @@ router.patch(
       updates.launcher_label = body.launcherLabel;
     if (body.accentColor !== undefined) updates.accent_color = body.accentColor;
     if (body.position !== undefined) updates.position = body.position;
-    if (body.avatarLabel !== undefined) updates.avatar_label = body.avatarLabel;
+    if (body.avatarLabel !== undefined) {
+      updates.avatar_label = await persistChatbotAvatar(db, {
+        organizationId: req.orgId,
+        chatbotId: id,
+        avatarLabel: body.avatarLabel,
+      });
+    }
     if (body.customPrompt !== undefined)
       updates.custom_prompt = body.customPrompt;
     if (body.suggestedPrompts !== undefined)
