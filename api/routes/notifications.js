@@ -428,22 +428,120 @@ async function ensureDerivedNotifications(db, orgId, userId) {
   }
 }
 
+function notificationReminderDateKey(date = new Date()) {
+  return date.toISOString().slice(0, 10);
+}
+
+function isDuplicateInsert(error) {
+  return (
+    String(error?.code || "") === "23505" ||
+    String(error?.message || "")
+      .toLowerCase()
+      .includes("duplicate key")
+  );
+}
+
+function isMissingReminderTable(error) {
+  const text = `${error?.code || ""} ${error?.message || ""}`.toLowerCase();
+  return (
+    text.includes("42p01") || text.includes("notification_email_reminders")
+  );
+}
+
+async function reserveDailyUnreadReminder(db, req, metrics, threshold) {
+  const now = new Date();
+  const dateKey = notificationReminderDateKey(now);
+  const reminderType = "unread_notifications_daily";
+  const payload = {
+    organization_id: req.orgId,
+    user_id: req.user?.id || null,
+    reminder_type: reminderType,
+    reminder_date: dateKey,
+    unread_count: Number(metrics.unread || 0),
+    sent_to: req.user?.email || "",
+    metadata: {
+      threshold,
+      source: "notifications.unread-threshold",
+      reservedAt: now.toISOString(),
+    },
+  };
+
+  const { data, error } = await db
+    .from("notification_email_reminders")
+    .insert(payload)
+    .select("id")
+    .single();
+
+  if (!error && data?.id)
+    return { reserved: true, reminderId: data.id, tableBacked: true };
+  if (isDuplicateInsert(error))
+    return { reserved: false, reason: "already_sent_today" };
+
+  if (!isMissingReminderTable(error)) {
+    console.warn(
+      "[notifications] reminder reservation failed; suppressing email to avoid spam:",
+      error?.message || error,
+    );
+    return { reserved: false, reason: "reservation_failed" };
+  }
+
+  // Fallback for deployments where the migration has not been applied yet.
+  // This is less race-proof than the unique table, but still prevents the
+  // every-minute email loop for normal traffic.
+  const currentLimits =
+    req.organization?.outbound_call_limits &&
+    typeof req.organization.outbound_call_limits === "object"
+      ? req.organization.outbound_call_limits
+      : {};
+  const reminderState = currentLimits.notification_email_reminders || {};
+  const existing = reminderState[reminderType] || {};
+  if (existing.date === dateKey)
+    return { reserved: false, reason: "already_sent_today" };
+
+  const nextLimits = {
+    ...currentLimits,
+    notification_email_reminders: {
+      ...reminderState,
+      [reminderType]: {
+        date: dateKey,
+        sent_at: now.toISOString(),
+        unread_count: Number(metrics.unread || 0),
+        sent_to: req.user?.email || "",
+        threshold,
+      },
+    },
+  };
+
+  const { error: updateError } = await db
+    .from("organizations")
+    .update({
+      outbound_call_limits: nextLimits,
+      updated_at: now.toISOString(),
+    })
+    .eq("id", req.orgId);
+
+  if (updateError) {
+    console.warn(
+      "[notifications] fallback reminder reservation failed; suppressing email to avoid spam:",
+      updateError.message || updateError,
+    );
+    return { reserved: false, reason: "fallback_failed" };
+  }
+
+  return { reserved: true, reminderId: null, tableBacked: false };
+}
+
 async function maybeSendUnreadThresholdEmail(db, req, metrics) {
   const threshold = Number(process.env.NOTIFICATION_EMAIL_THRESHOLD || 20);
   if (!metrics || Number(metrics.unread || 0) < threshold) return;
 
-  const now = Date.now();
-  const latest = await db
-    .from("tenant_notifications")
-    .select("id,created_at,metadata")
-    .eq("organization_id", req.orgId)
-    .eq("type", "notification_digest_sent")
-    .order("created_at", { ascending: false })
-    .limit(1);
-
-  const last = latest.data && latest.data[0];
-  if (last && now - new Date(last.created_at).getTime() < 24 * 60 * 60 * 1000)
-    return;
+  const reservation = await reserveDailyUnreadReminder(
+    db,
+    req,
+    metrics,
+    threshold,
+  );
+  if (!reservation.reserved) return;
 
   try {
     await sendUnreadNotificationsDigestEmail(
@@ -455,25 +553,67 @@ async function maybeSendUnreadThresholdEmail(db, req, metrics) {
         organizationId: req.orgId,
         userId: req.user?.id,
         route: "notifications.digest",
+        billable: false,
       },
     );
-    await db.from("tenant_notifications").insert({
-      organization_id: req.orgId,
-      user_id: req.user.id,
-      type: "notification_digest_sent",
-      title: "Unread notifications email sent",
-      body: `An email reminder was sent because ${metrics.unread} notifications are unread.`,
-      entity_type: "notification_digest",
-      entity_id: req.orgId,
-      is_read: true,
-      read_at: new Date().toISOString(),
-      metadata: {
-        threshold,
-        unreadCount: metrics.unread,
-        sentTo: req.user.email,
-      },
-    });
+
+    if (reservation.tableBacked && reservation.reminderId) {
+      await db
+        .from("notification_email_reminders")
+        .update({
+          sent_at: new Date().toISOString(),
+          metadata: {
+            threshold,
+            unreadCount: metrics.unread,
+            sentTo: req.user.email,
+            status: "sent",
+          },
+        })
+        .eq("id", reservation.reminderId);
+    }
+
+    await db
+      .from("tenant_notifications")
+      .insert({
+        organization_id: req.orgId,
+        user_id: req.user.id,
+        type: "notification_digest_sent",
+        title: "Unread notifications email sent",
+        body: `An email reminder was sent because ${metrics.unread} notifications are unread.`,
+        entity_type: "notification_digest",
+        entity_id: req.orgId,
+        is_read: true,
+        read_at: new Date().toISOString(),
+        metadata: {
+          threshold,
+          unreadCount: metrics.unread,
+          sentTo: req.user.email,
+          reminderDate: notificationReminderDateKey(),
+        },
+      })
+      .then(
+        () => null,
+        () => null,
+      );
   } catch (error) {
+    if (reservation.tableBacked && reservation.reminderId) {
+      await db
+        .from("notification_email_reminders")
+        .update({
+          metadata: {
+            threshold,
+            unreadCount: metrics.unread,
+            sentTo: req.user.email,
+            status: "send_failed",
+            error: error && error.message ? error.message : String(error),
+          },
+        })
+        .eq("id", reservation.reminderId)
+        .then(
+          () => null,
+          () => null,
+        );
+    }
     console.warn(
       "[notifications] unread threshold email failed:",
       error && error.message ? error.message : error,

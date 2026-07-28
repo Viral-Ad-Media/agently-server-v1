@@ -2,6 +2,7 @@
 
 const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
+const { clearSessionCache, primeSessionCache } = require("../../lib/auth");
 const {
   requireAuth,
   requireAdmin,
@@ -791,27 +792,218 @@ For questions, contact billing@agently.ai
 // SETTINGS
 // ============================================================
 
+function normalizeSettingsString(value, fallback = "") {
+  if (value === undefined || value === null) return fallback;
+  return String(value).replace(/\s+/g, " ").trim();
+}
+
+function normalizeSettingsUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    const withProtocol = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+    const parsed = new URL(withProtocol);
+    return parsed.href.replace(/\/+$/, "");
+  } catch (_) {
+    return raw;
+  }
+}
+
+function domainFromSettingsUrl(value) {
+  try {
+    return new URL(normalizeSettingsUrl(value)).hostname
+      .replace(/^www\./i, "")
+      .toLowerCase();
+  } catch (_) {
+    return "";
+  }
+}
+
+function metadataObject(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return value;
+}
+
+function locationFromKnowledgeBase(row) {
+  const metadata = metadataObject(row?.metadata);
+  const direct = metadata.location;
+  const nested =
+    metadata.businessProfile?.location || metadata.business_profile?.location;
+  return typeof direct === "string"
+    ? direct
+    : typeof nested === "string"
+      ? nested
+      : "";
+}
+
+function serializeOrganizationBusinessProfile(org) {
+  return {
+    id: `organization:${org?.id || "workspace"}`,
+    sourceType: "organization",
+    sourceId: org?.id || "workspace",
+    label: "Workspace business",
+    name: org?.name || "",
+    industry: org?.industry || "",
+    website: org?.website || "",
+    location: org?.location || "",
+    isPrimary: true,
+  };
+}
+
+function serializeKnowledgeBaseBusinessProfile(row, index = 0) {
+  return {
+    id: `knowledgeBase:${row.id}`,
+    sourceType: "knowledgeBase",
+    sourceId: row.id,
+    label: row.is_primary
+      ? "Primary knowledge base"
+      : `Business knowledge base ${index + 1}`,
+    name: row.business_name || row.name || "",
+    industry: row.industry || "",
+    website: row.primary_url || "",
+    location: locationFromKnowledgeBase(row),
+    isPrimary: row.is_primary === true,
+  };
+}
+
+function serializeBusinessProfiles(org, knowledgeBases = []) {
+  const knowledgeBaseProfiles = (knowledgeBases || []).map(
+    serializeKnowledgeBaseBusinessProfile,
+  );
+
+  // In Settings, "business profiles" are the businesses represented by
+  // knowledge bases: Business A -> Knowledge Base A -> website/source A.
+  // Only fall back to the workspace organization profile when the tenant has
+  // not created any knowledge-base businesses yet.
+  if (knowledgeBaseProfiles.length) return knowledgeBaseProfiles;
+
+  return [serializeOrganizationBusinessProfile(org)];
+}
+
+async function loadSettingsKnowledgeBases(db, organizationId) {
+  const { data, error } = await db
+    .from("knowledge_bases")
+    .select(
+      "id,name,business_name,industry,primary_url,metadata,is_primary,created_at,updated_at",
+    )
+    .eq("organization_id", organizationId)
+    .order("is_primary", { ascending: false })
+    .order("created_at", { ascending: true });
+
+  if (error) {
+    console.warn(
+      "[settings] business profile knowledge bases skipped:",
+      error.message || error,
+    );
+    return [];
+  }
+  return data || [];
+}
+
+function serializeSettingsResponse(org, user, knowledgeBases = []) {
+  return {
+    timezone: org?.timezone || "Africa/Lagos",
+    phoneNumber: org?.phone_number || "",
+    account: user ? serializeUser(user) : null,
+    businessProfile: {
+      name: org?.name || "",
+      industry: org?.industry || "",
+      website: org?.website || "",
+      location: org?.location || "",
+      onboarded: org?.onboarded ?? false,
+      timezone: org?.timezone || "Africa/Lagos",
+    },
+    businessProfiles: serializeBusinessProfiles(org, knowledgeBases),
+    twilio: {
+      accountSid: org?.twilio_account_sid || "",
+      authTokenConfigured: !!org?.twilio_auth_token_encrypted,
+      authTokenLastFour: org?.twilio_auth_token_last_four || "",
+      validateRequests: org?.twilio_validate_requests ?? true,
+      webhookBaseUrl: org?.twilio_webhook_base_url || process.env.API_URL || "",
+    },
+  };
+}
+
 // ── GET /api/settings ────────────────────────────────────────
 router.get(
   "/settings",
   requireAuth,
   asyncHandler(async (req, res) => {
     const db = getSupabase();
-    const { data: org } = await db
-      .from("organizations")
-      .select("timezone,phone_number")
-      .eq("id", req.orgId)
-      .single();
+    const [{ data: org }, knowledgeBases] = await Promise.all([
+      db
+        .from("organizations")
+        .select(
+          "id,name,industry,website,location,timezone,phone_number,onboarded,twilio_account_sid,twilio_auth_token_encrypted,twilio_auth_token_last_four,twilio_validate_requests,twilio_webhook_base_url",
+        )
+        .eq("id", req.orgId)
+        .single(),
+      loadSettingsKnowledgeBases(db, req.orgId),
+    ]);
 
-    res.json({
-      timezone: org?.timezone || req.organization?.timezone || "Africa/Lagos",
-      phoneNumber: org?.phone_number || req.organization?.phone_number || "",
-      twilio: {
-        webhookBaseUrl: process.env.API_URL || "",
-      },
-    });
+    res.json(
+      serializeSettingsResponse(
+        org || req.organization,
+        req.user,
+        knowledgeBases,
+      ),
+    );
   }),
 );
+
+function applyBusinessProfileToOrganizationUpdates(profile, updates) {
+  if (!profile || typeof profile !== "object") return;
+  if (profile.name !== undefined) {
+    const nextName = normalizeSettingsString(profile.name);
+    if (!nextName) {
+      const error = new Error("Business name is required.");
+      error.status = 400;
+      throw error;
+    }
+    updates.name = nextName;
+  }
+  if (profile.industry !== undefined)
+    updates.industry = normalizeSettingsString(profile.industry);
+  if (profile.website !== undefined)
+    updates.website = String(profile.website || "").trim();
+  if (profile.location !== undefined)
+    updates.location = normalizeSettingsString(profile.location);
+}
+
+function buildKnowledgeBaseBusinessUpdate(profile) {
+  const updates = { updated_at: new Date().toISOString() };
+  if (profile.name !== undefined) {
+    const nextName = normalizeSettingsString(profile.name);
+    if (!nextName) {
+      const error = new Error(
+        "Business name is required for every business profile.",
+      );
+      error.status = 400;
+      throw error;
+    }
+    updates.business_name = nextName;
+  }
+  if (profile.industry !== undefined)
+    updates.industry = normalizeSettingsString(profile.industry);
+  if (profile.website !== undefined) {
+    const nextUrl = normalizeSettingsUrl(profile.website);
+    updates.primary_url = nextUrl;
+    updates.domain = nextUrl ? domainFromSettingsUrl(nextUrl) : "";
+  }
+  if (profile.location !== undefined) {
+    const location = normalizeSettingsString(profile.location);
+    const metadata = metadataObject(profile.metadata);
+    updates.metadata = {
+      ...metadata,
+      location,
+      businessProfile: {
+        ...(metadata.businessProfile || {}),
+        location,
+      },
+    };
+  }
+  return updates;
+}
 
 // ── PATCH /api/settings ──────────────────────────────────────
 router.patch(
@@ -819,13 +1011,49 @@ router.patch(
   requireAuth,
   requireAdmin,
   asyncHandler(async (req, res) => {
-    const { timezone, phoneNumber, twilio } = req.body;
+    const {
+      timezone,
+      phoneNumber,
+      twilio,
+      account,
+      businessProfile,
+      businessProfiles,
+    } = req.body || {};
 
     const db = getSupabase();
     const updates = {};
+    const knowledgeBaseUpdates = [];
 
-    if (timezone !== undefined) updates.timezone = timezone;
-    if (phoneNumber !== undefined) updates.phone_number = phoneNumber;
+    if (timezone !== undefined)
+      updates.timezone = normalizeSettingsString(
+        timezone,
+        req.organization?.timezone || "Africa/Lagos",
+      );
+    if (phoneNumber !== undefined)
+      updates.phone_number = normalizeSettingsString(phoneNumber);
+
+    try {
+      if (Array.isArray(businessProfiles) && businessProfiles.length) {
+        for (const profile of businessProfiles) {
+          const sourceType = String(profile?.sourceType || "");
+          if (sourceType === "organization") {
+            applyBusinessProfileToOrganizationUpdates(profile, updates);
+          } else if (sourceType === "knowledgeBase" && profile.sourceId) {
+            knowledgeBaseUpdates.push({
+              id: String(profile.sourceId),
+              updates: buildKnowledgeBaseBusinessUpdate(profile),
+            });
+          }
+        }
+      } else if (businessProfile && typeof businessProfile === "object") {
+        applyBusinessProfileToOrganizationUpdates(businessProfile, updates);
+      }
+    } catch (error) {
+      if (Number(error.status) === 400) {
+        return res.status(400).json({ error: { message: error.message } });
+      }
+      throw error;
+    }
 
     if (twilio) {
       if (twilio.clearCredentials) {
@@ -834,38 +1062,154 @@ router.patch(
         updates.twilio_auth_token_last_four = "";
       } else {
         if (twilio.accountSid !== undefined)
-          updates.twilio_account_sid = twilio.accountSid;
+          updates.twilio_account_sid = normalizeSettingsString(
+            twilio.accountSid,
+          );
         if (twilio.authToken) {
           // In production you'd encrypt this; for now store with last 4
           updates.twilio_auth_token_encrypted = twilio.authToken; // Store securely in prod
-          updates.twilio_auth_token_last_four = twilio.authToken.slice(-4);
+          updates.twilio_auth_token_last_four = String(twilio.authToken).slice(
+            -4,
+          );
         }
         if (twilio.validateRequests !== undefined)
           updates.twilio_validate_requests = twilio.validateRequests;
       }
     }
 
+    let updatedUser = req.user;
+    if (account && typeof account === "object") {
+      const userUpdates = {};
+
+      if (account.name !== undefined) {
+        const nextName = normalizeSettingsString(account.name);
+        if (!nextName) {
+          return res.status(400).json({
+            error: { message: "Customer name is required." },
+          });
+        }
+        userUpdates.name = nextName;
+      }
+
+      if (account.email !== undefined) {
+        const nextEmail = String(account.email || "")
+          .trim()
+          .toLowerCase();
+        if (!nextEmail || !/^\S+@\S+\.\S+$/.test(nextEmail)) {
+          return res.status(400).json({
+            error: { message: "Enter a valid account email address." },
+          });
+        }
+
+        const { data: existingUser, error: existingErr } = await db
+          .from("users")
+          .select("id")
+          .eq("email", nextEmail)
+          .neq("id", req.user.id)
+          .maybeSingle();
+
+        if (existingErr) {
+          console.error(
+            "[settings] email uniqueness check failed:",
+            existingErr,
+          );
+          return res.status(500).json({
+            error: { message: "Could not validate this email address." },
+          });
+        }
+
+        if (existingUser) {
+          return res.status(409).json({
+            error: { message: "That email address is already in use." },
+          });
+        }
+
+        userUpdates.email = nextEmail;
+      }
+
+      if (Object.keys(userUpdates).length) {
+        userUpdates.updated_at = new Date().toISOString();
+        const { data: savedUser, error: userErr } = await db
+          .from("users")
+          .update(userUpdates)
+          .eq("id", req.user.id)
+          .eq("organization_id", req.orgId)
+          .select("id,name,email,role,avatar,organization_id")
+          .single();
+
+        if (userErr || !savedUser) {
+          console.error("[settings] user profile update failed:", userErr);
+          return res.status(500).json({
+            error: { message: "Could not update the customer account." },
+          });
+        }
+
+        updatedUser = savedUser;
+      }
+    }
+
     updates.updated_at = new Date().toISOString();
 
-    const { data: org } = await db
+    const { data: org, error: orgErr } = await db
       .from("organizations")
       .update(updates)
       .eq("id", req.orgId)
       .select()
       .single();
 
-    res.json({
-      timezone: org.timezone,
-      phoneNumber: org.phone_number,
-      twilio: {
-        accountSid: org.twilio_account_sid || "",
-        authTokenConfigured: !!org.twilio_auth_token_encrypted,
-        authTokenLastFour: org.twilio_auth_token_last_four || "",
-        validateRequests: org.twilio_validate_requests ?? true,
-        webhookBaseUrl:
-          org.twilio_webhook_base_url || process.env.API_URL || "",
-      },
-    });
+    if (orgErr || !org) {
+      console.error("[settings] organization update failed:", orgErr);
+      return res.status(500).json({
+        error: { message: "Could not update business settings." },
+      });
+    }
+
+    for (const item of knowledgeBaseUpdates) {
+      let nextUpdates = item.updates;
+      if (Object.prototype.hasOwnProperty.call(nextUpdates, "metadata")) {
+        const { data: existingKb } = await db
+          .from("knowledge_bases")
+          .select("metadata")
+          .eq("id", item.id)
+          .eq("organization_id", req.orgId)
+          .maybeSingle();
+        const existingMetadata = metadataObject(existingKb?.metadata);
+        const nextMetadata = metadataObject(nextUpdates.metadata);
+        nextUpdates = {
+          ...nextUpdates,
+          metadata: {
+            ...existingMetadata,
+            ...nextMetadata,
+            businessProfile: {
+              ...(existingMetadata.businessProfile || {}),
+              ...(nextMetadata.businessProfile || {}),
+            },
+          },
+        };
+      }
+
+      const { error: kbErr } = await db
+        .from("knowledge_bases")
+        .update(nextUpdates)
+        .eq("id", item.id)
+        .eq("organization_id", req.orgId);
+
+      if (kbErr) {
+        console.error(
+          "[settings] knowledge base business update failed:",
+          kbErr,
+        );
+        return res.status(500).json({
+          error: { message: "Could not update one of the business profiles." },
+        });
+      }
+    }
+
+    const knowledgeBases = await loadSettingsKnowledgeBases(db, req.orgId);
+    clearSessionCache(req.authToken);
+    primeSessionCache(req.authToken, { user: updatedUser, organization: org });
+
+    res.json(serializeSettingsResponse(org, updatedUser, knowledgeBases));
   }),
 );
 

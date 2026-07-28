@@ -5,7 +5,7 @@ const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
 const { v4: uuidv4 } = require("uuid");
 const { getSupabase } = require("../../lib/supabase");
-const { signToken } = require("../../lib/auth");
+const { signToken, clearSessionCache } = require("../../lib/auth");
 const { serializeUser } = require("../../lib/serializers");
 const {
   sendMagicLinkEmail,
@@ -615,6 +615,82 @@ router.post(
     return res.json({
       success: true,
       message: "Password updated. You can now sign in with your new password.",
+    });
+  }),
+);
+
+// ─────────────────────────────────────────────────────────────
+// POST /api/auth/change-password
+// Body: { currentPassword: string, newPassword: string }
+// Lets a signed-in customer change their own password from Settings.
+// ─────────────────────────────────────────────────────────────
+router.post(
+  "/change-password",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { currentPassword, newPassword } = req.body || {};
+
+    if (
+      !newPassword ||
+      typeof newPassword !== "string" ||
+      newPassword.length < 8
+    ) {
+      return res.status(400).json({
+        error: { message: "New password must be at least 8 characters." },
+      });
+    }
+
+    const db = getSupabase();
+    const { data: user, error: userErr } = await db
+      .from("users")
+      .select("id, organization_id, password_hash")
+      .eq("id", req.user.id)
+      .eq("organization_id", req.orgId)
+      .maybeSingle();
+
+    if (userErr || !user) {
+      return res.status(404).json({
+        error: { message: "User account not found." },
+      });
+    }
+
+    if (user.password_hash) {
+      if (!currentPassword || typeof currentPassword !== "string") {
+        return res.status(400).json({
+          error: { message: "Current password is required." },
+        });
+      }
+
+      const valid = await bcrypt.compare(currentPassword, user.password_hash);
+      if (!valid) {
+        return res.status(401).json({
+          error: { message: "Current password is incorrect." },
+        });
+      }
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+    const { error: updateErr } = await db
+      .from("users")
+      .update({
+        password_hash: passwordHash,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", user.id)
+      .eq("organization_id", req.orgId);
+
+    if (updateErr) {
+      console.error("[change-password] update failed:", updateErr);
+      return res.status(500).json({
+        error: { message: "Unable to update password. Please try again." },
+      });
+    }
+
+    clearSessionCache(req.authToken);
+
+    return res.json({
+      success: true,
+      message: "Password updated successfully.",
     });
   }),
 );

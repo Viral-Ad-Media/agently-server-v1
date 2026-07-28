@@ -6,6 +6,7 @@ const {
   getAssignedKnowledgeBaseIdsForChatbot,
 } = require("../../lib/knowledge-bases");
 const { searchScopedFaqs } = require("../../lib/knowledge-retrieval");
+const { getApiBaseUrl } = require("../../lib/chatbot-widget-utils");
 
 const router = express.Router();
 
@@ -28,7 +29,7 @@ router.get("/:id", async (req, res) => {
 </body></html>`);
     }
 
-    const apiUrl = (process.env.API_URL || "").replace(/\/$/, "");
+    const apiUrl = getApiBaseUrl(req);
     const queryLangs = req.query.langs
       ? String(req.query.langs).split(",").filter(Boolean)
       : null;
