@@ -193,11 +193,35 @@ function safeMount(prefix, loader, label) {
 
 safeMount("/api/auth", () => require("./routes/auth"), "auth");
 safeMount("/api/blog", () => require("./routes/blog"), "blog");
+// PLATFORM ASSISTANT — Agently's own in-app support agent.
+// Mounted BEFORE /api/super-admin so the more specific prefix wins outright.
+// If it were mounted after, every /api/super-admin/platform/* request would
+// first traverse the super-admin router, run requireSuperAdmin, match nothing,
+// and fall through — authenticating twice for no benefit.
+safeMount(
+  "/api/super-admin/platform",
+  () => require("./routes/super-admin-platform"),
+  "super-admin-platform",
+);
+safeMount(
+  "/api/super-admin/tour",
+  () => require("./routes/super-admin-tour"),
+  "super-admin-tour",
+);
 safeMount(
   "/api/super-admin",
   () => require("./routes/super-admin"),
   "super-admin",
 );
+// Tenant-facing (requires a signed-in tenant session, never public).
+safeMount(
+  "/api/platform-assistant",
+  () => require("./routes/platform-assistant"),
+  "platform-assistant",
+);
+// PRODUCT TOUR — per-page onboarding state. Same ordering rule as above: the
+// specific /api/super-admin/tour prefix is mounted before /api/super-admin.
+safeMount("/api/tour", () => require("./routes/tour"), "tour");
 safeMount(
   "/api/blog-automation",
   () => require("./routes/blog-automation"),

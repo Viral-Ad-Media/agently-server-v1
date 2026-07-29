@@ -57,10 +57,27 @@ async function enforcePublicChatbotCredit(res, chatbotId, action) {
   }
   return true;
 }
-function isRateLimited(key) {
+/*
+ * SECURITY FIX — the limiter key was the chatbot id alone, with a shared
+ * budget of 80 requests/minute across every visitor to that tenant's website.
+ * One abusive client therefore consumed the whole allowance and every genuine
+ * customer on the site got 429s: a self-inflicted denial of service on the
+ * tenant, triggered by a single bad actor.
+ *
+ * Now scoped per caller IP as well, with a lower per-IP ceiling and a higher
+ * per-chatbot ceiling. A busy site is unaffected; a single abusive source is
+ * cut off on its own key.
+ */
+function clientIp(req) {
+  const forwarded = String(req.headers["x-forwarded-for"] || "")
+    .split(",")[0]
+    .trim();
+  return forwarded || req.socket?.remoteAddress || req.ip || "unknown";
+}
+
+function isRateLimited(key, max = 80) {
   const now = Date.now(),
-    windowMs = 60000,
-    max = 80;
+    windowMs = 60000;
   const entry = rateLimitMap.get(key) || { count: 0, start: now };
   if (now - entry.start > windowMs) {
     rateLimitMap.set(key, { count: 1, start: now });
@@ -71,6 +88,22 @@ function isRateLimited(key) {
   rateLimitMap.set(key, entry);
   return false;
 }
+
+function isThrottled(req, chatbotId, scope) {
+  return (
+    isRateLimited(`${scope}:ip:${clientIp(req)}:${chatbotId}`, 20) ||
+    isRateLimited(`${scope}:bot:${chatbotId}`, 300)
+  );
+}
+
+// The map is process-global and never shrank. On a warm serverless instance or
+// the long-lived dev server that is an unbounded leak keyed by IP.
+setInterval(() => {
+  const cutoff = Date.now() - 300000;
+  for (const [key, entry] of rateLimitMap) {
+    if (entry.start < cutoff) rateLimitMap.delete(key);
+  }
+}, 300000).unref?.();
 function normalizePhone(phone) {
   return String(phone || "")
     .replace(/[^+0-9]/g, "")
@@ -228,7 +261,7 @@ router.post(
       return res
         .status(400)
         .json({ error: { message: "chatbotId is required." } });
-    if (isRateLimited(`chat:${chatbotId}`))
+    if (isThrottled(req, chatbotId, "chat"))
       return res.status(429).json({
         response:
           "I'm receiving many messages right now. Please try again in a moment.",
@@ -407,7 +440,7 @@ router.post(
         .json({ error: { message: "chatbotId is required." } });
     if (!(await enforcePublicChatbotCredit(res, chatbotId, "voice_call")))
       return;
-    if (isRateLimited(`voice:${chatbotId}`))
+    if (isThrottled(req, chatbotId, "voice"))
       return res
         .status(429)
         .json({ error: { message: "Rate limit exceeded." } });
@@ -544,9 +577,35 @@ router.post(
   }),
 );
 
+/*
+ * SECURITY FIX — this endpoint was unauthenticated and returned the tenant's
+ * organization record, knowledge base profile, and raw scraped chunks for any
+ * chatbot id. Those ids are public: every deployed widget embeds one in its
+ * script tag. Anyone who viewed a customer's page source could read that
+ * customer's entire knowledge base.
+ *
+ * It is now gated behind an internal diagnostic secret. Set
+ * CHATBOT_DEBUG_CONTEXT_SECRET and pass it as ?secret= or x-debug-secret.
+ * With no secret configured the route is disabled outright, which is the
+ * correct default for production.
+ */
+function debugContextAllowed(req) {
+  const configured = String(
+    process.env.CHATBOT_DEBUG_CONTEXT_SECRET || "",
+  ).trim();
+  if (!configured) return false;
+  const supplied = String(
+    req.headers["x-debug-secret"] || req.query.secret || "",
+  ).trim();
+  return supplied.length > 0 && supplied === configured;
+}
+
 router.get(
   "/debug-context/:chatbotId",
   asyncHandler(async (req, res) => {
+    if (!debugContextAllowed(req)) {
+      return res.status(404).json({ error: { message: "Not found." } });
+    }
     const { chatbotId } = req.params;
     const context = await loadChatbotContext(chatbotId);
     const { collectLinks } = require("../../lib/assistant-intelligence");
