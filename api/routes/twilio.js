@@ -448,16 +448,21 @@ function buildRealtimeTwiml({
   const normalizedPurpose =
     precomputedNormalizedPurpose ||
     voiceBehavior.humanizeOutboundPurposeForSpeech(callPurpose || "", 220);
-  const openingGreeting =
-    String(precomputedOpeningGreeting || "").trim() ||
-    preparedOpeningGreetingForCall({
-      agent,
-      organization,
-      direction,
-      recipientName,
-      targetName,
-      callPurpose,
-    });
+  /*
+   * Pre-call intelligence used to win outright here. It now only fills the gap
+   * when nothing is configured — resolveOpeningGreeting() weighs the two in
+   * the correct order internally. Without this, an outbound agent with a
+   * greeting set on the dashboard still opened with a generated line.
+   */
+  const openingGreeting = voiceBehavior.resolveOpeningGreeting({
+    agent,
+    organization,
+    direction,
+    recipientName,
+    targetName,
+    callPurpose,
+    precomputed: precomputedOpeningGreeting,
+  });
   console.log("[context-audit] purpose intent", {
     raw_call_purpose: String(callPurpose || "").slice(0, 240),
     normalized_call_purpose: normalizedPurpose,
@@ -752,28 +757,37 @@ function preparedOpeningGreetingForCall({
     recipientName || targetName || "",
   );
   const outbound = String(direction || "").toLowerCase() === "outbound";
-  const rawGreeting = outbound
-    ? voiceBehavior.buildOutboundGreeting({
-        recipientName: cleanRecipientName,
-        agentName,
-        organizationName,
-        callPurpose,
-      })
-    : voiceBehavior.buildInboundGreeting({ agentName, organizationName });
-  const safeGreeting = outbound
-    ? voiceBehavior.repairOutboundAssistantText(rawGreeting, {
-        direction: "outbound",
-        recipientName: cleanRecipientName,
-        targetName: cleanRecipientName,
-        agentName,
-        organizationName,
-        callPurpose,
-      })
-    : rawGreeting;
-  return String(safeGreeting || "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 420);
+  /*
+   * ROOT CAUSE FIX — the configured greeting was never used.
+   *
+   * This function previously went straight to buildInboundGreeting() /
+   * buildOutboundGreeting(), which synthesise an opening line purely from the
+   * agent and business names. voice_agents.greeting — the field the tenant
+   * actually fills in on the dashboard — was never read. The synthesised line
+   * was then written into BOTH openingGreeting and greetingMessage on the
+   * stream URL, and those parameters outrank the database greeting in the WS
+   * server's merge order. So the dashboard greeting was loaded correctly on
+   * the media server and then immediately shadowed on every single call.
+   *
+   * Worse, when neither name resolved (a knowledge base without a business
+   * name set), the synthesised line collapsed to "Hello, thank you for
+   * calling. How can I help you today?" — no business, no agent, no
+   * introduction. That is the line customers were hearing.
+   *
+   * resolveOpeningGreeting() applies one order everywhere: configured greeting
+   * first, pre-call intelligence second, synthesis last, and an introduction
+   * guaranteed on top of whichever won.
+   */
+  return voiceBehavior.resolveOpeningGreeting({
+    agent,
+    organization,
+    direction,
+    recipientName: cleanRecipientName,
+    targetName: cleanRecipientName,
+    callPurpose,
+    agentName,
+    organizationName,
+  });
 }
 
 // ─────────────────────────────────────────────────────────────

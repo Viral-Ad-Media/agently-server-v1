@@ -125,6 +125,11 @@ router.get("/:id", async (req, res) => {
       ),
       placeholder: safeStr(chatbot.placeholder || "Type your message..."),
       avatarLabel: safeStr(chatbot.avatar_label || "A"),
+      // Raw, unescaped values used for MARKUP (never for the script config).
+      rawAvatarLabel: chatbot.avatar_label || "",
+      rawAvatarDataUri: chatbot.avatar_data_uri || "",
+      rawApiUrl: apiUrl || "",
+      rawChatbotId: id || "",
       position: chatbot.position === "left" ? "left" : "right",
       serviceHalted: serviceHalted === true,
       suggestedPrompts: JSON.stringify(
@@ -228,32 +233,117 @@ function isSafeDataImageSrc(value) {
   );
 }
 
-function getWidgetAvatarHtml(avatarLabel, fallbackInitial) {
-  const value = String(avatarLabel || "");
-  const initial = escapeHtml(String(fallbackInitial || "A").slice(0, 1).toUpperCase() || "A");
-  const media = (src) => `<span class="av-media"><img src="${escapeHtml(src)}" alt="" loading="eager" decoding="async" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"/><span class="av-fallback">${initial}</span></span>`;
+/*
+ * AVATAR RESOLUTION — why the picture never survived deployment.
+ *
+ * Three separate faults, all of which had to go:
+ *
+ *   1. RELATIVE URLS. Both the uploaded-avatar path ("/chatbot-avatar/...")
+ *      and the preset path ("/chatbot-avatars/x.jpg") were emitted relative.
+ *      They resolve against whatever document the <img> ends up in. That is
+ *      fine while the widget is previewed inside the dashboard, and it is why
+ *      this always looked correct in testing — but the moment the markup is
+ *      rendered anywhere with a different base, the request goes to the
+ *      customer's own domain, 404s, and the onerror handler quietly swaps in
+ *      the letter. A silent fallback is exactly what makes this hard to spot.
+ *
+ *   2. blob: URLS. The dashboard creates an object URL for the local preview.
+ *      If that value was ever persisted to avatar_label it matched none of the
+ *      branches below and fell through to the initial. A blob URL is valid
+ *      only inside the tab that created it, so it can never work here.
+ *
+ *   3. DOUBLE ESCAPING. The caller passed cfg.avatarLabel, which had already
+ *      been through safeStr() — an escaper for JavaScript string literals,
+ *      which turns \ into \\ and ' into \'. The value was then HTML-escaped
+ *      again on the way into the src attribute. Any avatar value containing a
+ *      quote or backslash was corrupted before it was ever fetched. This now
+ *      takes the raw column value.
+ *
+ * Every branch returns an absolute https URL or an inline data URI, so the
+ * markup is portable to any origin.
+ */
+function absoluteAvatarUrl(pathOrUrl, apiBase) {
+  const value = String(pathOrUrl || "").trim();
+  if (!value) return "";
+  if (/^https?:\/\//i.test(value)) return value;
+  const base = String(apiBase || "").replace(/\/+$/, "");
+  if (!base) return "";
+  return `${base}${value.startsWith("/") ? "" : "/"}${value}`;
+}
+
+function getWidgetAvatarHtml(avatarLabel, fallbackInitial, options = {}) {
+  const { apiUrl = "", chatbotId = "", avatarDataUri = "" } = options;
+  const value = String(avatarLabel || "").trim();
+  const initial = escapeHtml(
+    String(fallbackInitial || "A")
+      .slice(0, 1)
+      .toUpperCase() || "A",
+  );
+  const media = (src) =>
+    `<span class="av-media"><img src="${escapeHtml(src)}" alt="" loading="eager" decoding="async" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"/><span class="av-fallback">${initial}</span></span>`;
+
+  // Highest priority: a normalised data URI stored on the row. It ships inline
+  // with the markup, so there is no second request and nothing to break.
+  if (isSafeDataImageSrc(avatarDataUri)) return media(avatarDataUri);
 
   if (value.startsWith(CHATBOT_AVATAR_URL_PREFIX)) {
     const imageUrl = value.slice(CHATBOT_AVATAR_URL_PREFIX.length).trim();
-    if (/^https?:\/\//i.test(imageUrl) || imageUrl.startsWith("/chatbot-avatar/")) {
-      return media(imageUrl);
+    // blob: and data-less local references can never resolve off-origin.
+    if (!/^blob:/i.test(imageUrl)) {
+      const absolute = absoluteAvatarUrl(imageUrl, apiUrl);
+      if (absolute) return media(absolute);
     }
   }
+
   if (value.startsWith(CHATBOT_AVATAR_UPLOAD_PREFIX)) {
     const dataUri = value.slice(CHATBOT_AVATAR_UPLOAD_PREFIX.length);
     if (isSafeDataImageSrc(dataUri)) return media(dataUri);
   }
+
   if (isSafeDataImageSrc(value)) return media(value);
+
   if (value.startsWith(CHATBOT_AVATAR_PREFIX)) {
     const avatarId = value.slice(CHATBOT_AVATAR_PREFIX.length);
     const fileName = WIDGET_AVATAR_FILES[avatarId];
-    if (fileName) return media(`/chatbot-avatars/${fileName}`);
+    if (fileName) {
+      const absolute = absoluteAvatarUrl(
+        `/chatbot-avatars/${fileName}`,
+        apiUrl,
+      );
+      if (absolute) return media(absolute);
+    }
   }
+
+  /*
+   * Last resort before the letter: an avatar may have been uploaded to storage
+   * without avatar_label ever being rewritten to point at it. The upload route
+   * serves a fixed filename set, so probing the canonical path costs nothing
+   * and recovers those rows. onerror still guards a miss.
+   */
+  if (chatbotId && apiUrl && !value) {
+    return media(
+      absoluteAvatarUrl(
+        `/chatbot-avatar/${encodeURIComponent(chatbotId)}/avatar.png`,
+        apiUrl,
+      ),
+    );
+  }
+
   return initial;
 }
 
 function buildWidgetHtml(cfg) {
-  const avatarHtml = getWidgetAvatarHtml(cfg.avatarLabel, cfg.headerTitle || cfg.agentName || "A");
+  // cfg.avatarLabel is safeStr-escaped for the inline <script> config block and
+  // must NOT be reused for markup. cfg.rawAvatarLabel is the untouched column.
+  const avatarHtml = getWidgetAvatarHtml(
+    cfg.rawAvatarLabel !== undefined ? cfg.rawAvatarLabel : cfg.avatarLabel,
+    cfg.headerTitle || cfg.agentName || "A",
+    {
+      apiUrl: cfg.rawApiUrl || "",
+      chatbotId: cfg.rawChatbotId || "",
+      avatarDataUri: cfg.rawAvatarDataUri || "",
+    },
+  );
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
