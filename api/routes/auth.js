@@ -14,6 +14,7 @@ const {
 } = require("../../lib/email");
 const { requireAuth } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
+const { buildAppHashUrl } = require("../../lib/app-url");
 
 const router = express.Router();
 
@@ -38,33 +39,10 @@ function hashResetToken(token) {
     .digest("hex");
 }
 
-function resolveFrontendBaseUrl() {
-  const raw =
-    process.env.PASSWORD_RESET_APP_URL ||
-    process.env.FRONTEND_URL ||
-    process.env.PUBLIC_APP_URL ||
-    process.env.APP_URL ||
-    "https://www.agentlycall.com";
-  const cleaned = String(raw)
-    .split(",")[0]
-    .trim()
-    .replace(/^https\/\//i, "https://")
-    .replace(/^http\/\//i, "http://");
-
-  try {
-    const parsed = new URL(cleaned);
-    const pathname =
-      parsed.pathname && parsed.pathname !== "/"
-        ? parsed.pathname.replace(/\/$/, "")
-        : "";
-    return `${parsed.origin}${pathname}`.replace(/\/$/, "");
-  } catch {
-    return "https://www.agentlycall.com";
-  }
-}
-
 function buildPasswordResetUrl(token) {
-  return `${resolveFrontendBaseUrl()}/#/reset-password?resetToken=${encodeURIComponent(token)}`;
+  return buildAppHashUrl(
+    `/reset-password?resetToken=${encodeURIComponent(token)}`,
+  );
 }
 
 async function getUserOrganization(db, organizationId) {
@@ -290,8 +268,7 @@ router.post(
       expires_at: expiresAt,
     });
 
-    const appUrl = (process.env.APP_URL || "http://localhost:3000").trim();
-    const magicLinkUrl = `${appUrl}/#/login?magic=${token}`;
+    const magicLinkUrl = buildAppHashUrl(`/login?magic=${token}`);
 
     // Send the email — non-blocking
     try {

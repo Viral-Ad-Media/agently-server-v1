@@ -8,6 +8,7 @@ try {
 const express = require("express");
 const path = require("path");
 const { errorHandler } = require("../middleware/error");
+const { CANONICAL_APP_URL, isProductionRuntime } = require("../lib/app-url");
 const app = express();
 
 // ═══════════════════════════════════════════════════════════════
@@ -19,10 +20,9 @@ const app = express();
 // ═══════════════════════════════════════════════════════════════
 
 const DEFAULT_ALLOWED_ORIGINS = [
-  "https://agentlycall.vercel.app",
+  CANONICAL_APP_URL,
+  "https://agentlycall.com",
   "https://www.agentlycall.com",
-  // "https://agently-v1.vercel.app",
-  // "https://agently1.vercel.app",
   "http://localhost:3000",
   "http://localhost:5173",
 ];
@@ -53,10 +53,6 @@ function collectAllowedOrigins() {
       [
         ...DEFAULT_ALLOWED_ORIGINS,
         ...splitEnvList(process.env.ALLOWED_ORIGINS),
-        ...splitEnvList(process.env.APP_URL),
-        ...splitEnvList(process.env.FRONTEND_URL),
-        ...splitEnvList(process.env.PUBLIC_FRONTEND_URL),
-        ...splitEnvList(process.env.VITE_APP_URL),
       ]
         .map(normalizeOrigin)
         .filter(Boolean),
@@ -69,7 +65,7 @@ const ALLOWED_ORIGINS = collectAllowedOrigins();
 function isOriginAllowed(origin) {
   const normalizedOrigin = normalizeOrigin(origin);
   if (!normalizedOrigin) return true; // server-to-server / curl
-  if (process.env.NODE_ENV !== "production") return true; // dev: allow all
+  if (!isProductionRuntime()) return true; // local development: allow all
   if (ALLOWED_ORIGINS.length === 0) return true; // preserve existing fallback behavior
   return ALLOWED_ORIGINS.includes(normalizedOrigin);
 }

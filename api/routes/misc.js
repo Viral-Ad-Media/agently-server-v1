@@ -1,6 +1,7 @@
 "use strict";
 
 const express = require("express");
+const { buildAppHashUrl } = require("../../lib/app-url");
 const { getSupabase } = require("../../lib/supabase");
 const { clearSessionCache, primeSessionCache } = require("../../lib/auth");
 const {
@@ -390,10 +391,7 @@ router.post(
         .from("magic_link_tokens")
         .insert({ email: normalizedEmail, token, expires_at: expiresAt });
 
-      const appUrl = (
-        process.env.APP_URL || "https://agently.vercel.app"
-      ).replace(/\/$/, "");
-      const magicLinkUrl = `${appUrl}/#/login?magic=${token}`;
+      const magicLinkUrl = buildAppHashUrl(`/login?magic=${token}`);
 
       await sendTeamInviteEmail(
         normalizedEmail,
