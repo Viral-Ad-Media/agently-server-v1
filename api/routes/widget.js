@@ -344,6 +344,113 @@ function buildWidgetHtml(cfg) {
       avatarDataUri: cfg.rawAvatarDataUri || "",
     },
   );
+  const renderMarkdownScript = String.raw`
+  /* Render a small, safe markdown subset without corrupting generated links. */
+  function renderMd(text) {
+    var source = String(text || '').replace(/\\n/g, '\n').replace(/\r\n?/g, '\n');
+
+    function escapeHtml(value) {
+      return String(value || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function safeHref(value) {
+      try {
+        var parsed = new URL(String(value || ''));
+        return parsed.protocol === 'http:' || parsed.protocol === 'https:'
+          ? parsed.href
+          : '';
+      } catch (e) { return ''; }
+    }
+
+    function inline(value) {
+      var links = [];
+      var raw = String(value || '').replace(/\[([^\]]{1,180})\]\((https?:\/\/[^\s)]+)\)/gi, function(_all, label, url) {
+        var href = safeHref(url);
+        if (!href) return label;
+        var token = 'AGENTLYLINK' + links.length + 'TOKEN';
+        links.push('<a href="' + escapeHtml(href) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(label) + '</a>');
+        return token;
+      });
+
+      raw = escapeHtml(raw)
+        .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+        .replace(/__([^_\n]+)__/g, '<strong>$1</strong>')
+        .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+
+      raw = raw.replace(/https?:\/\/[^\s<]+/gi, function(found) {
+        var trailing = '';
+        while (/[.,!?;:]$/.test(found)) {
+          trailing = found.slice(-1) + trailing;
+          found = found.slice(0, -1);
+        }
+        var href = safeHref(found);
+        return href
+          ? '<a href="' + escapeHtml(href) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(found) + '</a>' + trailing
+          : escapeHtml(found + trailing);
+      });
+
+      for (var i = 0; i < links.length; i += 1) {
+        raw = raw.replace('AGENTLYLINK' + i + 'TOKEN', links[i]);
+      }
+      return raw;
+    }
+
+    var lines = source.split('\n');
+    var out = [];
+    var listType = '';
+    var paragraph = [];
+
+    function flushParagraph() {
+      if (!paragraph.length) return;
+      out.push('<p>' + paragraph.map(inline).join('<br>') + '</p>');
+      paragraph = [];
+    }
+
+    function closeList() {
+      if (!listType) return;
+      out.push('</' + listType + '>');
+      listType = '';
+    }
+
+    for (var i = 0; i < lines.length; i += 1) {
+      var line = String(lines[i] || '');
+      var bullet = line.match(/^\s*[-*+•]\s+(.+)$/);
+      var numbered = line.match(/^\s*(\d+)[.)]\s+(.+)$/);
+      var heading = line.match(/^\s*#{1,4}\s+(.+)$/);
+
+      if (bullet || numbered) {
+        flushParagraph();
+        var nextType = bullet ? 'ul' : 'ol';
+        if (listType && listType !== nextType) closeList();
+        if (!listType) {
+          listType = nextType;
+          out.push('<' + nextType + (numbered && Number(numbered[1]) !== 1 ? ' start="' + Number(numbered[1]) + '"' : '') + '>');
+        }
+        out.push('<li>' + inline(bullet ? bullet[1] : numbered[2]) + '</li>');
+        continue;
+      }
+
+      closeList();
+      if (heading) {
+        flushParagraph();
+        out.push('<p><strong>' + inline(heading[1]) + '</strong></p>');
+      } else if (!line.trim()) {
+        flushParagraph();
+      } else {
+        paragraph.push(line.trim());
+      }
+    }
+
+    flushParagraph();
+    closeList();
+    return out.join('');
+  }
+`;
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -653,7 +760,7 @@ body>*:not(#agently-root):not(script){display:none!important}
       if (closeClearTimer) { clearTimeout(closeClearTimer); closeClearTimer = null; }
       if (!sessionLoaded) { sessionLoaded = true; loadSession(); }
       if (!greeted) { greeted = true; setTimeout(function() { addBotMsg(WELCOME); }, 200); }
-      setTimeout(function() { ci.focus(); }, 250);
+      // Input receives focus only after the visitor taps it.
     } else {
       scheduleSessionClear();
     }
@@ -682,50 +789,7 @@ body>*:not(#agently-root):not(script){display:none!important}
     return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 
-  /* FIX: renderMd properly handles \\n escape sequences and formats output as HTML */
-  function renderMd(text) {
-    var s = String(text || '');
-    // Decode escaped newlines first
-    s = s.replace(/\\\\n/g, '\\n').replace(/\\n/g, '\\n');
-    // Escape HTML
-    s = s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-    // Bold and italic
-    s = s.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>');
-    s = s.replace(/\\*([^\\*\\n]+?)\\*/g, '<em>$1</em>');
-    s = s.replace(/_([^_\\n]+?)_/g, '<em>$1</em>');
-    // Links
-    s = s.replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-    s = s.replace(/(^|\\s)(https?:\\/\\/[^\\s<]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
-    // Lists
-    var lines = s.split('\\n');
-    var out = [];
-    var inUl = false, inOl = false;
-    for (var i = 0; i < lines.length; i++) {
-      var line = lines[i];
-      var ulMatch = line.match(/^[*\\-•] (.+)/);
-      var olMatch = line.match(/^\\d+\\. (.+)/);
-      if (ulMatch) {
-        if (!inUl) { out.push('<ul>'); inUl = true; }
-        if (inOl) { out.push('</ol>'); inOl = false; }
-        out.push('<li>' + ulMatch[1] + '</li>');
-      } else if (olMatch) {
-        if (!inOl) { out.push('<ol>'); inOl = true; }
-        if (inUl) { out.push('</ul>'); inUl = false; }
-        out.push('<li>' + olMatch[1] + '</li>');
-      } else {
-        if (inUl) { out.push('</ul>'); inUl = false; }
-        if (inOl) { out.push('</ol>'); inOl = false; }
-        if (line.trim() === '') {
-          out.push('<br>');
-        } else {
-          out.push('<p>' + line + '</p>');
-        }
-      }
-    }
-    if (inUl) out.push('</ul>');
-    if (inOl) out.push('</ol>');
-    return out.join('');
-  }
+  ${renderMarkdownScript}
 
   var SESS_KEY = 'agently_chat_' + CID;
 

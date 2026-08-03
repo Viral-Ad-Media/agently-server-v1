@@ -52,44 +52,60 @@ async function loadKnowledgeBaseDetails(db, organizationId, knowledgeBaseId) {
     knowledgeBaseId,
   });
   if (!base?.id) return null;
-  const [sources, agentLinks, chatbotLinks] = await Promise.all([
-    safeDb(
-      "knowledge base sources",
-      () =>
-        db
-          .from("knowledge_sources")
-          .select("*")
-          .eq("organization_id", organizationId)
-          .eq("knowledge_base_id", knowledgeBaseId)
-          .order("is_primary", { ascending: false })
-          .order("created_at", { ascending: true }),
-      [],
-    ),
-    safeDb(
-      "knowledge base voice links",
-      () =>
-        db
-          .from("agent_knowledge_base_links")
-          .select("voice_agent_id")
-          .eq("organization_id", organizationId)
-          .eq("knowledge_base_id", knowledgeBaseId),
-      [],
-    ),
-    safeDb(
-      "knowledge base chatbot links",
-      () =>
-        db
-          .from("chatbot_knowledge_base_links")
-          .select("chatbot_id")
-          .eq("organization_id", organizationId)
-          .eq("knowledge_base_id", knowledgeBaseId),
-      [],
-    ),
-  ]);
+  const [sources, agentLinks, chatbotLinks, latestDiscovery] =
+    await Promise.all([
+      safeDb(
+        "knowledge base sources",
+        () =>
+          db
+            .from("knowledge_sources")
+            .select("*")
+            .eq("organization_id", organizationId)
+            .eq("knowledge_base_id", knowledgeBaseId)
+            .order("is_primary", { ascending: false })
+            .order("created_at", { ascending: true }),
+        [],
+      ),
+      safeDb(
+        "knowledge base voice links",
+        () =>
+          db
+            .from("agent_knowledge_base_links")
+            .select("voice_agent_id")
+            .eq("organization_id", organizationId)
+            .eq("knowledge_base_id", knowledgeBaseId),
+        [],
+      ),
+      safeDb(
+        "knowledge base chatbot links",
+        () =>
+          db
+            .from("chatbot_knowledge_base_links")
+            .select("chatbot_id")
+            .eq("organization_id", organizationId)
+            .eq("knowledge_base_id", knowledgeBaseId),
+        [],
+      ),
+      safeDb(
+        "knowledge base latest discovery",
+        () =>
+          db
+            .from("knowledge_page_discoveries")
+            .select("id,status,created_at")
+            .eq("organization_id", organizationId)
+            .eq("knowledge_base_id", knowledgeBaseId)
+            .in("status", ["discovering", "completed"])
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle(),
+        null,
+      ),
+    ]);
   return serializeKnowledgeBase(base, {
     sources: sources || [],
     linkedVoiceAgentIds: (agentLinks || []).map((x) => x.voice_agent_id),
     linkedChatbotIds: (chatbotLinks || []).map((x) => x.chatbot_id),
+    latestDiscoveryId: latestDiscovery?.id || null,
   });
 }
 

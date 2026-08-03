@@ -21,6 +21,9 @@ const {
   getNumberRetentionStatus,
 } = require("../../lib/number-retention");
 const { isAutoWalletChargeEnabled } = require("../../lib/usage-ledger");
+const {
+  buildCustomerBillingActivity,
+} = require("../../lib/customer-billing-activity");
 
 const router = express.Router();
 const dashboardSelectCache = new Map();
@@ -167,7 +170,7 @@ async function loadCustomerWalletSummary(db, organizationId, limit = 150) {
     const { data: chargeRows } = await db
       .from("billing_customer_usage_charges")
       .select(
-        "id,organization_id,provider,service,event_type,unit,quantity,internal_cost_usd,customer_charge_usd,gross_profit_usd,gross_margin_percent,wallet_transaction_id,created_at,metadata",
+        "id,usage_event_id,organization_id,provider,service,event_type,unit,quantity,internal_cost_usd,customer_charge_usd,gross_profit_usd,gross_margin_percent,wallet_transaction_id,source,created_at,metadata",
       )
       .eq("organization_id", organizationId)
       .order("created_at", { ascending: false })
@@ -194,8 +197,26 @@ async function loadCustomerWalletSummary(db, organizationId, limit = 150) {
       );
     }
 
+    const usageEventIds = [
+      ...new Set(
+        scopedChargeRows.map((charge) => charge.usage_event_id).filter(Boolean),
+      ),
+    ];
+    let usageEvents = [];
+    if (usageEventIds.length) {
+      const { data: eventRows, error: usageEventError } = await db
+        .from("billing_usage_events")
+        .select(
+          "id,organization_id,provider,service,event_type,source,external_id,call_id,chatbot_id,voice_agent_id,knowledge_base_id,unit,quantity,billable,occurred_at,metadata",
+        )
+        .eq("organization_id", organizationId)
+        .in("id", usageEventIds);
+      if (!usageEventError && Array.isArray(eventRows)) usageEvents = eventRows;
+    }
+
     const recentUsageCharges = scopedChargeRows.map((charge) => ({
       id: charge.id,
+      usageEventId: charge.usage_event_id || null,
       organizationId: charge.organization_id,
       provider: charge.provider || "usage",
       service: charge.service || "usage",
@@ -210,6 +231,11 @@ async function loadCustomerWalletSummary(db, organizationId, limit = 150) {
 
     wallet.organizationId = organizationId;
     wallet.recentUsageCharges = recentUsageCharges;
+    wallet.recentActivity = buildCustomerBillingActivity({
+      charges: scopedChargeRows,
+      usageEvents,
+      transactions: scopedTxRows,
+    });
     wallet.totalUsageChargesUsd = recentUsageCharges.reduce(
       (sum, charge) => sum + Number(charge.customerChargeUsd || 0),
       0,
@@ -346,53 +372,135 @@ router.post(
     const normalizedEmail = email.toLowerCase().trim();
     const memberName = (name || "").trim() || normalizedEmail.split("@")[0];
 
-    // Check if already a member
+    if (!/^\S+@\S+\.\S+$/.test(normalizedEmail)) {
+      return res
+        .status(400)
+        .json({ error: { message: "Enter a valid email address." } });
+    }
+
+    // A failed email delivery must be retryable. A pending invited user may be
+    // sent a fresh link; a member who already accepted the invitation remains
+    // protected from duplicate invites.
     const { data: existing } = await db
       .from("users")
-      .select("id")
+      .select("id,name,email,role,avatar,organization_id")
       .eq("email", normalizedEmail)
       .eq("organization_id", req.orgId)
-      .single();
+      .maybeSingle();
 
-    if (existing) {
-      return res.status(409).json({
-        error: {
-          message: "This user is already a member of your organization.",
-        },
-      });
-    }
-
-    // Create placeholder user
-    const { data: member, error } = await db
-      .from("users")
-      .insert({
-        organization_id: req.orgId,
-        name: memberName,
-        email: normalizedEmail,
-        role,
-      })
-      .select()
-      .single();
-
-    if (error) {
-      return res
-        .status(500)
-        .json({ error: { message: "Failed to invite team member." } });
-    }
-
-    // Generate a magic link so they can sign in immediately
-    try {
-      const { v4: uuidv4 } = require("uuid");
-      const token = uuidv4().replace(/-/g, "") + uuidv4().replace(/-/g, "");
-      const expiresAt = new Date(
-        Date.now() + 7 * 24 * 60 * 60 * 1000,
-      ).toISOString(); // 7 days
-      await db
+    let member = existing || null;
+    let isResend = false;
+    if (member) {
+      const { data: invitationTokens, error: invitationTokenError } = await db
         .from("magic_link_tokens")
-        .insert({ email: normalizedEmail, token, expires_at: expiresAt });
+        .select("id,used,used_reason,expires_at")
+        .eq("user_id", member.id)
+        .eq("organization_id", req.orgId)
+        .eq("purpose", "team_invite")
+        .order("created_at", { ascending: false })
+        .limit(1);
+      if (invitationTokenError) throw invitationTokenError;
+      const latestInvitation = invitationTokens?.[0] || null;
+      const accepted =
+        latestInvitation?.used === true &&
+        String(latestInvitation?.used_reason || "accepted") !== "superseded";
+      if (!latestInvitation || accepted) {
+        return res.status(409).json({
+          error: {
+            message: "This user is already a member of your organization.",
+          },
+        });
+      }
+
+      const { data: updatedMember, error: updateMemberError } = await db
+        .from("users")
+        .update({
+          name: memberName,
+          role,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", member.id)
+        .eq("organization_id", req.orgId)
+        .select()
+        .single();
+      if (updateMemberError) throw updateMemberError;
+      member = updatedMember;
+      isResend = true;
+    } else {
+      // One email currently maps to one Agently workspace. Detect an account in
+      // another organization explicitly instead of surfacing a generic database
+      // uniqueness error.
+      const { data: accountElsewhere } = await db
+        .from("users")
+        .select("id,organization_id")
+        .eq("email", normalizedEmail)
+        .maybeSingle();
+      if (accountElsewhere && accountElsewhere.organization_id !== req.orgId) {
+        return res.status(409).json({
+          error: {
+            message:
+              "That email already belongs to another Agently workspace. Use a different email for this invitation.",
+          },
+        });
+      }
+
+      const { data: createdMember, error: createMemberError } = await db
+        .from("users")
+        .insert({
+          organization_id: req.orgId,
+          name: memberName,
+          email: normalizedEmail,
+          role,
+        })
+        .select()
+        .single();
+      if (createMemberError || !createdMember) {
+        return res
+          .status(500)
+          .json({ error: { message: "Failed to invite team member." } });
+      }
+      member = createdMember;
+    }
+
+    const { v4: uuidv4 } = require("uuid");
+    const token = uuidv4().replace(/-/g, "") + uuidv4().replace(/-/g, "");
+    const expiresAt = new Date(
+      Date.now() + 7 * 24 * 60 * 60 * 1000,
+    ).toISOString();
+
+    try {
+      // Insert the new token before invalidating an older one. If the database
+      // write or email provider fails, the tenant can retry without stranding
+      // the invited member in an unrecoverable "already exists" state.
+      const { error: tokenError } = await db.from("magic_link_tokens").insert({
+        email: normalizedEmail,
+        token,
+        expires_at: expiresAt,
+        user_id: member.id,
+        organization_id: req.orgId,
+        purpose: "team_invite",
+      });
+      if (tokenError) throw tokenError;
+
+      const { error: invalidateError } = await db
+        .from("magic_link_tokens")
+        .update({
+          used: true,
+          used_reason: "superseded",
+          used_at: new Date().toISOString(),
+        })
+        .eq("email", normalizedEmail)
+        .eq("purpose", "team_invite")
+        .eq("used", false)
+        .neq("token", token);
+      if (invalidateError) {
+        console.warn(
+          "Older team invitation tokens could not be invalidated:",
+          invalidateError.message,
+        );
+      }
 
       const magicLinkUrl = buildAppHashUrl(`/login?magic=${token}`);
-
       await sendTeamInviteEmail(
         normalizedEmail,
         memberName,
@@ -406,11 +514,21 @@ router.post(
           route: "team.invite",
         },
       );
-    } catch (e) {
-      console.warn("Invite email failed:", e.message);
+    } catch (error) {
+      console.error("Invite email failed:", error?.message || error);
+      return res.status(502).json({
+        error: {
+          code: "INVITE_DELIVERY_FAILED",
+          message:
+            "The member was saved, but the invitation email could not be delivered. Retry the invitation to send a fresh link.",
+        },
+      });
     }
 
-    res.status(201).json({ member: serializeUser(member) });
+    res.status(isResend ? 200 : 201).json({
+      member: serializeUser(member),
+      invitation: { status: "sent", expiresAt, resent: isResend },
+    });
   }),
 );
 

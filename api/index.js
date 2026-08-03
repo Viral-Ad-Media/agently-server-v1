@@ -50,10 +50,7 @@ function normalizeOrigin(value) {
 function collectAllowedOrigins() {
   return Array.from(
     new Set(
-      [
-        ...DEFAULT_ALLOWED_ORIGINS,
-        ...splitEnvList(process.env.ALLOWED_ORIGINS),
-      ]
+      [...DEFAULT_ALLOWED_ORIGINS, ...splitEnvList(process.env.ALLOWED_ORIGINS)]
         .map(normalizeOrigin)
         .filter(Boolean),
     ),

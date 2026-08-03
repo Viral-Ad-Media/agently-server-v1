@@ -428,7 +428,21 @@ async function ensureDerivedNotifications(db, orgId, userId) {
   }
 }
 
-function notificationReminderDateKey(date = new Date()) {
+function notificationReminderDateKey(date = new Date(), timezone = "UTC") {
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: timezone || "UTC",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(date);
+    const values = Object.fromEntries(
+      parts.map((part) => [part.type, part.value]),
+    );
+    if (values.year && values.month && values.day) {
+      return `${values.year}-${values.month}-${values.day}`;
+    }
+  } catch (_) {}
   return date.toISOString().slice(0, 10);
 }
 
@@ -450,7 +464,10 @@ function isMissingReminderTable(error) {
 
 async function reserveDailyUnreadReminder(db, req, metrics, threshold) {
   const now = new Date();
-  const dateKey = notificationReminderDateKey(now);
+  const dateKey = notificationReminderDateKey(
+    now,
+    req.organization?.timezone || "UTC",
+  );
   const reminderType = "unread_notifications_daily";
   const payload = {
     organization_id: req.orgId,
@@ -472,67 +489,28 @@ async function reserveDailyUnreadReminder(db, req, metrics, threshold) {
     .select("id")
     .single();
 
-  if (!error && data?.id)
+  if (!error && data?.id) {
     return { reserved: true, reminderId: data.id, tableBacked: true };
-  if (isDuplicateInsert(error))
+  }
+  if (isDuplicateInsert(error)) {
     return { reserved: false, reason: "already_sent_today" };
-
-  if (!isMissingReminderTable(error)) {
-    console.warn(
-      "[notifications] reminder reservation failed; suppressing email to avoid spam:",
-      error?.message || error,
-    );
-    return { reserved: false, reason: "reservation_failed" };
   }
 
-  // Fallback for deployments where the migration has not been applied yet.
-  // This is less race-proof than the unique table, but still prevents the
-  // every-minute email loop for normal traffic.
-  const currentLimits =
-    req.organization?.outbound_call_limits &&
-    typeof req.organization.outbound_call_limits === "object"
-      ? req.organization.outbound_call_limits
-      : {};
-  const reminderState = currentLimits.notification_email_reminders || {};
-  const existing = reminderState[reminderType] || {};
-  if (existing.date === dateKey)
-    return { reserved: false, reason: "already_sent_today" };
-
-  const nextLimits = {
-    ...currentLimits,
-    notification_email_reminders: {
-      ...reminderState,
-      [reminderType]: {
-        date: dateKey,
-        sent_at: now.toISOString(),
-        unread_count: Number(metrics.unread || 0),
-        sent_to: req.user?.email || "",
-        threshold,
-      },
-    },
-  };
-
-  const { error: updateError } = await db
-    .from("organizations")
-    .update({
-      outbound_call_limits: nextLimits,
-      updated_at: now.toISOString(),
-    })
-    .eq("id", req.orgId);
-
-  if (updateError) {
-    console.warn(
-      "[notifications] fallback reminder reservation failed; suppressing email to avoid spam:",
-      updateError.message || updateError,
-    );
-    return { reserved: false, reason: "fallback_failed" };
-  }
-
-  return { reserved: true, reminderId: null, tableBacked: false };
+  // Fail closed. If the reservation table/index is unavailable, do not send an
+  // email at all. This is safer than a process-local fallback on serverless,
+  // which is what allowed several concurrent requests to send duplicates.
+  console.warn(
+    "[notifications] daily reminder reservation unavailable; email suppressed:",
+    error?.message || error,
+  );
+  return { reserved: false, reason: "reservation_unavailable" };
 }
 
 async function maybeSendUnreadThresholdEmail(db, req, metrics) {
-  const threshold = Number(process.env.NOTIFICATION_EMAIL_THRESHOLD || 20);
+  const threshold = Math.max(
+    1,
+    Number(process.env.NOTIFICATION_EMAIL_THRESHOLD || 1),
+  );
   if (!metrics || Number(metrics.unread || 0) < threshold) return;
 
   const reservation = await reserveDailyUnreadReminder(
@@ -571,30 +549,6 @@ async function maybeSendUnreadThresholdEmail(db, req, metrics) {
         })
         .eq("id", reservation.reminderId);
     }
-
-    await db
-      .from("tenant_notifications")
-      .insert({
-        organization_id: req.orgId,
-        user_id: req.user.id,
-        type: "notification_digest_sent",
-        title: "Unread notifications email sent",
-        body: `An email reminder was sent because ${metrics.unread} notifications are unread.`,
-        entity_type: "notification_digest",
-        entity_id: req.orgId,
-        is_read: true,
-        read_at: new Date().toISOString(),
-        metadata: {
-          threshold,
-          unreadCount: metrics.unread,
-          sentTo: req.user.email,
-          reminderDate: notificationReminderDateKey(),
-        },
-      })
-      .then(
-        () => null,
-        () => null,
-      );
   } catch (error) {
     if (reservation.tableBacked && reservation.reminderId) {
       await db
@@ -680,7 +634,6 @@ router.get(
     if (error) throw error;
 
     const metrics = await getNotificationMetrics(db, req.orgId);
-    await maybeSendUnreadThresholdEmail(db, req, metrics);
 
     res.json({
       success: true,

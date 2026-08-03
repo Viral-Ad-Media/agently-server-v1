@@ -10,10 +10,13 @@ const { logChatbotConversationUsage } = require("../../lib/billing-limits");
 const {
   ensureWalletCreditOrRespond,
 } = require("../../lib/billing-credit-enforcement");
+const { loadVoiceContext } = require("../../lib/context-builder");
 const {
   loadChatbotContext,
-  loadVoiceContext,
-} = require("../../lib/context-builder");
+  buildAssistantPrompt,
+  cleanAssistantResponse,
+  ensureProductLinks,
+} = require("../../lib/assistant-intelligence");
 
 const router = express.Router();
 
@@ -70,12 +73,19 @@ router.post(
     let systemPrompt =
       "You are a helpful AI receptionist assistant. Be concise, professional, and helpful.";
     let unresolvedChatbotId = chatbotId || null;
+    let groundedContext = null;
 
     if (chatbotId) {
-      const context = await loadChatbotContext(db, chatbotId, message.trim());
-      if (context?.chatbot) {
-        systemPrompt = context.systemPrompt;
-        unresolvedChatbotId = context.chatbot.id;
+      groundedContext = await loadChatbotContext(chatbotId, message.trim());
+      if (groundedContext?.entity) {
+        systemPrompt = buildAssistantPrompt({
+          context: groundedContext,
+          message: message.trim(),
+          mode: "text",
+          direction: "chat",
+          languageName: "English",
+        });
+        unresolvedChatbotId = groundedContext.entity.id;
       }
     } else {
       const activeAgentId = req.organization.active_voice_agent_id;
@@ -110,7 +120,7 @@ router.post(
       .select()
       .single();
 
-    const aiText = await generateChatResponse(
+    let aiText = await generateChatResponse(
       message.trim(),
       history || [],
       systemPrompt,
@@ -121,6 +131,14 @@ router.post(
         metadata: { route: "messenger.messages" },
       },
     );
+    aiText = groundedContext
+      ? ensureProductLinks({
+          message: message.trim(),
+          response: cleanAssistantResponse(aiText),
+          products: groundedContext.products || [],
+          chunks: groundedContext.chunks || [],
+        })
+      : cleanAssistantResponse(aiText);
 
     const { data: aiMsg } = await db
       .from("chat_messages")

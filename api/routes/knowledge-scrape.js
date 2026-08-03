@@ -26,7 +26,11 @@ const { asyncHandler } = require("../../middleware/error");
 const {
   ensureWalletCreditOrRespond,
 } = require("../../lib/billing-credit-enforcement");
-const { discoverPages } = require("../../lib/page-discovery");
+const { discoverPages, normalizeUrl } = require("../../lib/page-discovery");
+const {
+  findOrCreateKnowledgeSource,
+  ensureDefaultKnowledgeBaseForOrg,
+} = require("../../lib/knowledge-bases");
 
 const router = express.Router();
 const nowIso = () => new Date().toISOString();
@@ -67,16 +71,80 @@ router.post(
       knowledgeBaseId = null,
       knowledgeSourceId = null,
       duringOnboarding = false,
-      maxPages = 500,
+      maxPages = Number(process.env.DISCOVERY_MAX_PAGES || 5000),
     } = req.body || {};
 
     try {
+      const requestedRoot = normalizeUrl(website || url);
+      let resolvedKnowledgeBaseId = knowledgeBaseId || null;
+      let resolvedKnowledgeSourceId = knowledgeSourceId || null;
+
+      const db = getSupabase();
+
+      // Onboarding intentionally does not crawl the whole website anymore.
+      // When this endpoint is used by an older client, still attach the result
+      // to the tenant's primary KB so the page list is not orphaned.
+      if (!resolvedKnowledgeBaseId && duringOnboarding === true) {
+        const { data: org } = await db
+          .from("organizations")
+          .select("id,name,industry,website")
+          .eq("id", req.orgId)
+          .maybeSingle();
+        const onboardingKb = await ensureDefaultKnowledgeBaseForOrg(db, {
+          id: req.orgId,
+          name: org?.name || "My Business",
+          industry: org?.industry || "",
+          website: requestedRoot || org?.website || "",
+        });
+        if (onboardingKb?.id) {
+          resolvedKnowledgeBaseId = onboardingKb.id;
+          if (
+            requestedRoot &&
+            normalizeUrl(onboardingKb.primary_url) !== requestedRoot
+          ) {
+            await db
+              .from("knowledge_bases")
+              .update({
+                primary_url: requestedRoot,
+                domain: new URL(requestedRoot).hostname.replace(/^www\./, ""),
+                updated_at: nowIso(),
+              })
+              .eq("id", onboardingKb.id)
+              .eq("organization_id", req.orgId);
+          }
+        }
+      }
+
+      if (resolvedKnowledgeBaseId) {
+        const kb = await verifyKb(db, req.orgId, resolvedKnowledgeBaseId);
+        if (!kb) {
+          return res
+            .status(404)
+            .json({ error: { message: "Knowledge base not found." } });
+        }
+        const source = await findOrCreateKnowledgeSource(db, {
+          organizationId: req.orgId,
+          knowledgeBaseId: resolvedKnowledgeBaseId,
+          url: requestedRoot || kb.primary_url,
+          title: kb.name || "Website",
+          isPrimary: true,
+        });
+        resolvedKnowledgeSourceId = source?.id || resolvedKnowledgeSourceId;
+      }
+
+      const configuredMax = Math.max(
+        100,
+        Math.min(10000, Number(process.env.DISCOVERY_MAX_PAGES || 5000)),
+      );
       const result = await discoverPages({
         organizationId: req.orgId,
-        knowledgeBaseId,
-        knowledgeSourceId,
-        rootUrl: website || url,
-        maxPages: Math.min(Number(maxPages) || 500, 1000),
+        knowledgeBaseId: resolvedKnowledgeBaseId,
+        knowledgeSourceId: resolvedKnowledgeSourceId,
+        rootUrl: requestedRoot,
+        maxPages: Math.max(
+          100,
+          Math.min(Number(maxPages) || configuredMax, configuredMax),
+        ),
         duringOnboarding: duringOnboarding === true,
         userId: req.user?.id || null,
       });
@@ -213,9 +281,9 @@ router.put(
         if (error) throw error;
       }
     } else {
-      return res
-        .status(400)
-        .json({ error: { message: "Provide pageIds, selectAll or selectNone." } });
+      return res.status(400).json({
+        error: { message: "Provide pageIds, selectAll or selectNone." },
+      });
     }
 
     const { count } = await db
@@ -251,6 +319,33 @@ router.post(
         .status(404)
         .json({ error: { message: "Knowledge base not found." } });
     }
+    if (!discoveryId) {
+      return res
+        .status(400)
+        .json({ error: { message: "A page discovery is required." } });
+    }
+
+    const { data: discovery } = await db
+      .from("knowledge_page_discoveries")
+      .select("id,knowledge_base_id,knowledge_source_id,status")
+      .eq("id", discoveryId)
+      .eq("organization_id", req.orgId)
+      .eq("knowledge_base_id", knowledgeBaseId)
+      .maybeSingle();
+    if (!discovery) {
+      return res.status(404).json({
+        error: {
+          message: "That page list does not belong to this knowledge base.",
+        },
+      });
+    }
+    if (discovery.status !== "completed") {
+      return res.status(409).json({
+        error: {
+          message: "Page discovery is still running. Try again shortly.",
+        },
+      });
+    }
 
     const { data: selected } = await db
       .from("knowledge_discovered_pages")
@@ -277,13 +372,16 @@ router.post(
 
     // One active job per knowledge base. Prevents a double-click producing two
     // workers scraping the same pages and double-charging.
-    const { data: existing } = await db
+    const { data: existingJobs, error: existingJobError } = await db
       .from("knowledge_scrape_jobs")
       .select("id,status")
       .eq("knowledge_base_id", knowledgeBaseId)
       .eq("organization_id", req.orgId)
-      .in("status", ["queued", "running"])
-      .maybeSingle();
+      .in("status", ["queued", "running", "paused"])
+      .order("created_at", { ascending: false })
+      .limit(1);
+    if (existingJobError) throw existingJobError;
+    const existing = existingJobs?.[0] || null;
 
     if (existing) {
       return res.status(409).json({
@@ -291,13 +389,18 @@ router.post(
           code: "JOB_ALREADY_RUNNING",
           message: "A scan is already running for this knowledge base.",
           jobId: existing.id,
+          details: { jobId: existing.id },
         },
       });
     }
 
     await db
       .from("knowledge_discovered_pages")
-      .update({ scrape_status: "queued", scrape_progress: 0, updated_at: nowIso() })
+      .update({
+        scrape_status: "queued",
+        scrape_progress: 0,
+        updated_at: nowIso(),
+      })
       .eq("discovery_id", discoveryId)
       .eq("organization_id", req.orgId)
       .eq("is_selected", true);
@@ -330,6 +433,42 @@ router.post(
       job: { id: job.id, status: job.status, totalPages: pageCount },
       estimatedUsd: estimated,
       message: `Reading ${pageCount} page${pageCount === 1 ? "" : "s"}. You can leave this page — we'll notify you when it's done.`,
+    });
+  }),
+);
+
+// Return the active job when a tenant comes back after navigating away.
+router.get(
+  "/knowledge-bases/:knowledgeBaseId/active-job",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const kb = await verifyKb(db, req.orgId, req.params.knowledgeBaseId);
+    if (!kb) {
+      return res
+        .status(404)
+        .json({ error: { message: "Knowledge base not found." } });
+    }
+
+    const { data: jobs, error } = await db
+      .from("knowledge_scrape_jobs")
+      .select("id,status,discovery_id,created_at")
+      .eq("organization_id", req.orgId)
+      .eq("knowledge_base_id", req.params.knowledgeBaseId)
+      .in("status", ["queued", "running", "paused"])
+      .order("created_at", { ascending: false })
+      .limit(1);
+    if (error) throw error;
+
+    const active = Array.isArray(jobs) ? jobs[0] : null;
+    return res.json({
+      job: active
+        ? {
+            id: active.id,
+            status: active.status,
+            discoveryId: active.discovery_id,
+          }
+        : null,
     });
   }),
 );
@@ -435,7 +574,11 @@ router.post(
 
       await db
         .from("knowledge_discovered_pages")
-        .update({ scrape_status: "pending", scrape_progress: 0, updated_at: nowIso() })
+        .update({
+          scrape_status: "pending",
+          scrape_progress: 0,
+          updated_at: nowIso(),
+        })
         .eq("discovery_id", job.discovery_id)
         .eq("organization_id", req.orgId)
         .in("scrape_status", ["queued", "scraping"]);
@@ -507,10 +650,16 @@ router.post(
     if (Array.isArray(changeIds) && changeIds.length) q = q.in("id", changeIds);
 
     const { data: changes } = await q;
-    const pageIds = (changes || []).map((c) => c.discovered_page_id).filter(Boolean);
+    const pageIds = (changes || [])
+      .map((c) => c.discovered_page_id)
+      .filter(Boolean);
 
     if (!pageIds.length) {
-      return res.json({ success: true, queued: 0, message: "Nothing to update." });
+      return res.json({
+        success: true,
+        queued: 0,
+        message: "Nothing to update.",
+      });
     }
 
     const allowed = await ensureWalletCreditOrRespond(req, res, {
@@ -528,7 +677,11 @@ router.post(
 
     await db
       .from("knowledge_discovered_pages")
-      .update({ scrape_status: "queued", scrape_progress: 0, updated_at: nowIso() })
+      .update({
+        scrape_status: "queued",
+        scrape_progress: 0,
+        updated_at: nowIso(),
+      })
       .in("id", pageIds);
 
     const { data: job } = await db
@@ -550,7 +703,10 @@ router.post(
     await db
       .from("knowledge_change_events")
       .update({ status: "resync_queued" })
-      .in("id", (changes || []).map((c) => c.id));
+      .in(
+        "id",
+        (changes || []).map((c) => c.id),
+      );
 
     return res.status(202).json({
       success: true,
@@ -570,21 +726,17 @@ router.put(
   requireAdmin,
   asyncHandler(async (req, res) => {
     const db = getSupabase();
-    const { enabled, mode, intervalHours } = req.body || {};
+    const { enabled } = req.body || {};
 
-    const patch = { updated_at: nowIso() };
-    if (enabled !== undefined) patch.change_monitoring_enabled = enabled === true;
-    if (mode !== undefined) {
-      patch.change_monitoring_mode = ["notify_only", "auto_rescrape"].includes(mode)
-        ? mode
-        : "notify_only";
-    }
-    if (intervalHours !== undefined) {
-      patch.change_monitoring_interval_hours = Math.max(
-        1,
-        Math.min(Number(intervalHours) || 24, 168),
-      );
-    }
+    // Product requirement: this toggle has one predictable meaning everywhere.
+    // When enabled, selected pages are checked every 24 hours and changed pages
+    // are re-scraped automatically in the background.
+    const patch = {
+      updated_at: nowIso(),
+      change_monitoring_enabled: enabled === true,
+      change_monitoring_mode: "auto_rescrape",
+      change_monitoring_interval_hours: 24,
+    };
 
     const { data, error } = await db
       .from("knowledge_bases")

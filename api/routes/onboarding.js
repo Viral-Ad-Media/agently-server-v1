@@ -13,36 +13,154 @@ const {
   assignChatbotKnowledgeBase,
   findOrCreateKnowledgeSource,
 } = require("../../lib/knowledge-bases");
+const { normalizeUrl } = require("../../lib/page-discovery");
 
 const router = express.Router();
 
-function queueOnboardingKnowledgeSync({
+async function queueOnboardingKnowledgeSync({
+  db,
   organizationId,
   knowledgeBaseId,
   knowledgeSourceId,
   url,
+  requestedByUserId = null,
 }) {
-  if (!organizationId || !knowledgeBaseId || !knowledgeSourceId || !url) return;
-  const run = async () => {
-    try {
-      const { scrapeAndStore } = require("../../lib/scraper.service");
-      await scrapeAndStore({
-        url,
-        organizationId,
-        knowledgeBaseId,
-        knowledgeSourceId,
-        voiceAgentId: null,
-        chatbotId: null,
-      });
-    } catch (error) {
-      console.error(
-        "[onboarding] background website scrape failed:",
-        error?.message || error,
-      );
-    }
-  };
-  if (typeof setImmediate === "function") setImmediate(run);
-  else setTimeout(run, 0);
+  const normalizedUrl = normalizeUrl(url);
+  if (
+    !db ||
+    !organizationId ||
+    !knowledgeBaseId ||
+    !knowledgeSourceId ||
+    !normalizedUrl
+  ) {
+    return null;
+  }
+
+  // The first onboarding scan is one durable worker job, not a serverless
+  // setImmediate. The HTTP response may finish immediately while Railway keeps
+  // processing the homepage and sends the standard completion notification.
+  const { data: discoveries } = await db
+    .from("knowledge_page_discoveries")
+    .select("id")
+    .eq("organization_id", organizationId)
+    .eq("knowledge_base_id", knowledgeBaseId)
+    .eq("root_url", normalizedUrl)
+    .eq("status", "completed")
+    .eq("discovered_during_onboarding", true)
+    .order("created_at", { ascending: false })
+    .limit(1);
+
+  let discoveryId = discoveries?.[0]?.id || null;
+  if (!discoveryId) {
+    const parsed = new URL(normalizedUrl);
+    const { data: discovery, error } = await db
+      .from("knowledge_page_discoveries")
+      .insert({
+        organization_id: organizationId,
+        knowledge_base_id: knowledgeBaseId,
+        knowledge_source_id: knowledgeSourceId,
+        root_url: normalizedUrl,
+        domain: parsed.hostname.replace(/^www\./, ""),
+        status: "completed",
+        total_pages_found: 1,
+        discovery_method: "onboarding_homepage",
+        discovered_during_onboarding: true,
+        metadata: { homepageOnly: true },
+        completed_at: new Date().toISOString(),
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .select("id")
+      .single();
+    if (error) throw error;
+    discoveryId = discovery.id;
+  } else {
+    await db
+      .from("knowledge_page_discoveries")
+      .update({
+        knowledge_source_id: knowledgeSourceId,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", discoveryId)
+      .eq("organization_id", organizationId);
+  }
+
+  // Onboarding must read exactly the homepage. Additional routes are found and
+  // selected later from Settings -> Knowledge Bases.
+  await db
+    .from("knowledge_discovered_pages")
+    .update({ is_selected: false, updated_at: new Date().toISOString() })
+    .eq("discovery_id", discoveryId)
+    .eq("organization_id", organizationId);
+
+  const { data: homepageRows } = await db
+    .from("knowledge_discovered_pages")
+    .select("id")
+    .eq("discovery_id", discoveryId)
+    .eq("organization_id", organizationId)
+    .eq("normalized_url", normalizedUrl)
+    .limit(1);
+
+  if (homepageRows?.[0]?.id) {
+    await db
+      .from("knowledge_discovered_pages")
+      .update({
+        is_selected: true,
+        scrape_status: "queued",
+        scrape_progress: 0,
+        last_error: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", homepageRows[0].id)
+      .eq("organization_id", organizationId);
+  } else {
+    const parsed = new URL(normalizedUrl);
+    const { error } = await db.from("knowledge_discovered_pages").insert({
+      discovery_id: discoveryId,
+      organization_id: organizationId,
+      knowledge_base_id: knowledgeBaseId,
+      url: normalizedUrl,
+      normalized_url: normalizedUrl,
+      title: parsed.hostname,
+      path: parsed.pathname || "/",
+      depth: 0,
+      priority_score: 100,
+      is_selected: true,
+      scrape_status: "queued",
+      scrape_progress: 0,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+    if (error) throw error;
+  }
+
+  const { data: activeJobs } = await db
+    .from("knowledge_scrape_jobs")
+    .select("id,status")
+    .eq("organization_id", organizationId)
+    .eq("knowledge_base_id", knowledgeBaseId)
+    .in("status", ["queued", "running", "paused"])
+    .order("created_at", { ascending: false })
+    .limit(1);
+  if (activeJobs?.[0]?.id) return activeJobs[0];
+
+  const { data: job, error: jobError } = await db
+    .from("knowledge_scrape_jobs")
+    .insert({
+      organization_id: organizationId,
+      knowledge_base_id: knowledgeBaseId,
+      discovery_id: discoveryId,
+      status: "queued",
+      job_type: "onboarding_homepage",
+      total_pages: 1,
+      requested_by_user_id: requestedByUserId,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .select("id,status")
+    .single();
+  if (jobError) throw jobError;
+  return job;
 }
 
 // Voice name migration for onboarding (legacy names → Twilio names)
@@ -465,12 +583,21 @@ router.post(
         })
         .eq("id", knowledgeBase.id)
         .eq("organization_id", orgId);
-      queueOnboardingKnowledgeSync({
-        organizationId: orgId,
-        knowledgeBaseId: knowledgeBase.id,
-        knowledgeSourceId: primaryKnowledgeSource.id,
-        url: onboardingOrg.website,
-      });
+      try {
+        await queueOnboardingKnowledgeSync({
+          db,
+          organizationId: orgId,
+          knowledgeBaseId: knowledgeBase.id,
+          knowledgeSourceId: primaryKnowledgeSource.id,
+          url: onboardingOrg.website,
+          requestedByUserId: req.user?.id || null,
+        });
+      } catch (error) {
+        console.error(
+          "[onboarding] could not queue homepage knowledge sync:",
+          error?.message || error,
+        );
+      }
     }
 
     // Determine greeting — use provided or build from agent name + business name

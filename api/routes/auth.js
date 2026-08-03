@@ -328,16 +328,39 @@ router.post(
     // Mark the token as used immediately to prevent replay
     await db
       .from("magic_link_tokens")
-      .update({ used: true })
+      .update({
+        used: true,
+        used_reason: record.purpose === "team_invite" ? "accepted" : "used",
+        used_at: new Date().toISOString(),
+      })
       .eq("id", record.id);
 
-    // Find the existing user or auto-create one for new sign-ups
+    // Team invitation tokens are bound to one exact user and organization.
+    // Ordinary sign-in tokens continue to resolve by email.
     let user;
-    const { data: existingUser } = await db
-      .from("users")
-      .select("id, name, email, role, avatar, organization_id")
-      .eq("email", record.email)
-      .single();
+    let existingUser = null;
+    if (record.user_id) {
+      const { data } = await db
+        .from("users")
+        .select("id, name, email, role, avatar, organization_id")
+        .eq("id", record.user_id)
+        .eq("organization_id", record.organization_id)
+        .maybeSingle();
+      existingUser = data || null;
+    } else {
+      const { data } = await db
+        .from("users")
+        .select("id, name, email, role, avatar, organization_id")
+        .eq("email", record.email)
+        .maybeSingle();
+      existingUser = data || null;
+    }
+
+    if (record.purpose === "team_invite" && !existingUser) {
+      return res.status(400).json({
+        error: { message: "This team invitation is no longer valid." },
+      });
+    }
 
     if (existingUser) {
       user = existingUser;
