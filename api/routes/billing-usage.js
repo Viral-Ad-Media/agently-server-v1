@@ -3971,7 +3971,7 @@ router.patch("/customer-rates", async (req, res, next) => {
       p_target_margin_percent:
         body.targetMarginPercent === undefined &&
         body.target_margin_percent === undefined
-          ? 50
+          ? 70
           : Number(body.targetMarginPercent ?? body.target_margin_percent),
       p_minimum_charge_usd:
         body.minimumChargeUsd === undefined &&
@@ -4698,12 +4698,12 @@ router.get("/admin-queries", (_req, res) => {
         "SELECT * FROM billing_admin_billing_schema_inventory ORDER BY table_type, table_name;",
       customerRateSettings:
         "SELECT * FROM billing_admin_customer_rate_settings;",
-      setDefaultCustomerMargin50:
-        "SELECT public.billing_admin_update_customer_rate('*','*','*','*','*','target_margin',NULL,NULL,50,0,'Default 50 percent gross margin','{}'::jsonb);",
+      setDefaultCustomerMargin70:
+        "SELECT public.billing_admin_update_customer_rate('*','*','*','*','*','target_margin',NULL,NULL,70,0,'Default 70 percent gross margin','{}'::jsonb);",
       setStarterVoiceMargin50:
         "SELECT public.billing_admin_update_customer_rate('starter','twilio','voice','*','minutes','target_margin',NULL,NULL,50,0,'Starter voice margin','{}'::jsonb);",
-      topUpWallet30:
-        "SELECT public.billing_admin_top_up_wallet('YOUR_ORG_UUID', 30, 'manual_test_top_up');",
+      topUpWallet10:
+        "SELECT public.billing_admin_top_up_wallet('YOUR_ORG_UUID', 10, 'manual_test_top_up');",
       recalculateCustomerChargesNoWalletDebit:
         "SELECT public.billing_admin_recalculate_customer_charges('YOUR_ORG_UUID', NULL, NULL, false, false, 5000);",
       walletOverview:

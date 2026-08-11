@@ -21,6 +21,11 @@ const {
   getNumberRetentionStatus,
 } = require("../../lib/number-retention");
 const { isAutoWalletChargeEnabled } = require("../../lib/usage-ledger");
+const { getBillingPlatformSettings } = require("../../lib/billing-settings");
+const {
+  stripeConfigured,
+  stripeCheckoutConfigured,
+} = require("../../lib/stripe-billing");
 const {
   buildCustomerBillingActivity,
 } = require("../../lib/customer-billing-activity");
@@ -65,11 +70,12 @@ function maxNegativeBalanceUsd() {
 }
 
 async function loadCustomerWalletSummary(db, organizationId, limit = 150) {
+  const platformSettings = await getBillingPlatformSettings(db);
   const emptyWallet = {
     enabled: true,
     currency: "USD",
     balanceUsd: 0,
-    minimumRechargeUsd: 30,
+    minimumRechargeUsd: Number(platformSettings.minimumTopUpUsd || 10),
     status: "not_created",
     latestTransactionAt: null,
     recentTransactions: [],
@@ -95,7 +101,11 @@ async function loadCustomerWalletSummary(db, organizationId, limit = 150) {
           walletId: rawWallet.id,
           currency: rawWallet.currency || "USD",
           balanceUsd: Number(rawWallet.balance_usd || 0),
-          minimumRechargeUsd: Number(rawWallet.minimum_recharge_usd || 30),
+          minimumRechargeUsd: Number(
+            rawWallet.minimum_recharge_usd ||
+              platformSettings.minimumTopUpUsd ||
+              10,
+          ),
           status: rawWallet.status || "active",
           latestTransactionAt: rawWallet.updated_at || null,
           recentTransactions: [],
@@ -685,6 +695,8 @@ router.get(
         demoTopUpEnabled: parseBillingDemoBool(
           process.env.BILLING_DEMO_TOPUP_ENABLED,
         ),
+        stripeTopUpEnabled: stripeConfigured(),
+        stripeWebhookConfigured: stripeConfigured(),
         creditEnforcementMode: currentCreditEnforcementMode(),
         autoChargeWalletEnabled: isAutoWalletChargeEnabled(),
         numberRetention,
@@ -727,7 +739,7 @@ router.post(
       });
     }
 
-    const amountUsd = Number(req.body?.amountUsd ?? req.body?.amount_usd ?? 30);
+    const amountUsd = Number(req.body?.amountUsd ?? req.body?.amount_usd ?? 10);
     if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
       return res
         .status(400)

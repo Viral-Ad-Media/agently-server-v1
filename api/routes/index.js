@@ -29,6 +29,7 @@ const notificationsRoutes = require("./routes/notifications");
 const elevenlabsRoutes = require("./routes/elevenlabs");
 const voicesRoutes = require("./routes/voices");
 const agentVoiceConfigRoutes = require("./routes/agent-voice-config");
+const webcallRoutes = require("./routes/webcall");
 const { errorHandler } = require("../middleware/error");
 
 const app = express();
@@ -96,6 +97,7 @@ app.use("/api/notifications", notificationsRoutes);
 app.use("/api/elevenlabs", elevenlabsRoutes);
 app.use("/api/voices", voicesRoutes);
 app.use("/api/agents", agentVoiceConfigRoutes);
+app.use("/api/webcall", webcallRoutes);
 app.use("/api", miscRoutes); // team, billing, settings, contact
 
 app.use("/chatbot-widget", widgetRoutes);

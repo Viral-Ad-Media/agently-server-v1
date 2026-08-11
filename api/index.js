@@ -104,7 +104,21 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "4mb" }));
+app.use(
+  express.json({
+    limit: process.env.JSON_BODY_LIMIT || "4mb",
+    verify: (req, _res, buffer) => {
+      // Stripe signs the exact request bytes. Preserve them before Express
+      // converts the JSON payload into an object. Never log this buffer.
+      if (
+        String(req.originalUrl || "").split("?")[0] ===
+        "/api/billing/stripe/webhook"
+      ) {
+        req.rawBody = Buffer.from(buffer);
+      }
+    },
+  }),
+);
 app.use(express.urlencoded({ extended: true }));
 
 // Serve bundled chatbot preset avatars from the backend domain.
@@ -143,6 +157,8 @@ app.get("/health", (_req, res) => {
       VOICE_PROVIDER_DEFAULT: process.env.VOICE_PROVIDER_DEFAULT || "openai",
       VOICE_PROVIDER_FALLBACK: process.env.VOICE_PROVIDER_FALLBACK || "openai",
       RESEND_API_KEY: !!process.env.RESEND_API_KEY,
+      STRIPE_SECRET_KEY: !!process.env.STRIPE_SECRET_KEY,
+      STRIPE_WEBHOOK_SECRET: !!process.env.STRIPE_WEBHOOK_SECRET,
       TWILIO_ACCOUNT_SID: !!process.env.TWILIO_ACCOUNT_SID,
       TWILIO_AUTH_TOKEN: !!process.env.TWILIO_AUTH_TOKEN,
       TWILIO_API_KEY_SID: !!process.env.TWILIO_API_KEY_SID,
@@ -286,6 +302,7 @@ safeMount(
   () => require("./routes/agent-voice-config"),
   "agent-voice-config",
 );
+safeMount("/api/webcall", () => require("./routes/webcall"), "webcall");
 
 // Billing usage, production-cost, vendor-rate-sync, wallet, and margin endpoints.
 // Keep this mounted BEFORE the generic /api misc route so nested billing paths
@@ -294,6 +311,14 @@ safeMount(
   "/api/billing-usage",
   () => require("./routes/billing-usage"),
   "billing-usage",
+);
+
+// Stripe Checkout creates verified prepaid-wallet top-ups. The webhook uses
+// req.rawBody captured by the JSON parser above for signature verification.
+safeMount(
+  "/api/billing/stripe",
+  () => require("./routes/stripe-billing"),
+  "stripe-billing",
 );
 
 safeMount(

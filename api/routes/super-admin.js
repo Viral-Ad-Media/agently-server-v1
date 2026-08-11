@@ -4,6 +4,11 @@ const express = require("express");
 const path = require("path");
 const { v4: uuidv4 } = require("uuid");
 const { getSupabase } = require("../../lib/supabase");
+const { getBillingPlatformSettings } = require("../../lib/billing-settings");
+const {
+  stripeConfigured,
+  stripeCheckoutConfigured,
+} = require("../../lib/stripe-billing");
 const { asyncHandler } = require("../../middleware/error");
 const {
   authenticateSuperAdmin,
@@ -219,6 +224,66 @@ function walletBalance(row) {
   );
 }
 
+function rateKey(value) {
+  return (
+    String(value ?? "*")
+      .trim()
+      .toLowerCase() || "*"
+  );
+}
+
+function marginFromRates(rates, provider, services) {
+  const serviceList = Array.isArray(services) ? services : [services];
+  for (const service of serviceList) {
+    const match = (rates || []).find(
+      (row) =>
+        rateKey(row.plan_key) === "*" &&
+        rateKey(row.provider) === rateKey(provider) &&
+        rateKey(row.service) === rateKey(service) &&
+        rateKey(row.event_type) === "*" &&
+        rateKey(row.unit) === "*" &&
+        rateKey(row.billing_mode) === "target_margin",
+    );
+    const margin = Number(match?.target_margin_percent);
+    if (Number.isFinite(margin)) return margin;
+  }
+  return null;
+}
+
+async function loadPlatformPricing(db) {
+  const [settings, rateResult] = await Promise.all([
+    getBillingPlatformSettings(db),
+    db
+      .from("billing_admin_customer_rate_settings")
+      .select(
+        "plan_key,provider,service,event_type,unit,billing_mode,target_margin_percent,notes,updated_at",
+      ),
+  ]);
+
+  const rates = rateResult.error ? [] : rateResult.data || [];
+  const defaultMargin =
+    marginFromRates(rates, "*", "*") ??
+    Number(settings.defaultTargetMarginPercent || 70);
+
+  return {
+    minimumTopUpUsd: Number(settings.minimumTopUpUsd || 10),
+    defaultMarginPercent: defaultMargin,
+    openAiRealtimeMarginPercent:
+      marginFromRates(rates, "openai", ["realtime_call", "realtime"]) ??
+      defaultMargin,
+    elevenLabsMarginPercent:
+      marginFromRates(rates, "elevenlabs", "*") ?? defaultMargin,
+    twilioCallMarginPercent:
+      marginFromRates(rates, "twilio", "voice") ?? defaultMargin,
+    twilioNumberMarginPercent:
+      marginFromRates(rates, "twilio", "phone_number") ?? defaultMargin,
+    stripeCheckoutEnabled: stripeCheckoutConfigured(),
+    stripeWebhookConfigured: stripeConfigured(),
+    settingsSource: settings.source,
+    updatedAt: settings.updatedAt || null,
+  };
+}
+
 router.get("/auth/config", (_req, res) => {
   if (!isEnabled())
     return res.status(404).json({ error: { message: "Not found." } });
@@ -285,6 +350,80 @@ router.get(
           .length,
         totalCustomerCreditUsd: balances.reduce((sum, value) => sum + value, 0),
       },
+    });
+  }),
+);
+
+router.get(
+  "/billing/pricing",
+  asyncHandler(async (_req, res) => {
+    const pricing = await loadPlatformPricing(getSupabase());
+    res.json({
+      pricing,
+      notes: {
+        marginMeaning:
+          "Gross margin. Customer price is vendor cost divided by (1 - margin).",
+        appliesTo:
+          "New usage across all plans and organizations. Historical charges are not repriced.",
+      },
+    });
+  }),
+);
+
+router.patch(
+  "/billing/pricing",
+  asyncHandler(async (req, res) => {
+    const body = req.body || {};
+    const values = {
+      minimumTopUpUsd: Number(body.minimumTopUpUsd),
+      defaultMarginPercent: Number(body.defaultMarginPercent),
+      openAiRealtimeMarginPercent: Number(body.openAiRealtimeMarginPercent),
+      elevenLabsMarginPercent: Number(body.elevenLabsMarginPercent),
+      twilioCallMarginPercent: Number(body.twilioCallMarginPercent),
+      twilioNumberMarginPercent: Number(body.twilioNumberMarginPercent),
+    };
+
+    if (
+      !Number.isFinite(values.minimumTopUpUsd) ||
+      values.minimumTopUpUsd < 0.5 ||
+      values.minimumTopUpUsd > 100000
+    ) {
+      return res.status(400).json({
+        error: {
+          message: "Minimum top-up must be between $0.50 and $100,000.",
+        },
+      });
+    }
+    for (const [key, value] of Object.entries(values)) {
+      if (key === "minimumTopUpUsd") continue;
+      if (!Number.isFinite(value) || value < 0 || value > 95) {
+        return res.status(400).json({
+          error: { message: `${key} must be between 0% and 95%.` },
+        });
+      }
+    }
+
+    const db = getSupabase();
+    const { data, error } = await db.rpc("billing_admin_set_platform_pricing", {
+      p_minimum_top_up_usd: values.minimumTopUpUsd,
+      p_default_margin_percent: values.defaultMarginPercent,
+      p_openai_realtime_margin_percent: values.openAiRealtimeMarginPercent,
+      p_elevenlabs_margin_percent: values.elevenLabsMarginPercent,
+      p_twilio_voice_margin_percent: values.twilioCallMarginPercent,
+      p_twilio_phone_number_margin_percent: values.twilioNumberMarginPercent,
+      p_updated_by: req.superAdmin.email,
+    });
+    if (error) throw error;
+
+    await logSecurityEvent(req, "platform_billing_pricing_updated", true, {
+      adminEmail: req.superAdmin.email,
+      values,
+    });
+
+    res.json({
+      success: true,
+      result: data,
+      pricing: await loadPlatformPricing(db),
     });
   }),
 );
