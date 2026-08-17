@@ -21,6 +21,27 @@ const {
   getNumberRetentionStatus,
 } = require("../../lib/number-retention");
 const { isAutoWalletChargeEnabled } = require("../../lib/usage-ledger");
+/**
+ * True only for the platform operator, identified the same way
+ * lib/super-admin-auth.js identifies them: a match against SUPER_ADMIN_EMAIL.
+ *
+ * Note this deliberately does NOT use requireSuperAdmin from that module —
+ * that guard authenticates a separate super-admin JWT (issuer
+ * "agently-super-admin") rather than the tenant session, so it cannot be
+ * chained after requireAuth and would also leave req.orgId undefined.
+ * This predicate works against the ordinary session that the route already
+ * authenticates, and returns false when SUPER_ADMIN_EMAIL is unset.
+ */
+function isSuperAdminRequest(req) {
+  const configured = String(process.env.SUPER_ADMIN_EMAIL || "")
+    .trim()
+    .toLowerCase();
+  if (!configured) return false;
+  const email = String(req?.user?.email || "")
+    .trim()
+    .toLowerCase();
+  return Boolean(email) && email === configured;
+}
 const { getBillingPlatformSettings } = require("../../lib/billing-settings");
 const {
   stripeConfigured,
@@ -692,9 +713,14 @@ router.get(
       },
       wallet: {
         ...wallet,
-        demoTopUpEnabled: parseBillingDemoBool(
-          process.env.BILLING_DEMO_TOPUP_ENABLED,
-        ),
+        // Only ever advertise the unverified demo top-up to a super admin.
+        // Billing.tsx falls back to this path whenever Stripe is not
+        // configured, so reporting it to a tenant is what turned a missing
+        // Stripe key into free self-service credit. Tenants now correctly see
+        // "card top-ups are not configured yet" instead.
+        demoTopUpEnabled:
+          parseBillingDemoBool(process.env.BILLING_DEMO_TOPUP_ENABLED) &&
+          isSuperAdminRequest(req),
         stripeTopUpEnabled: stripeConfigured(),
         stripeWebhookConfigured: stripeConfigured(),
         creditEnforcementMode: currentCreditEnforcementMode(),
@@ -725,11 +751,32 @@ router.get(
 );
 
 // ── POST /api/billing/wallet/demo-top-up ─────────────────────
+// SECURITY: this credits a wallet with real spendable balance and is NOT
+// payment-verified. It previously ran behind requireAdmin, which is the
+// TENANT's own role check (Owner/Admin) — so any tenant administrator could
+// mint themselves up to $500 per request, unlimited times, purely because
+// BILLING_DEMO_TOPUP_ENABLED was left true in production. It is now behind
+// requireSuperAdmin, the same guard the super-admin dashboard uses, so the
+// env flag is no longer the only thing preventing self-crediting.
 router.post(
   "/billing/wallet/demo-top-up",
   requireAuth,
   requireAdmin,
   asyncHandler(async (req, res) => {
+    if (!isSuperAdminRequest(req)) {
+      console.warn("[billing] demo top-up refused for non-super-admin", {
+        organizationId: req.orgId,
+        userId: req.user?.id || null,
+        userEmail: req.user?.email || null,
+        role: req.user?.role || null,
+      });
+      return res.status(403).json({
+        error: {
+          code: "SUPER_ADMIN_REQUIRED",
+          message: "Wallet credit can only be added through checkout.",
+        },
+      });
+    }
     if (!parseBillingDemoBool(process.env.BILLING_DEMO_TOPUP_ENABLED)) {
       return res.status(403).json({
         error: {
