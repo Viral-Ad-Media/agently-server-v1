@@ -267,6 +267,11 @@ safeMount(
   () => require("./routes/knowledge-scrape"),
   "knowledge-scrape",
 );
+safeMount(
+  "/api/knowledge-uploads",
+  () => require("./routes/knowledge-uploads"),
+  "knowledge-uploads",
+);
 safeMount("/api/calls", () => require("./routes/calls"), "calls");
 safeMount("/api/leads", () => require("./routes/leads"), "leads");
 safeMount("/api/outreach", () => require("./routes/outreach"), "outreach");

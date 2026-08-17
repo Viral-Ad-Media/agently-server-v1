@@ -726,15 +726,18 @@ router.put(
   requireAdmin,
   asyncHandler(async (req, res) => {
     const db = getSupabase();
-    const { enabled } = req.body || {};
+    const { enabled, mode } = req.body || {};
 
-    // Product requirement: this toggle has one predictable meaning everywhere.
-    // When enabled, selected pages are checked every 24 hours and changed pages
-    // are re-scraped automatically in the background.
+    // Tenant's actual choice: "auto_rescrape" (re-read changed pages
+    // automatically) or "notify_only" (just tell them, they decide when).
+    // This used to be hardcoded to auto_rescrape regardless of what was
+    // sent — change-monitor.js's notify_only branch existed and worked, it
+    // just never ran because nothing could ever request it.
+    const resolvedMode = mode === "notify_only" ? "notify_only" : "auto_rescrape";
     const patch = {
       updated_at: nowIso(),
       change_monitoring_enabled: enabled === true,
-      change_monitoring_mode: "auto_rescrape",
+      change_monitoring_mode: resolvedMode,
       change_monitoring_interval_hours: 24,
     };
 

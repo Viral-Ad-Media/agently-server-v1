@@ -16,11 +16,12 @@
  * ============================================================
  */
 
+const crypto = require("crypto");
 const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
 const { requireAuth } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
-const { signScopedToken } = require("../../lib/auth");
+const { signScopedToken, verifyToken } = require("../../lib/auth");
 
 const router = express.Router();
 
@@ -45,6 +46,95 @@ function webcallWsBase() {
   const explicit = (process.env.TWILIO_WS_URL || "").trim().replace(/\/+$/, "");
   const apiUrl = (process.env.API_URL || "").trim().replace(/\/+$/, "");
   return normalizeWebSocketBase(explicit || apiUrl);
+}
+
+// ── Internal service guard for /verify-token ─────────────────
+// This endpoint is called server-to-server by agently-ws-server, never by a
+// browser. It is locked behind a shared secret so it cannot be used as a
+// public oracle for probing webcall tokens and reading their org/agent/user
+// claims. Fail closed, matching requireInternalBillingAccess in
+// billing-usage.js: no secret configured means the route is unavailable.
+function webcallVerifySecret() {
+  return String(process.env.WEBCALL_VERIFY_SECRET || "").trim();
+}
+
+function isSafeInternalKey(key) {
+  return Boolean(key) && key.length >= 32;
+}
+
+function keysMatch(provided, expected) {
+  const a = Buffer.from(provided, "utf8");
+  const b = Buffer.from(expected, "utf8");
+  // timingSafeEqual throws on length mismatch, so compare lengths first.
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function requireWebcallVerifyAccess(req, res, next) {
+  const expected = webcallVerifySecret();
+  if (!isSafeInternalKey(expected)) {
+    console.warn(
+      "[webcall] /verify-token is locked: set WEBCALL_VERIFY_SECRET (32+ chars) on the backend and agently-ws-server.",
+    );
+    return res.status(503).json({
+      valid: false,
+      error: {
+        code: "VERIFIER_NOT_CONFIGURED",
+        message: "Token verification service is not configured.",
+      },
+    });
+  }
+
+  const provided = String(req.headers["x-webcall-verify-key"] || "").trim();
+  if (!provided || !keysMatch(provided, expected)) {
+    return res.status(403).json({
+      valid: false,
+      error: {
+        code: "INTERNAL_ACCESS_REQUIRED",
+        message: "Internal access required.",
+      },
+    });
+  }
+  next();
+}
+
+// Per-instance sliding-window limiter. Serverless means this is per warm
+// instance rather than global, so it is a brake on abuse, not a hard quota —
+// the shared secret above is the real control.
+const VERIFY_RATE_WINDOW_MS = 60_000;
+const VERIFY_RATE_MAX = Math.max(
+  10,
+  Number(process.env.WEBCALL_VERIFY_RATE_LIMIT || 120),
+);
+const verifyHits = new Map();
+
+function rateLimitVerify(req, res, next) {
+  const now = Date.now();
+  const key = String(
+    req.headers["x-forwarded-for"] || req.ip || "unknown",
+  ).split(",")[0].trim();
+
+  const hits = (verifyHits.get(key) || []).filter(
+    (t) => now - t < VERIFY_RATE_WINDOW_MS,
+  );
+  hits.push(now);
+  verifyHits.set(key, hits);
+
+  // Bound memory on a long-lived instance.
+  if (verifyHits.size > 500) {
+    for (const [k, v] of verifyHits) {
+      if (!v.length || now - v[v.length - 1] > VERIFY_RATE_WINDOW_MS) {
+        verifyHits.delete(k);
+      }
+    }
+  }
+
+  if (hits.length > VERIFY_RATE_MAX) {
+    return res.status(429).json({
+      valid: false,
+      error: { code: "RATE_LIMITED", message: "Too many verification requests." },
+    });
+  }
+  next();
 }
 
 async function loadOrgWebcallFlag(db, orgId) {
@@ -81,6 +171,53 @@ router.get(
       enabled,
       maxSessionSeconds: WEBCALL_MAX_SESSION_SECONDS,
       wsConfigured: Boolean(webcallWsBase()),
+    });
+  }),
+);
+
+// ── POST /api/webcall/verify-token ────────────────────────────
+// Server-to-server verifier used by agently-ws-server as a safe fallback
+// when Railway and Vercel do not share the same local JWT_SECRET. It does
+// not use requireAuth (there is no end-user session on this hop); instead it
+// is gated on the shared WEBCALL_VERIFY_SECRET, and it accepts ONLY
+// purpose-scoped webcall JWTs signed by this backend, returning just the
+// claims the WS service needs.
+router.post(
+  "/verify-token",
+  rateLimitVerify,
+  requireWebcallVerifyAccess,
+  asyncHandler(async (req, res) => {
+    const token = String(req.body?.token || "").trim();
+    if (!token) {
+      return res.status(400).json({
+        valid: false,
+        error: { code: "TOKEN_REQUIRED", message: "token is required." },
+      });
+    }
+
+    const claims = verifyToken(token);
+    if (
+      !claims ||
+      claims.purpose !== "webcall" ||
+      !claims.orgId ||
+      !claims.agentId
+    ) {
+      return res.status(401).json({
+        valid: false,
+        error: { code: "TOKEN_INVALID", message: "Invalid or expired webcall token." },
+      });
+    }
+
+    return res.json({
+      valid: true,
+      claims: {
+        purpose: "webcall",
+        orgId: claims.orgId,
+        agentId: claims.agentId,
+        userId: claims.userId || null,
+        iat: claims.iat || null,
+        exp: claims.exp || null,
+      },
     });
   }),
 );
