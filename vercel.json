@@ -1,5 +1,11 @@
 {
   "version": 2,
+  "crons": [
+    {
+      "path": "/api/billing-usage/vendor-rate-sync/cron",
+      "schedule": "0 6 * * 1"
+    }
+  ],
   "builds": [
     {
       "src": "api/index.js",

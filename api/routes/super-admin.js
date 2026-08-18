@@ -321,6 +321,111 @@ router.get("/auth/session", (req, res) => {
   res.json({ authenticated: true, email: req.superAdmin.email });
 });
 
+// ── GET/PATCH /api/super-admin/pricing/margin ────────────────
+// Owner control over the platform-wide markup. Every billable line is priced
+// by the wildcard row in billing_customer_rate_cards (provider=*, service=*)
+// using billing_mode = target_margin, so changing target_margin_percent here
+// re-prices everything at once. Existing charges are NOT rewritten — this
+// affects usage priced from now on.
+router.get(
+  "/pricing/margin",
+  asyncHandler(async (_req, res) => {
+    const db = getSupabase();
+    const { data, error } = await db
+      .from("billing_customer_rate_cards")
+      .select(
+        "id,plan_key,provider,service,event_type,unit,billing_mode,target_margin_percent,markup_percent,customer_unit_price_usd,minimum_charge_usd,active",
+      )
+      .eq("active", true)
+      .order("provider");
+    if (error) throw error;
+
+    const wildcard = (data || []).find(
+      (r) => r.provider === "*" && r.service === "*" && r.event_type === "*",
+    );
+    const overrides = (data || []).filter((r) => r !== wildcard);
+
+    res.json({
+      baseMarginPercent: wildcard ? Number(wildcard.target_margin_percent) : null,
+      baseMultiple: wildcard
+        ? Math.round((100 / (100 - Number(wildcard.target_margin_percent))) * 1000) / 1000
+        : null,
+      wildcardRuleId: wildcard?.id || null,
+      overrides: overrides.map((r) => ({
+        id: r.id,
+        scope: `${r.provider}/${r.service}/${r.event_type}`,
+        billingMode: r.billing_mode,
+        targetMarginPercent: r.target_margin_percent,
+        markupPercent: r.markup_percent,
+        unitPriceUsd: r.customer_unit_price_usd,
+      })),
+    });
+  }),
+);
+
+router.patch(
+  "/pricing/margin",
+  asyncHandler(async (req, res) => {
+    const marginPercent = Number(
+      req.body?.marginPercent ?? req.body?.margin_percent,
+    );
+    // Above ~95% the divisor collapses and prices explode; at or below 0 you
+    // would be selling at or under cost. Refuse rather than silently accept.
+    if (!Number.isFinite(marginPercent) || marginPercent <= 0 || marginPercent > 95) {
+      return res.status(400).json({
+        error: {
+          code: "INVALID_MARGIN",
+          message: "marginPercent must be greater than 0 and no more than 95.",
+        },
+      });
+    }
+
+    const db = getSupabase();
+    const { data: wildcard, error: findError } = await db
+      .from("billing_customer_rate_cards")
+      .select("id,target_margin_percent")
+      .eq("provider", "*")
+      .eq("service", "*")
+      .eq("event_type", "*")
+      .eq("active", true)
+      .maybeSingle();
+    if (findError) throw findError;
+    if (!wildcard) {
+      return res.status(404).json({
+        error: {
+          code: "NO_BASE_RULE",
+          message: "No active wildcard rate card row exists to update.",
+        },
+      });
+    }
+
+    const previous = Number(wildcard.target_margin_percent);
+    const { error: updateError } = await db
+      .from("billing_customer_rate_cards")
+      .update({
+        billing_mode: "target_margin",
+        target_margin_percent: marginPercent,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", wildcard.id);
+    if (updateError) throw updateError;
+
+    await logSecurityEvent(req, "pricing_margin_changed", true, {
+      adminEmail: req.superAdmin.email,
+      previousMarginPercent: previous,
+      newMarginPercent: marginPercent,
+    });
+
+    res.json({
+      success: true,
+      previousMarginPercent: previous,
+      marginPercent,
+      multiple: Math.round((100 / (100 - marginPercent)) * 1000) / 1000,
+      note: "Applies to usage priced from now on. Existing charges are unchanged.",
+    });
+  }),
+);
+
 // ── GET /api/super-admin/tenant-economics ────────────────────
 // Per-tenant spend, true provider cost, and our margin. Sits behind the
 // router-level requireSuperAdmin above, so it is never reachable by a tenant

@@ -2337,6 +2337,53 @@ async function buildCtoOrgCostBaseline({ organizationId, start, end } = {}) {
   };
 }
 
+// ── GET /api/billing-usage/vendor-rate-sync/cron ─────────────
+// Scheduled refresh of provider rates. Declared ABOVE the internal-key guard
+// below because Vercel Cron cannot send custom headers — it sends
+// `Authorization: Bearer $CRON_SECRET`. Either that or the normal internal
+// billing key is accepted; without CRON_SECRET set the route stays closed.
+router.get("/vendor-rate-sync/cron", async (req, res, next) => {
+  try {
+    const cronSecret = String(process.env.CRON_SECRET || "").trim();
+    const authHeader = String(req.headers.authorization || "").trim();
+    const bearer = authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7).trim()
+      : "";
+    const internalKey = String(
+      req.headers["x-internal-billing-key"] ||
+        req.headers["x-agently-internal-key"] ||
+        "",
+    ).trim();
+    const expectedInternal = getInternalBillingKey();
+
+    const cronAuthorized =
+      cronSecret.length >= 16 && bearer.length > 0 && bearer === cronSecret;
+    const internalAuthorized =
+      isSafeInternalKey(expectedInternal) && internalKey === expectedInternal;
+
+    if (!cronAuthorized && !internalAuthorized) {
+      return res.status(403).json({
+        error: {
+          code: "CRON_ACCESS_REQUIRED",
+          message:
+            "Set CRON_SECRET (16+ chars) on the backend and let Vercel Cron call this route.",
+        },
+      });
+    }
+
+    const result = await runVendorRateSync({
+      providers: DEFAULT_PROVIDERS,
+      hours: Number(req.query.hours || 168), // one week
+    });
+    console.log("[vendor-rate-sync] scheduled run finished", {
+      providers: Array.isArray(result?.runs) ? result.runs.length : null,
+    });
+    res.json({ success: true, scheduled: true, result });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.use(requireInternalBillingAccess);
 
 router.get("/plans", async (_req, res, next) => {
