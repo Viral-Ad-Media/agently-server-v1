@@ -39,6 +39,7 @@ const {
 const {
   runOrgFullCostReconciliation,
 } = require("../../lib/org-full-cost-reconciler");
+const { runPhase2ProviderSync } = require("../../lib/provider-resource-sync");
 
 const router = express.Router();
 
@@ -2378,7 +2379,38 @@ router.get("/vendor-rate-sync/cron", async (req, res, next) => {
     console.log("[vendor-rate-sync] scheduled run finished", {
       providers: Array.isArray(result?.runs) ? result.runs.length : null,
     });
-    res.json({ success: true, scheduled: true, result });
+
+    // Recurring provider charges are emitted by these two jobs, and nothing
+    // was scheduling them: Twilio number rentals last billed 2026-07-30 and
+    // Supabase compute 2026-07-04, so months of real cost never reached any
+    // tenant's ledger. They run here, daily, alongside the rate refresh.
+    // Each is isolated — one failing must not stop the others or fail the
+    // whole cron, which would mask the remaining work.
+    const jobs = { vendorRates: "ok" };
+
+    try {
+      const providerSync = await runPhase2ProviderSync({});
+      jobs.providerResources = {
+        ok: true,
+        numbers: providerSync?.twilio?.numbersProcessed ?? null,
+      };
+    } catch (err) {
+      jobs.providerResources = { ok: false, error: err?.message || String(err) };
+      console.error("[provider-resource-sync] scheduled run failed:", err?.message || err);
+    }
+
+    try {
+      const reconciliation = await runOrgFullCostReconciliation({});
+      jobs.orgFullCost = {
+        ok: true,
+        organizations: reconciliation?.organizationsProcessed ?? null,
+      };
+    } catch (err) {
+      jobs.orgFullCost = { ok: false, error: err?.message || String(err) };
+      console.error("[org-full-cost-reconciler] scheduled run failed:", err?.message || err);
+    }
+
+    res.json({ success: true, scheduled: true, jobs, result });
   } catch (err) {
     next(err);
   }

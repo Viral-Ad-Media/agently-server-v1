@@ -3,7 +3,7 @@
   "crons": [
     {
       "path": "/api/billing-usage/vendor-rate-sync/cron",
-      "schedule": "0 6 * * 1"
+      "schedule": "0 6 * * *"
     }
   ],
   "builds": [
