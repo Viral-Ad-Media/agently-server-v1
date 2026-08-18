@@ -21,27 +21,6 @@ const {
   getNumberRetentionStatus,
 } = require("../../lib/number-retention");
 const { isAutoWalletChargeEnabled } = require("../../lib/usage-ledger");
-/**
- * True only for the platform operator, identified the same way
- * lib/super-admin-auth.js identifies them: a match against SUPER_ADMIN_EMAIL.
- *
- * Note this deliberately does NOT use requireSuperAdmin from that module —
- * that guard authenticates a separate super-admin JWT (issuer
- * "agently-super-admin") rather than the tenant session, so it cannot be
- * chained after requireAuth and would also leave req.orgId undefined.
- * This predicate works against the ordinary session that the route already
- * authenticates, and returns false when SUPER_ADMIN_EMAIL is unset.
- */
-function isSuperAdminRequest(req) {
-  const configured = String(process.env.SUPER_ADMIN_EMAIL || "")
-    .trim()
-    .toLowerCase();
-  if (!configured) return false;
-  const email = String(req?.user?.email || "")
-    .trim()
-    .toLowerCase();
-  return Boolean(email) && email === configured;
-}
 const { getBillingPlatformSettings } = require("../../lib/billing-settings");
 const {
   stripeConfigured,
@@ -61,10 +40,6 @@ function warnThrottled(key, ...args) {
   if (now - previous < 15000) return;
   warningThrottle.set(key, now);
   console.warn(...args);
-}
-
-function parseBillingDemoBool(value) {
-  return ["1", "true", "yes", "on"].includes(String(value || "").toLowerCase());
 }
 
 function currentCreditEnforcementMode() {
@@ -715,12 +690,14 @@ router.get(
         ...wallet,
         // Only ever advertise the unverified demo top-up to a super admin.
         // Billing.tsx falls back to this path whenever Stripe is not
-        // configured, so reporting it to a tenant is what turned a missing
-        // Stripe key into free self-service credit. Tenants now correctly see
-        // "card top-ups are not configured yet" instead.
-        demoTopUpEnabled:
-          parseBillingDemoBool(process.env.BILLING_DEMO_TOPUP_ENABLED) &&
-          isSuperAdminRequest(req),
+        // Always false. The unverified demo top-up route has been deleted
+        // outright so it cannot be re-enabled by flipping an env var. Tenants
+        // top up by card through Stripe; internal testers are credited from
+        // the super-admin dashboard via
+        // POST /api/super-admin/wallets/:organizationId/top-up, which is
+        // behind requireSuperAdmin and can target any organization.
+        // The field is retained so older deployed clients keep parsing.
+        demoTopUpEnabled: false,
         stripeTopUpEnabled: stripeConfigured(),
         stripeWebhookConfigured: stripeConfigured(),
         creditEnforcementMode: currentCreditEnforcementMode(),
@@ -750,93 +727,6 @@ router.get(
   }),
 );
 
-// ── POST /api/billing/wallet/demo-top-up ─────────────────────
-// SECURITY: this credits a wallet with real spendable balance and is NOT
-// payment-verified. It previously ran behind requireAdmin, which is the
-// TENANT's own role check (Owner/Admin) — so any tenant administrator could
-// mint themselves up to $500 per request, unlimited times, purely because
-// BILLING_DEMO_TOPUP_ENABLED was left true in production. It is now behind
-// requireSuperAdmin, the same guard the super-admin dashboard uses, so the
-// env flag is no longer the only thing preventing self-crediting.
-router.post(
-  "/billing/wallet/demo-top-up",
-  requireAuth,
-  requireAdmin,
-  asyncHandler(async (req, res) => {
-    if (!isSuperAdminRequest(req)) {
-      console.warn("[billing] demo top-up refused for non-super-admin", {
-        organizationId: req.orgId,
-        userId: req.user?.id || null,
-        userEmail: req.user?.email || null,
-        role: req.user?.role || null,
-      });
-      return res.status(403).json({
-        error: {
-          code: "SUPER_ADMIN_REQUIRED",
-          message: "Wallet credit can only be added through checkout.",
-        },
-      });
-    }
-    if (!parseBillingDemoBool(process.env.BILLING_DEMO_TOPUP_ENABLED)) {
-      return res.status(403).json({
-        error: {
-          message:
-            "Demo wallet top-up is disabled. Set BILLING_DEMO_TOPUP_ENABLED=true on the backend to use this manual test mode.",
-        },
-      });
-    }
-
-    const amountUsd = Number(req.body?.amountUsd ?? req.body?.amount_usd ?? 10);
-    if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
-      return res
-        .status(400)
-        .json({ error: { message: "amountUsd must be greater than zero." } });
-    }
-    if (amountUsd > 500) {
-      return res.status(400).json({
-        error: { message: "Demo wallet top-up is capped at $500 per request." },
-      });
-    }
-
-    const db = getSupabase();
-    const { data, error } = await db.rpc("billing_admin_top_up_wallet", {
-      p_organization_id: req.orgId,
-      p_amount_usd: amountUsd,
-      p_source: "manual_demo_top_up",
-      p_external_id: req.body?.externalId || `demo-top-up-${Date.now()}`,
-      p_metadata: {
-        manual_demo: true,
-        performed_by_user_id: req.user?.id || null,
-        performed_by_user_email: req.user?.email || null,
-        note: "Manual wallet credit used for billing-system demonstration. Replace with payment-gateway webhook when live.",
-        ...(req.body?.metadata || {}),
-      },
-    });
-
-    if (error) {
-      return res.status(500).json({
-        error: {
-          message:
-            error.message ||
-            "Unable to add demo wallet credit. Confirm the V41 wallet migration has been run.",
-        },
-      });
-    }
-
-    const wallet = await loadCustomerWalletSummary(db, req.orgId, 150);
-    res.json({
-      success: true,
-      source: "billing_admin_top_up_wallet",
-      mode: "manual_demo_top_up",
-      transaction: data,
-      wallet: {
-        ...wallet,
-        demoTopUpEnabled: true,
-      },
-      note: "This simulates a real top-up. It is not payment-verified and should be replaced by gateway webhook crediting before production billing.",
-    });
-  }),
-);
 
 // ── PATCH /api/billing/plan ──────────────────────────────────
 router.patch(
@@ -1739,8 +1629,12 @@ router.get(
         String(lead.status || "").toLowerCase(),
       ),
     ).length;
+    // "model" is the role this platform actually writes for assistant turns —
+    // it was missing from this list, so the Chatbot answers card counted zero
+    // no matter how many replies the bot had sent. The other names are kept
+    // for older rows and any future writer.
     const chatbotMessagesAnswered = chatMessages.filter((message) =>
-      ["assistant", "bot", "agent"].includes(
+      ["assistant", "bot", "agent", "model"].includes(
         String(message.role || message.sender || "").toLowerCase(),
       ),
     ).length;
