@@ -349,15 +349,43 @@ router.post(
 
     const { data: selected } = await db
       .from("knowledge_discovered_pages")
-      .select("id")
+      .select("id,scrape_status")
       .eq("discovery_id", discoveryId)
       .eq("organization_id", req.orgId)
       .eq("is_selected", true);
 
-    const pageCount = (selected || []).length;
-    if (!pageCount) {
+    const selectedRows = selected || [];
+    const willRescrapeCompleted =
+      req.body?.rescrapeCompleted === true || req.body?.forceRescrape === true;
+    const forcedIds = new Set(
+      Array.isArray(req.body?.rescrapePageIds) ? req.body.rescrapePageIds : [],
+    );
+
+    // Count only the pages this job will actually read, so progress reflects
+    // real work. Counting the whole selection made a job that re-read one new
+    // page report "1 of 10" and sit at 10% forever.
+    const pageCount = selectedRows.filter(
+      (p) =>
+        willRescrapeCompleted ||
+        forcedIds.has(p.id) ||
+        p.scrape_status !== "completed",
+    ).length;
+
+    if (!selectedRows.length) {
       return res.status(400).json({
         error: { message: "Choose at least one page before starting." },
+      });
+    }
+
+    // Everything selected is already read. Say so rather than starting a job
+    // that would bill for nothing and immediately complete.
+    if (!pageCount) {
+      return res.status(400).json({
+        error: {
+          code: "NOTHING_TO_SCRAPE",
+          message:
+            "Every selected page has already been read. Select a new page, or choose re-scrape on a page to read it again.",
+        },
       });
     }
 
@@ -394,7 +422,24 @@ router.post(
       });
     }
 
-    await db
+    // Queue only pages that still need reading.
+    //
+    // This used to reset EVERY selected page to "queued", so selecting one
+    // extra page re-scraped the entire selection. With nine pages already
+    // done, adding a tenth re-read all ten — and pages are billed per read,
+    // so the customer paid nine times over for content that had not changed.
+    //
+    // Completed pages are now left alone unless the caller explicitly asks to
+    // re-read them (the UI's "re-scrape this page" action), which is also what
+    // makes the content_hash short-circuit in the worker meaningful.
+    const rescrapeCompleted =
+      req.body?.rescrapeCompleted === true ||
+      req.body?.forceRescrape === true;
+    const forcedPageIds = Array.isArray(req.body?.rescrapePageIds)
+      ? req.body.rescrapePageIds.filter(Boolean)
+      : [];
+
+    let queueQuery = db
       .from("knowledge_discovered_pages")
       .update({
         scrape_status: "queued",
@@ -404,6 +449,25 @@ router.post(
       .eq("discovery_id", discoveryId)
       .eq("organization_id", req.orgId)
       .eq("is_selected", true);
+
+    if (!rescrapeCompleted) {
+      queueQuery = queueQuery.neq("scrape_status", "completed");
+    }
+    await queueQuery;
+
+    // Explicitly forced pages are re-queued even though they are completed.
+    if (!rescrapeCompleted && forcedPageIds.length) {
+      await db
+        .from("knowledge_discovered_pages")
+        .update({
+          scrape_status: "queued",
+          scrape_progress: 0,
+          updated_at: nowIso(),
+        })
+        .eq("discovery_id", discoveryId)
+        .eq("organization_id", req.orgId)
+        .in("id", forcedPageIds);
+    }
 
     const { data: job, error } = await db
       .from("knowledge_scrape_jobs")
