@@ -214,11 +214,11 @@ safeMount("/api/blog", () => require("./routes/blog"), "blog");
 // assistant admin screen — which is why that screen could not finish loading.
 // The file is now named for what it is.
 //
-// NOTE: /api/super-admin/platform has no router. The admin screen calls
-// /platform, /platform/chatbot, /platform/settings, /platform/faqs,
-// /platform/sources and /platform/support-requests, and none of those exist
-// server-side. Leaving it unmounted so it fails honestly with a 404 instead
-// of returning tour data that the screen cannot parse.
+safeMount(
+  "/api/super-admin/platform",
+  () => require("./routes/super-admin-platform"),
+  "super-admin-platform",
+);
 safeMount(
   "/api/super-admin/tour",
   () => require("./routes/super-admin-tour"),

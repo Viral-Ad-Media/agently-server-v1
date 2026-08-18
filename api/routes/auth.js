@@ -165,7 +165,7 @@ router.post(
         name: companyName.trim(),
         onboarded: false,
         plan: "Starter",
-        subscription_status: "trialing",
+        subscription_status: "active",
         subscription_period_end: new Date(
           Date.now() + 30 * 24 * 60 * 60 * 1000,
         ).toISOString(),
@@ -374,7 +374,7 @@ router.post(
           name: "My Business",
           onboarded: false,
           plan: "Starter",
-          subscription_status: "trialing",
+          subscription_status: "active",
           subscription_period_end: new Date(
             Date.now() + 30 * 24 * 60 * 60 * 1000,
           ).toISOString(),
