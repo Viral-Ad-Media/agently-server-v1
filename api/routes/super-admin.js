@@ -321,6 +321,143 @@ router.get("/auth/session", (req, res) => {
   res.json({ authenticated: true, email: req.superAdmin.email });
 });
 
+// ── GET /api/super-admin/tenant-economics ────────────────────
+// Per-tenant spend, true provider cost, and our margin. Sits behind the
+// router-level requireSuperAdmin above, so it is never reachable by a tenant
+// — this exposes internal cost and profit, which tenants must not see.
+// ?format=csv returns a downloadable file instead of JSON.
+router.get(
+  "/tenant-economics",
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+
+    // Aggregate per organization from the charge ledger.
+    const { data: charges, error: chargeError } = await db
+      .from("billing_customer_usage_charges")
+      .select(
+        "organization_id,provider,service,quantity,unit,internal_cost_usd,customer_charge_usd,gross_profit_usd",
+      )
+      .limit(50000);
+    if (chargeError) throw chargeError;
+
+    const byOrg = new Map();
+    for (const row of charges || []) {
+      const orgId = row.organization_id || "unknown";
+      if (!byOrg.has(orgId)) {
+        byOrg.set(orgId, {
+          organizationId: orgId,
+          organizationName: "",
+          walletBalanceUsd: null,
+          cost: 0,
+          charged: 0,
+          profit: 0,
+          lines: new Map(),
+        });
+      }
+      const org = byOrg.get(orgId);
+      const cost = Number(row.internal_cost_usd || 0);
+      const charged = Number(row.customer_charge_usd || 0);
+      org.cost += cost;
+      org.charged += charged;
+      org.profit += Number(row.gross_profit_usd || 0);
+      const key = `${row.provider}/${row.service}`;
+      const line = org.lines.get(key) || { line: key, unit: row.unit, quantity: 0, cost: 0, charged: 0 };
+      line.quantity += Number(row.quantity || 0);
+      line.cost += cost;
+      line.charged += charged;
+      org.lines.set(key, line);
+    }
+
+    // Attach names and live wallet balances.
+    const orgIds = [...byOrg.keys()].filter((id) => id !== "unknown");
+    if (orgIds.length) {
+      const [{ data: orgs }, { data: wallets }] = await Promise.all([
+        db.from("organizations").select("id,name").in("id", orgIds),
+        db.from("billing_wallets").select("organization_id,balance_usd").in("organization_id", orgIds),
+      ]);
+      for (const o of orgs || []) {
+        const row = byOrg.get(o.id);
+        if (row) row.organizationName = o.name || "";
+      }
+      for (const w of wallets || []) {
+        const row = byOrg.get(w.organization_id);
+        if (row) row.walletBalanceUsd = Number(w.balance_usd || 0);
+      }
+    }
+
+    const round = (v) => Math.round(Number(v || 0) * 1e6) / 1e6;
+    const tenants = [...byOrg.values()]
+      .map((o) => ({
+        organizationId: o.organizationId,
+        organizationName: o.organizationName,
+        walletBalanceUsd: o.walletBalanceUsd,
+        providerCostUsd: round(o.cost),
+        chargedUsd: round(o.charged),
+        grossProfitUsd: round(o.profit),
+        marginPercent: o.charged > 0 ? Math.round((1000 * o.profit) / o.charged) / 10 : null,
+        multiple: o.cost > 0 ? Math.round((1000 * o.charged) / o.cost) / 1000 : null,
+        lines: [...o.lines.values()]
+          .map((l) => ({ ...l, cost: round(l.cost), charged: round(l.charged) }))
+          .sort((a, b) => b.cost - a.cost),
+      }))
+      .sort((a, b) => b.chargedUsd - a.chargedUsd);
+
+    const totals = tenants.reduce(
+      (acc, t) => ({
+        providerCostUsd: round(acc.providerCostUsd + t.providerCostUsd),
+        chargedUsd: round(acc.chargedUsd + t.chargedUsd),
+        grossProfitUsd: round(acc.grossProfitUsd + t.grossProfitUsd),
+      }),
+      { providerCostUsd: 0, chargedUsd: 0, grossProfitUsd: 0 },
+    );
+
+    if (String(req.query.format || "").toLowerCase() === "csv") {
+      const esc = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+      const rows = [
+        ["Organization", "Org ID", "Line", "Unit", "Quantity", "Our cost USD", "Charged USD", "Profit USD"],
+      ];
+      for (const t of tenants) {
+        for (const l of t.lines) {
+          rows.push([
+            t.organizationName,
+            t.organizationId,
+            l.line,
+            l.unit || "",
+            l.quantity,
+            l.cost.toFixed(6),
+            l.charged.toFixed(6),
+            (l.charged - l.cost).toFixed(6),
+          ]);
+        }
+        rows.push([t.organizationName, t.organizationId, "TOTAL", "", "", t.providerCostUsd.toFixed(6), t.chargedUsd.toFixed(6), t.grossProfitUsd.toFixed(6)]);
+      }
+      rows.push(["ALL TENANTS", "", "TOTAL", "", "", totals.providerCostUsd.toFixed(6), totals.chargedUsd.toFixed(6), totals.grossProfitUsd.toFixed(6)]);
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="agently-tenant-economics-${new Date().toISOString().slice(0, 10)}.csv"`,
+      );
+      return res.send(rows.map((r) => r.map(esc).join(",")).join("\n"));
+    }
+
+    res.json({
+      generatedAt: new Date().toISOString(),
+      totals: {
+        ...totals,
+        marginPercent:
+          totals.chargedUsd > 0
+            ? Math.round((1000 * totals.grossProfitUsd) / totals.chargedUsd) / 10
+            : null,
+        multiple:
+          totals.providerCostUsd > 0
+            ? Math.round((1000 * totals.chargedUsd) / totals.providerCostUsd) / 1000
+            : null,
+      },
+      tenants,
+    });
+  }),
+);
+
 router.get(
   "/overview",
   asyncHandler(async (_req, res) => {
