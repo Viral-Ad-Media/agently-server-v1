@@ -207,11 +207,18 @@ safeMount("/api/blog", () => require("./routes/blog"), "blog");
 // If it were mounted after, every /api/super-admin/platform/* request would
 // first traverse the super-admin router, run requireSuperAdmin, match nothing,
 // and fall through — authenticating twice for no benefit.
-safeMount(
-  "/api/super-admin/platform",
-  () => require("./routes/super-admin-platform"),
-  "super-admin-platform",
-);
+// The tour router was saved as super-admin-platform.js while its own header
+// declared it to be super-admin-tour.js. The result: /api/super-admin/tour
+// failed to require and served the "route unavailable at startup" stub, while
+// /api/super-admin/platform silently served TOUR endpoints to the platform
+// assistant admin screen — which is why that screen could not finish loading.
+// The file is now named for what it is.
+//
+// NOTE: /api/super-admin/platform has no router. The admin screen calls
+// /platform, /platform/chatbot, /platform/settings, /platform/faqs,
+// /platform/sources and /platform/support-requests, and none of those exist
+// server-side. Leaving it unmounted so it fails honestly with a 404 instead
+// of returning tour data that the screen cannot parse.
 safeMount(
   "/api/super-admin/tour",
   () => require("./routes/super-admin-tour"),
