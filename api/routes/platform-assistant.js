@@ -34,7 +34,13 @@ const {
   answerFromFaqsOnly,
   createSupportRequest,
   SUPPORT_EMAIL,
+  MAX_SUPPORT_ATTACHMENTS,
+  ALLOWED_ATTACHMENT_MIME,
+  MAX_ATTACHMENT_BYTES,
+  SUPPORT_ATTACHMENT_BUCKET,
 } = require("../../lib/platform-assistant");
+const crypto = require("crypto");
+const { getSupabase } = require("../../lib/supabase");
 
 const router = express.Router();
 
@@ -256,6 +262,7 @@ router.post(
       subject: subject || "Support request from the Agently assistant",
       body: String(body).trim(),
       conversationExcerpt: excerpt,
+      attachments: req.body?.attachments,
     });
 
     res.json({
@@ -263,6 +270,70 @@ router.post(
       requestId: request.id,
       supportEmail: SUPPORT_EMAIL,
       message: `Logged it. The team will reply to ${request.contact_email || "your account email"}. You can also email ${SUPPORT_EMAIL} directly with anything you want to add.`,
+    });
+  }),
+);
+
+/**
+ * POST /api/platform-assistant/attachments/upload-url
+ *
+ * Hands back a short-lived signed upload URL for one screenshot. The browser
+ * PUTs the file straight to Supabase Storage, so image bytes never pass
+ * through this API.
+ *
+ * The path is {organization_id}/{uuid}.{ext}, and the bucket's RLS policy
+ * requires the first segment to match the caller's own organization — a
+ * tenant cannot write into another tenant's folder even with a hand-crafted
+ * request. The bucket is private and has no read policy at all, so an
+ * uploaded file cannot be read back by any tenant, including the uploader.
+ */
+router.post(
+  "/attachments/upload-url",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const mime = String(req.body?.mime || "").toLowerCase();
+    const bytes = Number(req.body?.bytes || 0);
+
+    if (!ALLOWED_ATTACHMENT_MIME.has(mime)) {
+      return res.status(400).json({
+        error: {
+          code: "UNSUPPORTED_IMAGE",
+          message: "Screenshots must be PNG, JPEG or WebP.",
+        },
+      });
+    }
+    if (!Number.isFinite(bytes) || bytes <= 0 || bytes > MAX_ATTACHMENT_BYTES) {
+      return res.status(400).json({
+        error: {
+          code: "IMAGE_TOO_LARGE",
+          message: `Each screenshot must be under ${Math.round(MAX_ATTACHMENT_BYTES / (1024 * 1024))}MB.`,
+        },
+      });
+    }
+    if (!req.orgId) {
+      return res.status(400).json({
+        error: { code: "NO_ORGANIZATION", message: "No organization on this session." },
+      });
+    }
+
+    const ext = mime === "image/png" ? "png" : mime === "image/webp" ? "webp" : "jpg";
+    const path = `${req.orgId}/${crypto.randomUUID()}.${ext}`;
+
+    const db = getSupabase();
+    const { data, error } = await db.storage
+      .from(SUPPORT_ATTACHMENT_BUCKET)
+      .createSignedUploadUrl(path);
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      path,
+      mime,
+      bytes,
+      uploadUrl: data?.signedUrl,
+      token: data?.token,
+      bucket: SUPPORT_ATTACHMENT_BUCKET,
+      maxAttachments: MAX_SUPPORT_ATTACHMENTS,
     });
   }),
 );

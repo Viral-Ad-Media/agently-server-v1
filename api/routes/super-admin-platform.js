@@ -412,6 +412,48 @@ router.delete(
   }),
 );
 
+// ── GET /support-requests/:id/attachments ────────────────────
+// Screenshots live in a private bucket with no tenant read policy, so they
+// can only be viewed through a signed URL minted here. Links expire after
+// five minutes: long enough to open, short enough that a copied URL pasted
+// into a ticket or chat stops working quickly.
+router.get(
+  "/support-requests/:id/attachments",
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const { data: request, error } = await db
+      .from("platform_support_requests")
+      .select("id,attachments")
+      .eq("id", req.params.id)
+      .maybeSingle();
+    if (error) throw error;
+    if (!request) {
+      return res.status(404).json({
+        error: { code: "NOT_FOUND", message: "Support request not found." },
+      });
+    }
+
+    const files = Array.isArray(request.attachments) ? request.attachments : [];
+    const signed = await Promise.all(
+      files.map(async (file) => {
+        const { data, error: signError } = await db.storage
+          .from("support-attachments")
+          .createSignedUrl(String(file.path || ""), 300);
+        return {
+          path: file.path,
+          mime: file.mime,
+          bytes: file.bytes,
+          uploadedAt: file.uploadedAt,
+          url: signError ? null : data?.signedUrl || null,
+          error: signError ? signError.message : null,
+        };
+      }),
+    );
+
+    res.json({ requestId: request.id, attachments: signed, expiresInSeconds: 300 });
+  }),
+);
+
 // ── Support requests ─────────────────────────────────────────
 router.patch(
   "/support-requests/:id",
