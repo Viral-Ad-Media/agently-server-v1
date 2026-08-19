@@ -102,7 +102,7 @@ router.get(
       db
         .from("platform_support_requests")
         .select(
-          "id,contact_name,contact_email,subject,body,status,created_at,organization_id",
+          "id,contact_name,contact_email,subject,body,status,created_at,organization_id,attachments",
         )
         .order("created_at", { ascending: false })
         .limit(200)
@@ -151,6 +151,7 @@ router.get(
         body: str(s.body),
         status: str(s.status, "open"),
         createdAt: s.created_at,
+        attachments: Array.isArray(s.attachments) ? s.attachments : [],
       })),
     });
   }),
