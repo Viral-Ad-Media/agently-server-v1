@@ -350,9 +350,6 @@ router.post(
     }
 
     try {
-      const { getOpenAI } = require("../../lib/openai-client");
-      const { toFile } = require("openai");
-      const openai = getOpenAI();
       // toFile(), not `new File(...)`: File only became a Node global in v20
       // and this service declares engines ">=18", so constructing one directly
       // throws a ReferenceError on an 18.x runtime and every transcription
@@ -377,14 +374,67 @@ router.post(
                 : mime.includes("flac")
                   ? "flac"
                   : "webm";
-      const file = await toFile(buffer, `voice.${ext}`, {
-        type: mime || "audio/webm",
+      // Call the REST endpoint directly instead of going through the SDK.
+      //
+      // Logs proved the audio arrives intact (7.9KB received) and the SDK
+      // still returned "Connection error." — its multipart upload path fails
+      // on this serverless runtime. A plain fetch with a global FormData and
+      // Blob uses the platform's own HTTP stack, which is the same one every
+      // other working request here uses.
+      const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+      if (!apiKey) {
+        return res
+          .status(500)
+          .json({ error: { message: "OPENAI_API_KEY is not configured." } });
+      }
+
+      const form = new FormData();
+      form.append(
+        "file",
+        new Blob([buffer], { type: mime || "audio/webm" }),
+        `voice.${ext}`,
+      );
+      form.append("model", process.env.OPENAI_TRANSCRIBE_MODEL || "whisper-1");
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 45000);
+      let response;
+      try {
+        response = await fetch(
+          "https://api.openai.com/v1/audio/transcriptions",
+          {
+            method: "POST",
+            headers: { Authorization: `Bearer ${apiKey}` },
+            body: form,
+            signal: controller.signal,
+          },
+        );
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      const bodyText = await response.text();
+      if (!response.ok) {
+        console.error("[messenger/transcribe] OpenAI rejected", {
+          status: response.status,
+          body: bodyText.slice(0, 500),
+        });
+        let apiMessage = `Transcription failed (${response.status}).`;
+        try {
+          apiMessage = JSON.parse(bodyText)?.error?.message || apiMessage;
+        } catch (_) {
+          /* keep the status-based message */
+        }
+        return res
+          .status(500)
+          .json({ error: { message: `Could not transcribe that recording: ${apiMessage}` } });
+      }
+
+      const parsed = JSON.parse(bodyText);
+      console.log("[messenger/transcribe] ok", {
+        chars: (parsed.text || "").length,
       });
-      const result = await openai.audio.transcriptions.create({
-        file,
-        model: process.env.OPENAI_TRANSCRIBE_MODEL || "whisper-1",
-      });
-      return res.json({ text: result.text || "" });
+      return res.json({ text: parsed.text || "" });
     } catch (err) {
       // Include the real reason. This endpoint is tenant-authenticated, and a
       // generic "could not transcribe" cost several rounds of guessing at what
