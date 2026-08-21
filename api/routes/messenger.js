@@ -324,10 +324,26 @@ router.post(
   requireAuth,
   express.raw({ type: ["audio/*", "application/octet-stream"], limit: "15mb" }),
   asyncHandler(async (req, res) => {
-    const buffer = Buffer.isBuffer(req.body)
-      ? req.body
-      : Buffer.from(req.body || "");
-    if (!buffer.length) {
+    // Read the body defensively. express.raw normally leaves a Buffer here,
+    // but the serverless runtime can hand the request over already consumed
+    // or unparsed depending on content-type, so fall back to draining the
+    // stream rather than assuming.
+    let buffer = Buffer.isBuffer(req.body) ? req.body : null;
+    if (!buffer || !buffer.length) {
+      buffer = await new Promise((resolve) => {
+        const parts = [];
+        req.on("data", (c) => parts.push(c));
+        req.on("end", () => resolve(Buffer.concat(parts)));
+        req.on("error", () => resolve(Buffer.alloc(0)));
+      }).catch(() => Buffer.alloc(0));
+    }
+
+    console.log("[messenger/transcribe] received", {
+      bytes: buffer?.length || 0,
+      contentType: req.headers["content-type"] || "(none)",
+    });
+
+    if (!buffer || !buffer.length) {
       return res
         .status(400)
         .json({ error: { message: "No audio received. Try recording again." } });
@@ -352,11 +368,20 @@ router.post(
       });
       return res.json({ text: result.text || "" });
     } catch (err) {
-      console.error("[messenger/transcribe] failed:", err?.message || err);
+      // Include the real reason. This endpoint is tenant-authenticated, and a
+      // generic "could not transcribe" cost several rounds of guessing at what
+      // was actually failing.
+      const detail =
+        err?.error?.message || err?.message || String(err || "unknown error");
+      console.error("[messenger/transcribe] failed:", {
+        detail,
+        status: err?.status || err?.statusCode || null,
+        type: err?.type || err?.name || null,
+      });
       return res.status(500).json({
         error: {
-          message:
-            "Could not transcribe that recording. Please try again, or type your message.",
+          message: `Could not transcribe that recording: ${detail}`,
+          detail,
         },
       });
     }
