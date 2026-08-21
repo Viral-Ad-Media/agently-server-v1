@@ -308,4 +308,52 @@ router.post(
   }),
 );
 
+/**
+ * POST /api/messenger/transcribe
+ *
+ * Speech-to-text for the in-app chatbot preview's mic button.
+ *
+ * This route did not exist. The preview recorded audio, POSTed it here, got a
+ * 404, swallowed the error, and put nothing in the input box — which is why
+ * "Press mic to record" never produced text or a send button. The public
+ * widget has had a working equivalent at /api/chatbot-public/transcribe all
+ * along; this is the same implementation behind tenant auth.
+ */
+router.post(
+  "/transcribe",
+  requireAuth,
+  express.raw({ type: ["audio/*", "application/octet-stream"], limit: "15mb" }),
+  asyncHandler(async (req, res) => {
+    const buffer = Buffer.isBuffer(req.body)
+      ? req.body
+      : Buffer.from(req.body || "");
+    if (!buffer.length) {
+      return res
+        .status(400)
+        .json({ error: { message: "No audio received. Try recording again." } });
+    }
+
+    try {
+      const { getOpenAI } = require("../../lib/openai-client");
+      const openai = getOpenAI();
+      const file = new File([buffer], "voice.webm", {
+        type: req.headers["content-type"] || "audio/webm",
+      });
+      const result = await openai.audio.transcriptions.create({
+        file,
+        model: "gpt-4o-mini-transcribe",
+      });
+      return res.json({ text: result.text || "" });
+    } catch (err) {
+      console.error("[messenger/transcribe] failed:", err?.message || err);
+      return res.status(500).json({
+        error: {
+          message:
+            "Could not transcribe that recording. Please try again, or type your message.",
+        },
+      });
+    }
+  }),
+);
+
 module.exports = router;
