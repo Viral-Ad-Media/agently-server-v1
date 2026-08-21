@@ -520,12 +520,15 @@ router.post(
     if (!buffer.length)
       return res.status(400).json({ error: { message: "No audio received." } });
     const openai = getOpenAI();
-    const file = new File([buffer], "voice.webm", {
+    // Same File-global hazard as /api/messenger/transcribe: File is only a
+    // Node global from v20 and this service declares engines ">=18".
+    const { toFile } = require("openai");
+    const file = await toFile(buffer, "voice.webm", {
       type: req.headers["content-type"] || "audio/webm",
     });
     const result = await openai.audio.transcriptions.create({
       file,
-      model: "gpt-4o-mini-transcribe",
+      model: process.env.OPENAI_TRANSCRIBE_MODEL || "whisper-1",
     });
     res.json({ text: result.text || "" });
   }),

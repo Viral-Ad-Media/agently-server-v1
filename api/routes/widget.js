@@ -488,8 +488,17 @@ body{margin:0!important;padding:0!important;display:block!important;visibility:v
 body>*:not(#agently-root):not(script){display:none!important}
 :root{--a:${cfg.accentColor};--ad:${cfg.accentColor}cc;--al:${cfg.accentColor}18}
 #agently-root{position:absolute!important;bottom:0!important;${cfg.position}:0!important;left:auto;right:auto;width:100%;height:100%;max-width:none;max-height:none;overflow:visible;display:block!important;visibility:visible!important;z-index:2147483647}
-#launcher{position:absolute;bottom:0;${cfg.position}:20px;width:56px;height:56px;background:var(--a);border-radius:50%;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(0,0,0,.22);color:#fff;z-index:2147483646;transition:transform .2s,box-shadow .2s;}
-#launcher:hover{transform:scale(1.08);box-shadow:0 6px 24px rgba(0,0,0,.28)}
+/* Centred, not corner-anchored.
+   The closed widget is a 72px iframe and this button is 56px. Pinning it to
+   ${cfg.position}:20px put its far edge at 72 - 20 - 56 = -4px, i.e. 4px
+   outside the iframe, and an iframe clips its content no matter what
+   overflow says — which is why the bubble looked shaved off on one side.
+   Centring leaves 8px clear all round, and the 1.08 hover scale (60.5px)
+   still fits. */
+#launcher{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:56px;height:56px;background:var(--a);border-radius:50%;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(0,0,0,.22);color:#fff;z-index:2147483646;transition:transform .2s,box-shadow .2s;}
+/* Must repeat the centring translate — a bare scale() here would replace the
+   transform above and snap the button back to the corner on hover. */
+#launcher:hover{transform:translate(-50%,-50%) scale(1.08);box-shadow:0 6px 24px rgba(0,0,0,.28)}
 #launcher svg{pointer-events:none}
 #cw{position:absolute;inset:0;width:100%;height:100%;max-width:none;max-height:none;background:#fff;border-radius:22px;box-shadow:0 12px 48px rgba(0,0,0,.18),0 2px 8px rgba(0,0,0,.08);display:flex;flex-direction:column;overflow:hidden;z-index:2147483647;transform-origin:bottom ${cfg.position};transition:transform .25s cubic-bezier(.34,1.56,.64,1),opacity .2s;}
 #cw.hide{transform:scale(.85) translateY(12px);opacity:0;pointer-events:none}

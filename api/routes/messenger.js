@@ -335,13 +335,20 @@ router.post(
 
     try {
       const { getOpenAI } = require("../../lib/openai-client");
+      const { toFile } = require("openai");
       const openai = getOpenAI();
-      const file = new File([buffer], "voice.webm", {
-        type: req.headers["content-type"] || "audio/webm",
-      });
+      // toFile(), not `new File(...)`: File only became a Node global in v20
+      // and this service declares engines ">=18", so constructing one directly
+      // throws a ReferenceError on an 18.x runtime and every transcription
+      // fails with a generic error. The SDK helper works on any version.
+      const file = await toFile(
+        buffer,
+        "voice.webm",
+        { type: req.headers["content-type"] || "audio/webm" },
+      );
       const result = await openai.audio.transcriptions.create({
         file,
-        model: "gpt-4o-mini-transcribe",
+        model: process.env.OPENAI_TRANSCRIBE_MODEL || "whisper-1",
       });
       return res.json({ text: result.text || "" });
     } catch (err) {
