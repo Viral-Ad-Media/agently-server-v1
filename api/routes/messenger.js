@@ -357,11 +357,29 @@ router.post(
       // and this service declares engines ">=18", so constructing one directly
       // throws a ReferenceError on an 18.x runtime and every transcription
       // fails with a generic error. The SDK helper works on any version.
-      const file = await toFile(
-        buffer,
-        "voice.webm",
-        { type: req.headers["content-type"] || "audio/webm" },
-      );
+      // OpenAI identifies the format from the FILENAME EXTENSION, and rejects
+      // anything it cannot place with "Invalid file format". The browser sends
+      // Content-Type like "audio/webm;codecs=opus" — passing that through
+      // whole, or hardcoding .webm for a browser that actually recorded mp4
+      // (Safari) or ogg (Firefox), makes the extension disagree with the bytes.
+      // Strip the codecs parameter and pick the extension from the real type.
+      const rawType = String(req.headers["content-type"] || "audio/webm");
+      const mime = rawType.split(";")[0].trim().toLowerCase();
+      const ext =
+        mime.includes("ogg") || mime.includes("oga")
+          ? "ogg"
+          : mime.includes("mp4") || mime.includes("m4a")
+            ? "mp4"
+            : mime.includes("mpeg") || mime.includes("mp3")
+              ? "mp3"
+              : mime.includes("wav")
+                ? "wav"
+                : mime.includes("flac")
+                  ? "flac"
+                  : "webm";
+      const file = await toFile(buffer, `voice.${ext}`, {
+        type: mime || "audio/webm",
+      });
       const result = await openai.audio.transcriptions.create({
         file,
         model: process.env.OPENAI_TRANSCRIBE_MODEL || "whisper-1",

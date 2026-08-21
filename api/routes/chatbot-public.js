@@ -523,8 +523,22 @@ router.post(
     // Same File-global hazard as /api/messenger/transcribe: File is only a
     // Node global from v20 and this service declares engines ">=18".
     const { toFile } = require("openai");
-    const file = await toFile(buffer, "voice.webm", {
-      type: req.headers["content-type"] || "audio/webm",
+    // Extension must match the actual bytes or OpenAI returns "Invalid file
+    // format" — see the same handling in api/routes/messenger.js.
+    const rawType = String(req.headers["content-type"] || "audio/webm");
+    const mime = rawType.split(";")[0].trim().toLowerCase();
+    const ext =
+      mime.includes("ogg") || mime.includes("oga")
+        ? "ogg"
+        : mime.includes("mp4") || mime.includes("m4a")
+          ? "mp4"
+          : mime.includes("mpeg") || mime.includes("mp3")
+            ? "mp3"
+            : mime.includes("wav")
+              ? "wav"
+              : "webm";
+    const file = await toFile(buffer, `voice.${ext}`, {
+      type: mime || "audio/webm",
     });
     const result = await openai.audio.transcriptions.create({
       file,
