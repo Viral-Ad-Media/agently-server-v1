@@ -11,6 +11,7 @@ const {
   ensureWalletCreditOrRespond,
 } = require("../../lib/billing-credit-enforcement");
 const { loadVoiceContext } = require("../../lib/context-builder");
+const { sendProviderFailure } = require("../../lib/provider-errors");
 const {
   loadChatbotContext,
   buildAssistantPrompt,
@@ -415,19 +416,24 @@ router.post(
 
       const bodyText = await response.text();
       if (!response.ok) {
-        console.error("[messenger/transcribe] OpenAI rejected", {
-          status: response.status,
-          body: bodyText.slice(0, 500),
-        });
-        let apiMessage = `Transcription failed (${response.status}).`;
+        // The provider's own words never reach the tenant. They named the
+        // vendor, our account's billing state and our billing URL — see
+        // lib/provider-errors.js. The verbatim body goes to the log instead,
+        // tied to the reference the caller is given.
+        let apiMessage = bodyText;
         try {
-          apiMessage = JSON.parse(bodyText)?.error?.message || apiMessage;
+          apiMessage = JSON.parse(bodyText)?.error?.message || bodyText;
         } catch (_) {
-          /* keep the status-based message */
+          /* keep the raw body for the log */
         }
-        return res
-          .status(500)
-          .json({ error: { message: `Could not transcribe that recording: ${apiMessage}` } });
+        return void sendProviderFailure(res, {
+          provider: "openai",
+          operation: "transcribe",
+          status: response.status,
+          error: apiMessage,
+          req,
+          fallback: "That recording could not be transcribed.",
+        });
       }
 
       const parsed = JSON.parse(bodyText);
@@ -436,21 +442,16 @@ router.post(
       });
       return res.json({ text: parsed.text || "" });
     } catch (err) {
-      // Include the real reason. This endpoint is tenant-authenticated, and a
-      // generic "could not transcribe" cost several rounds of guessing at what
-      // was actually failing.
-      const detail =
-        err?.error?.message || err?.message || String(err || "unknown error");
-      console.error("[messenger/transcribe] failed:", {
-        detail,
-        status: err?.status || err?.statusCode || null,
-        type: err?.type || err?.name || null,
-      });
-      return res.status(500).json({
-        error: {
-          message: `Could not transcribe that recording: ${detail}`,
-          detail,
-        },
+      // The real reason still has to be recoverable — that is what the
+      // reference code is for. It is logged in full server-side; the tenant
+      // gets a neutral sentence and the code to quote to support.
+      return void sendProviderFailure(res, {
+        provider: "openai",
+        operation: "transcribe",
+        status: err?.status || err?.statusCode,
+        error: err,
+        req,
+        fallback: "That recording could not be transcribed.",
       });
     }
   }),

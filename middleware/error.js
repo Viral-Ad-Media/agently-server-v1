@@ -1,5 +1,7 @@
 "use strict";
 
+const { mentionsVendor, newReference } = require("../lib/provider-errors");
+
 const recentDependencyLogs = new Map();
 
 function errorText(error) {
@@ -74,17 +76,39 @@ function errorHandler(err, req, res, _next) {
 
   if (res.headersSent) return;
 
+  let message = dependencyFailure
+    ? "Agently could not reach a required data service. Your session is still valid; please retry."
+    : err?.message || "Internal server error.";
+  let code = dependencyFailure
+    ? "DEPENDENCY_UNAVAILABLE"
+    : err?.code || "INTERNAL_ERROR";
+  let reference;
+
+  // Last line of defence. Individual routes translate their own upstream
+  // failures (see lib/provider-errors.js), but anything that throws past
+  // them lands here and this handler used to relay err.message verbatim —
+  // which is how a vendor's billing notice reached a tenant. If a message
+  // names a provider, it is replaced and the original is logged instead.
+  if (!dependencyFailure && mentionsVendor(message)) {
+    reference = newReference();
+    console.error(
+      `[provider-leak-blocked] ${reference} route=${req?.method} ${
+        String(req?.originalUrl || req?.url || "").split("?")[0]
+      } original=${JSON.stringify(String(message).slice(0, 500))}`,
+    );
+    message = `That request could not be completed right now. Please try again shortly — if it keeps happening, contact support and quote ${reference}.`;
+    code = "UPSTREAM_UNAVAILABLE";
+  }
+
   res.status(status).json({
     error: {
-      message: dependencyFailure
-        ? "Agently could not reach a required data service. Your session is still valid; please retry."
-        : err?.message || "Internal server error.",
-      code: dependencyFailure
-        ? "DEPENDENCY_UNAVAILABLE"
-        : err?.code || "INTERNAL_ERROR",
-      retryable: dependencyFailure,
+      message,
+      code,
+      ...(reference && { reference }),
+      retryable: dependencyFailure || Boolean(reference),
       ...(process.env.NODE_ENV !== "production" &&
-        !dependencyFailure && { stack: err?.stack }),
+        !dependencyFailure &&
+        !reference && { stack: err?.stack }),
     },
   });
 }

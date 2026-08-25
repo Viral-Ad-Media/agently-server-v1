@@ -6,6 +6,10 @@ const { requireAuth } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 const { requireWalletCredit } = require("../../lib/billing-credit-enforcement");
 const {
+  describeProviderFailure,
+  logProviderFailure,
+} = require("../../lib/provider-errors");
+const {
   listVoiceCatalog,
   resolveVoice,
   synthesizeElevenLabsPreview,
@@ -61,15 +65,35 @@ async function resolvePreviewVoice({ db, requestedVoiceId, requestedModelId }) {
   return resolveVoice({ db, provider: "elevenlabs", voiceId });
 }
 
-function sendQuotaUnavailable(res, error) {
-  const providerMessage = String(error?.message || "").trim();
+function sendQuotaUnavailable(res, error, req) {
+  // Named the vendor and echoed its message back to the tenant. The useful
+  // half — "this is not your wallet balance" — is kept, because a tenant
+  // seeing a voice failure will otherwise assume they are out of credit.
+  // The vendor's identity and its verbatim complaint go to the log.
+  const { reference } = describeProviderFailure({
+    provider: "elevenlabs",
+    operation: "voice-preview",
+    status: error?.status || error?.statusCode,
+    error,
+  });
+  logProviderFailure({
+    provider: "elevenlabs",
+    operation: "voice-preview",
+    status: error?.status || error?.statusCode,
+    detail: error?.message || String(error || "quota unavailable"),
+    reference,
+    req,
+  });
   return res.status(503).json({
     success: false,
     error: {
-      code: "ELEVENLABS_QUOTA_UNAVAILABLE",
+      code: "VOICE_PREVIEW_UNAVAILABLE",
       message:
-        "The ElevenLabs API key configured on the backend cannot generate this preview because its provider quota is unavailable. This is separate from the organization's Agently wallet balance.",
-      details: { providerMessage: providerMessage || undefined },
+        "Voice preview is temporarily unavailable. This is not related to your organization's wallet balance. Please try again shortly — if it keeps happening, contact support and quote " +
+        reference +
+        ".",
+      reference,
+      retryable: true,
     },
   });
 }
@@ -257,7 +281,7 @@ router.post(
         });
         providerUsed = "openai-fallback";
       } catch (fallbackError) {
-        return sendQuotaUnavailable(res, error);
+        return sendQuotaUnavailable(res, error, req);
       }
     }
 

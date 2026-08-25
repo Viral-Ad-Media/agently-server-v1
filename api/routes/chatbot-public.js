@@ -4,6 +4,7 @@ const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
 const { asyncHandler } = require("../../middleware/error");
 const { getOpenAI } = require("../../lib/openai-client");
+const { sendProviderFailure } = require("../../lib/provider-errors");
 const { recordLeadActivity } = require("../../lib/lead-crm-events");
 const {
   getWalletCreditStatus,
@@ -495,9 +496,16 @@ router.post(
       },
     );
     if (!openaiResp.ok) {
+      // Named the vendor outright and attached the raw upstream body, on a
+      // public route. Both now go to the log under a reference code instead.
       const detail = await openaiResp.text().catch(() => "");
-      return res.status(openaiResp.status).json({
-        error: { message: "OpenAI rejected the session request.", detail },
+      return void sendProviderFailure(res, {
+        provider: "openai",
+        operation: "realtime-session",
+        status: openaiResp.status,
+        error: detail,
+        req,
+        fallback: "Live voice chat is unavailable right now.",
       });
     }
     const data = await openaiResp.json();
@@ -540,11 +548,26 @@ router.post(
     const file = await toFile(buffer, `voice.${ext}`, {
       type: mime || "audio/webm",
     });
-    const result = await openai.audio.transcriptions.create({
-      file,
-      model: process.env.OPENAI_TRANSCRIBE_MODEL || "whisper-1",
-    });
-    res.json({ text: result.text || "" });
+    // This route is UNAUTHENTICATED — the reader is a tenant's own customer
+    // on their public widget. Without this catch the provider's error text
+    // (vendor name, our billing state, our billing URL) reached them through
+    // the generic error handler. Nothing about our supply chain belongs here.
+    try {
+      const result = await openai.audio.transcriptions.create({
+        file,
+        model: process.env.OPENAI_TRANSCRIBE_MODEL || "whisper-1",
+      });
+      res.json({ text: result.text || "" });
+    } catch (err) {
+      return void sendProviderFailure(res, {
+        provider: "openai",
+        operation: "transcribe-public",
+        status: err?.status || err?.statusCode,
+        error: err,
+        req,
+        fallback: "That recording could not be transcribed.",
+      });
+    }
   }),
 );
 
