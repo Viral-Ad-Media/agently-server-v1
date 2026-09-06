@@ -12,17 +12,17 @@
  * This is the "run sync in case any organization's data increases" job.
  * It does not replace live-call metering (that must work continuously via
  * agently-ws-server); this is the batch backstop that guarantees every org
- * has Twilio + OpenAI + ElevenLabs + Railway + Supabase usage reconciled
+ * has Twilio + OpenAI + ElevenLabs + AWS + Supabase usage reconciled
  * even for periods where live metering was down, missing, or the org
  * onboarded before metering existed.
  *
  * Usage:
  *   node scripts/reconcile-all-orgs-cost.js [--from onboarding|iso] [--to iso]
- *     [--providers all|twilio,openai,elevenlabs,railway,supabase]
+ *     [--providers all|twilio,openai,elevenlabs,aws,supabase]
  *     [--apply-wallet false] [--force true] [--concurrency 1]
  *     [--out reconcile-results/all-orgs-cost.json]
  *
- * Recommended: run this nightly (cron / Railway cron job / GitHub Action)
+ * Recommended: run this nightly (cron / GitHub Action)
  * so every registered organization's usage ledger stays current without
  * anyone remembering to trigger it manually per org.
  */
@@ -85,7 +85,7 @@ async function main() {
   if (args.help || args.h) {
     console.log(`Usage:
   node scripts/reconcile-all-orgs-cost.js [--from onboarding|iso] [--to iso]
-    [--providers all|twilio,openai,elevenlabs,railway,supabase]
+    [--providers all|twilio,openai,elevenlabs,aws,supabase]
     [--apply-wallet false] [--force true] [--concurrency 1]
     [--out reconcile-results/all-orgs-cost.json]
 

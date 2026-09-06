@@ -125,7 +125,7 @@ function summarize(rows) {
 }
 
 function providerCoverage(rows) {
-  const providers = ["twilio", "openai", "elevenlabs", "railway", "supabase", "agently", "knowledge_base"];
+  const providers = ["twilio", "openai", "elevenlabs", "aws", "supabase", "agently", "knowledge_base"];
   return providers.map((provider) => {
     const matches = rows.filter((row) => row.provider === provider);
     return {

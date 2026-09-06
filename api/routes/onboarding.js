@@ -37,7 +37,7 @@ async function queueOnboardingKnowledgeSync({
   }
 
   // The first onboarding scan is one durable worker job, not a serverless
-  // setImmediate. The HTTP response may finish immediately while Railway keeps
+  // setImmediate. The HTTP response may finish immediately while the host keeps
   // processing the homepage and sends the standard completion notification.
   const { data: discoveries } = await db
     .from("knowledge_page_discoveries")
@@ -476,6 +476,27 @@ router.post(
       return res
         .status(400)
         .json({ error: { message: "Profile and agent config are required." } });
+    }
+
+    /*
+     * Required-field enforcement.
+     *
+     * The wizard now disables Continue until step 1 is complete, but client
+     * validation is a convenience, not a guarantee: this endpoint is reachable
+     * directly, and it used to happily write `name: "My Business"` with an
+     * empty industry and location. An org created that way looks fine right up
+     * until an agent has to introduce a business it knows nothing about.
+     */
+    const missing = ["name", "industry", "location"].filter(
+      (field) => !String(profile[field] || "").trim(),
+    );
+    if (missing.length) {
+      return res.status(400).json({
+        error: {
+          code: "ONBOARDING_INCOMPLETE",
+          message: `Missing required business details: ${missing.join(", ")}.`,
+        },
+      });
     }
 
     const db = getSupabase();

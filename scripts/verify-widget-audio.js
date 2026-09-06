@@ -19,7 +19,7 @@
  *
  * USAGE
  *   node scripts/verify-widget-audio.js \
- *     --ws wss://agently-ws-server-production2.up.railway.app \
+ *     --ws wss://<your-ws-host> \
  *     --chatbot <chatbotId> \
  *     --org <organizationId>
  */
@@ -181,7 +181,7 @@ async function main() {
     console.log("Interpreting the failure:\n");
     console.log("  Upgrade rejected      -> wrong WS_URL, or /realtime not routed in ws-server.js");
     console.log("  Session not negotiated-> chatbotId/orgId invalid, or auth rejected pre-session");
-    console.log("  Audio accepted, none  -> the common one. Check OPENAI_API_KEY on Railway,");
+    console.log("  Audio accepted, none  -> the common one. Check OPENAI_API_KEY on the ws host,");
     console.log("     returned              realtime model name, and lib/realtime-relay.js");
     console.log("                            forwarding audio.delta back to the browser socket.");
     console.log("  Not billed            -> runtime-meter.js not invoked on widget sessions\n");

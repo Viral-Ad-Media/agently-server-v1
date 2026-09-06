@@ -22,6 +22,7 @@ const {
 } = require("../../lib/number-retention");
 const { isAutoWalletChargeEnabled } = require("../../lib/usage-ledger");
 const { getBillingPlatformSettings } = require("../../lib/billing-settings");
+const { getActivationState } = require("../../lib/activation-gate");
 const {
   stripeConfigured,
   stripeCheckoutConfigured,
@@ -246,6 +247,14 @@ async function loadCustomerWalletSummary(db, organizationId, limit = 150) {
       (sum, charge) => sum + Number(charge.customerChargeUsd || 0),
       0,
     );
+
+    /*
+     * Activation state travels with the wallet because the dashboard already
+     * refetches this payload after every mutation — the gating modal therefore
+     * clears itself the moment a top-up lands, with no extra endpoint and no
+     * polling.
+     */
+    wallet.activation = await getActivationState(db, organizationId);
 
     return wallet;
   } catch (err) {
@@ -698,7 +707,19 @@ router.get(
         // behind requireSuperAdmin and can target any organization.
         // The field is retained so older deployed clients keep parsing.
         demoTopUpEnabled: false,
-        stripeTopUpEnabled: stripeConfigured(),
+        /*
+         * These are two different capabilities and conflating them is what put
+         * "Stripe checkout is not configured" in front of tenants on a fully
+         * working Stripe integration.
+         *
+         *   checkout  -> needs STRIPE_SECRET_KEY only
+         *   webhook   -> also needs STRIPE_WEBHOOK_SECRET
+         *
+         * A missing webhook secret does not stop a customer paying; the
+         * credit is still recovered by the top-up status poll in
+         * getWalletTopUpStatus. It only means we cannot verify pushed events.
+         */
+        stripeTopUpEnabled: stripeCheckoutConfigured(),
         stripeWebhookConfigured: stripeConfigured(),
         creditEnforcementMode: currentCreditEnforcementMode(),
         autoChargeWalletEnabled: isAutoWalletChargeEnabled(),

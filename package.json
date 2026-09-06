@@ -14,7 +14,9 @@
     "billing:reconcile-org": "node scripts/reconcile-org-cost.js",
     "billing:phase2-provider-sync": "node scripts/billing-phase2-provider-sync.js",
     "billing:phase3-metering-audit": "node scripts/billing-phase3-metering-audit.js",
-    "admin:secrets": "node scripts/generate-super-admin-secrets.js"
+    "admin:secrets": "node scripts/generate-super-admin-secrets.js",
+    "billing:cycle": "node scripts/billing-run-cycle.js",
+    "billing:cycle:commit": "node scripts/billing-run-cycle.js --commit"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",

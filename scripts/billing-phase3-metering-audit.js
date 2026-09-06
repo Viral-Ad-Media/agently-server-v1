@@ -157,7 +157,7 @@ function inspectRuntimeHealth(rows) {
     audio_output_tokens: 0,
   };
   let elevenlabsCharacters = 0;
-  let railwayFinalSeconds = 0;
+  let runtimeFinalSeconds = 0;
   let supabaseBytes = 0;
 
   for (const row of rows || []) {
@@ -181,8 +181,8 @@ function inspectRuntimeHealth(rows) {
     if (row.provider === "elevenlabs" && row.unit === "characters") {
       elevenlabsCharacters += toNumber(row.quantity);
     }
-    if (row.provider === "railway" && row.service === "runtime" && row.event_type === "websocket_runtime_final") {
-      railwayFinalSeconds += toNumber(row.quantity);
+    if ((row.provider === "aws" || row.provider === "railway") && row.service === "runtime" && row.event_type === "websocket_runtime_final") {
+      runtimeFinalSeconds += toNumber(row.quantity);
     }
     if (row.provider === "supabase" && row.unit === "bytes") {
       supabaseBytes += toNumber(row.quantity);
@@ -194,7 +194,7 @@ function inspectRuntimeHealth(rows) {
       Object.entries(openaiComponents).map(([key, value]) => [key, round6(value)]),
     ),
     elevenlabs_characters: round6(elevenlabsCharacters),
-    railway_runtime_final_seconds: round6(railwayFinalSeconds),
+    runtime_final_seconds: round6(runtimeFinalSeconds),
     supabase_storage_bytes: round6(supabaseBytes),
     usage_missing_count: usageMissing.length,
     usage_missing_samples: usageMissing.slice(0, 50),
@@ -217,7 +217,7 @@ function markdownReport(report) {
   lines.push(`- OpenAI audio input tokens: ${report.runtime_health.openai_components.audio_input_tokens}`);
   lines.push(`- OpenAI audio output tokens: ${report.runtime_health.openai_components.audio_output_tokens}`);
   lines.push(`- ElevenLabs characters: ${report.runtime_health.elevenlabs_characters}`);
-  lines.push(`- Railway final runtime seconds: ${report.runtime_health.railway_runtime_final_seconds}`);
+  lines.push(`- Final runtime seconds: ${report.runtime_health.runtime_final_seconds}`);
   lines.push(`- Supabase storage bytes recorded: ${report.runtime_health.supabase_storage_bytes}`);
   lines.push(`- Usage-missing markers: ${report.runtime_health.usage_missing_count}`);
   lines.push("");

@@ -1,0 +1,600 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Agently — Cost, Pricing &amp; Billing Reference</title>
+<style>
+  @page { size: A4; margin: 16mm 14mm 18mm; }
+
+  :root {
+    --ink: #0F172A;
+    --body: #475569;
+    --muted: #94A3B8;
+    --line: #E2E8F0;
+    --accent: #F59E0B;
+    --panel: #F8FAFC;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    font: 10pt/1.55 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--body);
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  h1, h2, h3 { color: var(--ink); letter-spacing: -0.02em; margin: 0; }
+  h1 { font-size: 26pt; font-weight: 800; line-height: 1.1; }
+  h2 {
+    font-size: 14pt; font-weight: 800; margin: 26pt 0 8pt;
+    padding-bottom: 5pt; border-bottom: 1.5pt solid var(--ink);
+  }
+  h3 { font-size: 10.5pt; font-weight: 700; margin: 14pt 0 5pt; }
+  p { margin: 0 0 8pt; }
+
+  .eyebrow {
+    font-size: 7.5pt; font-weight: 800; letter-spacing: 0.18em;
+    text-transform: uppercase; color: var(--accent); margin-bottom: 4pt;
+  }
+  .lede { font-size: 11pt; color: var(--body); max-width: 46em; }
+
+  .cover {
+    border-bottom: 2.5pt solid var(--ink);
+    padding-bottom: 14pt; margin-bottom: 6pt;
+  }
+  .meta {
+    margin-top: 10pt; font-size: 8.5pt; color: var(--muted);
+    display: flex; gap: 18pt; flex-wrap: wrap;
+  }
+
+  table { width: 100%; border-collapse: collapse; margin: 8pt 0 12pt; font-size: 9pt; }
+  th {
+    text-align: left; font-size: 7.5pt; font-weight: 800; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--muted);
+    border-bottom: 1pt solid var(--line); padding: 5pt 7pt 5pt 0;
+  }
+  td { padding: 5pt 7pt 5pt 0; border-bottom: 0.5pt solid var(--line); vertical-align: top; }
+  td.num, th.num { text-align: right; padding-right: 0; font-variant-numeric: tabular-nums; }
+  tr.total td { font-weight: 700; color: var(--ink); border-bottom: none; border-top: 1pt solid var(--ink); }
+
+  .panel {
+    background: var(--panel); border: 0.5pt solid var(--line);
+    border-radius: 6pt; padding: 10pt 12pt; margin: 10pt 0;
+  }
+  .panel.warn { background: #FFFBEB; border-color: #FDE68A; }
+  .panel.ok   { background: #F0FDF4; border-color: #BBF7D0; }
+  .panel p:last-child { margin-bottom: 0; }
+  .panel .t { font-weight: 700; color: var(--ink); margin-bottom: 3pt; }
+
+  code {
+    font-family: "SF Mono", Consolas, monospace; font-size: 8.5pt;
+    background: #F1F5F9; padding: 1pt 3pt; border-radius: 3pt; color: var(--ink);
+  }
+
+  .formula {
+    font-family: "SF Mono", Consolas, monospace; font-size: 10pt;
+    color: var(--ink); background: var(--panel); border-left: 2.5pt solid var(--accent);
+    padding: 8pt 12pt; margin: 8pt 0;
+  }
+
+  .cols { display: flex; gap: 14pt; }
+  .cols > * { flex: 1; }
+
+  ul { margin: 0 0 8pt; padding-left: 14pt; }
+  li { margin-bottom: 3pt; }
+
+  .src { font-size: 8pt; color: var(--muted); }
+  .src a { color: var(--muted); }
+
+  .tag {
+    display: inline-block; font-size: 7pt; font-weight: 800; letter-spacing: 0.08em;
+    text-transform: uppercase; padding: 1.5pt 5pt; border-radius: 3pt; vertical-align: 1pt;
+  }
+  .tag.direct { background: #DBEAFE; color: #1E40AF; }
+  .tag.shared { background: #FEF3C7; color: #92400E; }
+  .tag.off    { background: #FEE2E2; color: #991B1B; }
+
+  .page-break { page-break-before: always; }
+  h2, h3 { page-break-after: avoid; }
+  table, .panel, .formula { page-break-inside: avoid; }
+</style>
+</head>
+<body>
+
+<div class="cover">
+  <div class="eyebrow">Internal — not for distribution to tenants</div>
+  <h1>Cost, Pricing &amp; Billing</h1>
+  <p class="lede" style="margin-top:8pt">
+    Every paid service Agently depends on, what each one charges us, and exactly
+    how that becomes a number on a tenant's wallet.
+  </p>
+  <div class="meta">
+    <span><strong>Prepared</strong> 5 September 2026</span>
+    <span><strong>Margin</strong> 70% gross (3.333× cost)</span>
+    <span><strong>Model</strong> Prepaid wallet, pay-as-you-go</span>
+  </div>
+</div>
+
+<div class="panel warn">
+  <p class="t">This document contains internal cost and margin.</p>
+  <p>
+    Tenants see a single charge per unit of usage. They never see what a service
+    costs us, nor the multiplier applied. Vendor rates below are published list
+    prices retrieved on 4 September 2026 and are what we <em>pay</em>, not what
+    we charge.
+  </p>
+</div>
+
+<h2>1. How a tenant is billed</h2>
+
+<p>
+  Agently is prepaid and usage-based. There is no monthly subscription and no
+  seat fee. A tenant buys credit, and each unit of work draws that credit down
+  as it happens. New accounts start with <strong>$5 of free credit</strong>; a
+  card must be on file before a phone number can be bought or a chatbot put
+  live, so the account cannot run up cost and walk away.
+</p>
+
+<h3>The pricing formula</h3>
+
+<div class="formula">
+  tenant charge = our cost ÷ (1 − 0.70) = our cost × 3.333
+</div>
+
+<p>
+  70% is <em>gross margin</em>, not a 70% uplift. A service that costs us $1.00
+  is charged at $3.33, of which $2.33 is gross profit. The margin is stored in
+  <code>billing_platform_settings.default_target_margin_percent</code> and is
+  adjustable from the admin panel; the same <code>100 ÷ (100 − margin)</code>
+  form is used everywhere so per-event and periodic charges can never disagree.
+</p>
+
+<h3>Two kinds of cost</h3>
+
+<table>
+  <thead>
+    <tr>
+      <th style="width:22%">Kind</th>
+      <th style="width:40%">What it is</th>
+      <th>How the tenant pays for it</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="tag direct">Direct</span></td>
+      <td>
+        Metered per tenant by the vendor: a call minute, a synthesised
+        character, a token. Attributable to one tenant with certainty.
+      </td>
+      <td>
+        <strong>Charged immediately</strong>, as the event happens. The wallet
+        is debited within the same request that logs the usage.
+      </td>
+    </tr>
+    <tr>
+      <td><span class="tag shared">Shared</span></td>
+      <td>
+        Flat bills that arrive regardless of tenant activity: the Lightsail
+        container services, the Supabase plan. No per-tenant figure exists.
+      </td>
+      <td>
+        <strong>Never billed as a line item.</strong> It is a cost of doing
+        business, priced into the unit rate. See section 4.
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="panel">
+  <p class="t">Why infrastructure is not billed separately.</p>
+  <p>
+    It was built both ways and measured. Apportioning the flat server bill
+    across tenants and charging it at 3.33&times; produced a
+    <strong>$78.89 monthly infrastructure charge</strong> for the busiest
+    tenant, in a month where <em>every tenant combined</em> consumed $17.67 of
+    actual provider cost. Infrastructure would have been 78% of the bill.
+  </p>
+  <p>
+    Vapi, Bland and Twilio all absorb infrastructure into the per-unit price;
+    none of them itemise a customer's share of their servers. Agently now does
+    the same. The apportionment engine still runs &mdash; it is what tells us
+    whether the unit rate is high enough (section 4).
+  </p>
+</div>
+
+<h2>2. Direct costs — what each vendor charges us</h2>
+
+<p class="src">
+  List prices retrieved 4 September 2026. Our configured rates live in the
+  <code>billing_rate_cards</code> table and are seeded from
+  <code>VENDOR_RATE_CARD_JSON</code> — this table is the vendor's public price,
+  which those rates should be reconciled against.
+</p>
+
+<h3>Twilio — telephony <span class="tag direct">Direct</span></h3>
+<table>
+  <thead>
+    <tr><th>Item</th><th>Unit</th><th class="num">Our cost</th><th class="num">Tenant pays (×3.333)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Inbound local voice</td><td>per minute</td><td class="num">$0.0085</td><td class="num">$0.0283</td></tr>
+    <tr><td>Outbound local voice</td><td>per minute</td><td class="num">$0.0140</td><td class="num">$0.0467</td></tr>
+    <tr><td>Inbound toll-free voice</td><td>per minute</td><td class="num">$0.0220</td><td class="num">$0.0733</td></tr>
+    <tr><td>Outbound toll-free voice</td><td>per minute</td><td class="num">$0.0140</td><td class="num">$0.0467</td></tr>
+    <tr><td>Local number rental</td><td>per month</td><td class="num">$1.15</td><td class="num">$3.83</td></tr>
+    <tr><td>Toll-free number rental</td><td>per month</td><td class="num">$2.15</td><td class="num">$7.17</td></tr>
+  </tbody>
+</table>
+<p class="src">Source: twilio.com/en-us/voice/pricing/us. US rates; other countries differ and are charged at the vendor's country rate.</p>
+
+<h3>OpenAI — reasoning and realtime voice <span class="tag direct">Direct</span></h3>
+<table>
+  <thead>
+    <tr><th>Model</th><th>Unit</th><th class="num">Our cost</th><th class="num">Tenant pays (×3.333)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>gpt-realtime — audio in</td><td>per 1M tokens</td><td class="num">$32.00</td><td class="num">$106.67</td></tr>
+    <tr><td>gpt-realtime — audio out</td><td>per 1M tokens</td><td class="num">$64.00</td><td class="num">$213.33</td></tr>
+    <tr><td>gpt-realtime-mini — audio in</td><td>per 1M tokens</td><td class="num">$10.00</td><td class="num">$33.33</td></tr>
+    <tr><td>gpt-realtime-mini — audio out</td><td>per 1M tokens</td><td class="num">$20.00</td><td class="num">$66.67</td></tr>
+    <tr><td>gpt-4o — text in</td><td>per 1M tokens</td><td class="num">$2.50</td><td class="num">$8.33</td></tr>
+    <tr><td>gpt-4o — text out</td><td>per 1M tokens</td><td class="num">$10.00</td><td class="num">$33.33</td></tr>
+    <tr><td>gpt-4o-mini — text in</td><td>per 1M tokens</td><td class="num">$0.15</td><td class="num">$0.50</td></tr>
+    <tr><td>gpt-4o-mini — text out</td><td>per 1M tokens</td><td class="num">$0.60</td><td class="num">$2.00</td></tr>
+  </tbody>
+</table>
+<p class="src">Source: developers.openai.com/api/docs/pricing. Realtime audio is the dominant cost of a voice call — see the worked example in section 3.</p>
+
+<h3>ElevenLabs — speech synthesis <span class="tag direct">Direct</span></h3>
+<table>
+  <thead>
+    <tr><th>Plan</th><th class="num">Monthly</th><th class="num">Credits</th><th class="num">Cost / 1K chars</th><th class="num">Tenant pays / 1K</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Starter</td><td class="num">$6</td><td class="num">30,000</td><td class="num">$0.20</td><td class="num">$0.667</td></tr>
+    <tr><td>Creator</td><td class="num">$11</td><td class="num">121,000</td><td class="num">$0.18</td><td class="num">$0.600</td></tr>
+    <tr><td>Pro</td><td class="num">$99</td><td class="num">600,000</td><td class="num">$0.17</td><td class="num">$0.567</td></tr>
+    <tr><td>Scale</td><td class="num">$299</td><td class="num">1,800,000</td><td class="num">$0.17</td><td class="num">$0.567</td></tr>
+    <tr><td>Business</td><td class="num">$990</td><td class="num">6,000,000</td><td class="num">$0.17</td><td class="num">$0.567</td></tr>
+  </tbody>
+</table>
+<p class="src">
+  Source: elevenlabs.io/pricing. Note this is a <em>subscription with an included
+  allowance</em>, not pure per-unit billing. The effective per-character cost
+  therefore depends on how much of the allowance we consume; the rate card
+  should carry the blended rate for our actual plan, not the list rate.
+</p>
+
+<h3>Resend — transactional email <span class="tag direct">Direct</span></h3>
+<table>
+  <thead>
+    <tr><th>Plan</th><th class="num">Monthly</th><th class="num">Included</th><th class="num">Overage / 1K</th><th class="num">Tenant pays / 1K</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Free</td><td class="num">$0</td><td class="num">3,000</td><td class="num">—</td><td class="num">—</td></tr>
+    <tr><td>Pro</td><td class="num">$20</td><td class="num">50,000</td><td class="num">$0.90</td><td class="num">$3.00</td></tr>
+    <tr><td>Pro (larger)</td><td class="num">$35</td><td class="num">100,000</td><td class="num">$0.90</td><td class="num">$3.00</td></tr>
+    <tr><td>Scale (from)</td><td class="num">$90</td><td class="num">100,000</td><td class="num">$0.90 → $0.46</td><td class="num">$3.00 → $1.53</td></tr>
+  </tbody>
+</table>
+<p class="src">Source: resend.com/pricing.</p>
+
+<div class="page-break"></div>
+
+<h2>3. What a call actually costs</h2>
+
+<p>
+  A worked example, so the margin is legible against a real unit of work. A
+  <strong>five-minute inbound local voice call</strong> handled by the realtime
+  model, with roughly 3,000 characters of synthesised speech:
+</p>
+
+<table>
+  <thead>
+    <tr><th>Component</th><th>Quantity</th><th class="num">Our cost</th><th class="num">Tenant pays</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Twilio inbound local</td><td>5 min @ $0.0085</td><td class="num">$0.0425</td><td class="num">$0.1417</td></tr>
+    <tr><td>OpenAI realtime audio in</td><td>~15K tokens @ $32/M</td><td class="num">$0.4800</td><td class="num">$1.5998</td></tr>
+    <tr><td>OpenAI realtime audio out</td><td>~7K tokens @ $64/M</td><td class="num">$0.4480</td><td class="num">$1.4931</td></tr>
+    <tr><td>ElevenLabs synthesis</td><td>3K chars @ $0.17/1K</td><td class="num">$0.5100</td><td class="num">$1.6998</td></tr>
+    <tr class="total"><td>Total for one 5-minute call</td><td></td><td class="num">$1.4805</td><td class="num">$4.9344</td></tr>
+  </tbody>
+</table>
+
+<div class="panel">
+  <p class="t">Read this number carefully.</p>
+  <p>
+    Token counts above are <strong>illustrative</strong> — they are a plausible
+    shape for a five-minute call, not a measurement. Real consumption varies
+    with how much the caller talks, model choice, and whether ElevenLabs or the
+    realtime model produces the audio. The <em>rates</em> are published vendor
+    prices; the <em>quantities</em> must be read off
+    <code>billing_usage_events</code> for real calls before this table is used
+    to set customer-facing expectations.
+  </p>
+</div>
+
+<p>
+  The practical implication: a $5 free-credit account can make roughly
+  <strong>one five-minute realtime call</strong> before needing to top up. If
+  the trial is meant to feel more generous than that, the lever is either a
+  cheaper model for trial accounts (<code>gpt-realtime-mini</code> is ~3× less)
+  or a larger grant via <code>BILLING_SIGNUP_GRANT_USD</code>.
+</p>
+
+<h2>4. Shared infrastructure &mdash; measured, not billed</h2>
+
+<p>
+  Two bills arrive as a single flat number no matter what tenants do. Neither
+  vendor can say which tenant caused what, because for these services the
+  question has no answer: one set of containers runs everyone's calls.
+</p>
+
+<h3>What we actually run</h3>
+
+<p class="src">
+  Verified 5 September 2026 from the AWS API
+  (<code>lightsail get-container-services</code> and
+  <code>get-container-service-powers</code>), not from an estimate.
+</p>
+
+<table>
+  <thead>
+    <tr><th>Service</th><th>Power</th><th class="num">Scale</th><th class="num">$/node/mo</th><th class="num">Monthly</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>agently-calls</td><td>small-1 &mdash; 0.5 vCPU, 1&nbsp;GB</td><td class="num">2</td><td class="num">$15.00</td><td class="num">$30.00</td></tr>
+    <tr><td>agently-ingest</td><td>nano-1 &mdash; 0.25 vCPU, 0.5&nbsp;GB</td><td class="num">1</td><td class="num">$7.00</td><td class="num">$7.00</td></tr>
+    <tr class="total"><td>AWS Lightsail total</td><td></td><td class="num"></td><td class="num"></td><td class="num">$37.00</td></tr>
+  </tbody>
+</table>
+
+<p>
+  Data transfer in and out cost <strong>$0.00</strong> &mdash; 1.16&nbsp;GB in and
+  1.18&nbsp;GB out in August, far inside the bundle allowance. Actual metered
+  Lightsail spend was <strong>$7.16 in August</strong> (services were created on
+  26 August, so a partial month) and is tracking to roughly $31&ndash;37/month
+  at the current scale.
+</p>
+
+<table>
+  <thead>
+    <tr><th>Service</th><th>Billing shape</th><th class="num">Monthly</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Supabase <span class="tag shared">Shared</span></td>
+      <td>
+        Plan base plus overage: disk $0.125/GB past 8&nbsp;GB, egress $0.09/GB
+        past 250&nbsp;GB, storage $0.0213/GB past 100&nbsp;GB. Database is
+        currently 126&nbsp;MB, 13 of 60 connections in use.
+      </td>
+      <td class="num">$10.00<br><span class="src">standard tier</span></td>
+    </tr>
+    <tr class="total"><td>Total flat infrastructure</td><td></td><td class="num">$47.00</td></tr>
+  </tbody>
+</table>
+
+<div class="panel warn">
+  <p class="t">Supabase usage is not fully measurable by API.</p>
+  <p>
+    Database size and connection count are readable; bandwidth/egress, MAU,
+    storage objects and edge-function invocations are not exposed by the
+    Management API. The authoritative figure is the org usage page, and
+    <code>SUPABASE_MONTHLY_USD</code> must be updated from it when overages
+    appear:<br>
+    <code>supabase.com/dashboard/org/etnncnjhkskqwiwrxcwd/usage?projectRef=qozbmfwxlcuvwzbxtvnn</code>
+  </p>
+</div>
+
+<h3>The apportionment algorithm</h3>
+
+<p>
+  Infrastructure is not billed to tenants, but it is still measured per tenant.
+  That measurement is what proves the unit rate is high enough, and it is what
+  a per-customer profitability question gets answered with.
+</p>
+
+<p>
+  Splitting a shared bill by one single metric would be a guess &mdash; split by
+  call minutes and a chat-only tenant with a large knowledge base contributes
+  nothing to the database they fill. So each bill is attributed by the usage
+  that actually drives <em>that</em> bill:
+</p>
+
+<table>
+  <thead>
+    <tr><th>Bill</th><th>Attributed by</th><th>Why</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Lightsail</td>
+      <td>100% compute seconds</td>
+      <td>Containers running websocket audio. Time spent processing a live session is what consumes them.</td>
+    </tr>
+    <tr>
+      <td>Supabase</td>
+      <td>60% stored bytes<br>40% activity (USD of work)</td>
+      <td>The plan is roughly compute against disk and egress, so the split follows that shape.</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="formula">
+  tenant's share of a bill = &Sigma; (driver weight &times; tenant's share of that driver)
+</div>
+
+<p>Four properties the algorithm guarantees, each covered by a test:</p>
+<ul>
+  <li><strong>The split always sums to 100%.</strong> No cost silently disappears between tenants.</li>
+  <li><strong>A driver nobody used redistributes its weight.</strong> If no tenant stored anything this period, storage's 60% flows to the remaining drivers rather than dropping real cost on the floor.</li>
+  <li><strong>Idle tenants attract nothing.</strong> Share is measured in magnitude of work, not row counts &mdash; a tenant who sent one email is attributed $0.00, not a slice of the server bill.</li>
+  <li><strong>Cost nobody can be attributed is reported, not hidden.</strong> If nothing happened all period, the whole bill shows as absorbed rather than as a misleading zero.</li>
+</ul>
+
+<h3>The loss guard</h3>
+
+<p>
+  Absorbing infrastructure creates one specific danger: the unit rate looks like
+  it carries a 70% margin while the flat server bill quietly eats it, and
+  nothing on any invoice would reveal that. Every cycle therefore computes:
+</p>
+
+<table>
+  <thead>
+    <tr><th style="width:32%">Figure</th><th>Meaning</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>True cost</td><td>provider cost + infrastructure cost</td></tr>
+    <tr><td>Revenue</td><td>what tenants were actually charged</td></tr>
+    <tr><td>Actual margin</td><td>margin after infrastructure, not the headline 70%</td></tr>
+    <tr><td>Break-even multiplier</td><td>multiple of provider cost at which we stop losing money</td></tr>
+    <tr><td>Required multiplier</td><td>multiple needed to hit the target margin with infrastructure absorbed &mdash; <strong>this is the number that should set unit prices</strong></td></tr>
+  </tbody>
+</table>
+
+<div class="panel warn">
+  <p class="t">Current reading: we are running at a loss.</p>
+  <p>
+    Measured against live data for the 30 days to 5 September 2026, at $37
+    Lightsail + $10 Supabase:
+  </p>
+  <table style="margin-top:6pt">
+    <tbody>
+      <tr><td>Provider cost, all tenants</td><td class="num">$17.67</td></tr>
+      <tr><td>Infrastructure cost</td><td class="num">$46.36</td></tr>
+      <tr class="total"><td>True cost</td><td class="num">$64.03</td></tr>
+      <tr><td>Revenue at the current 3.333&times;</td><td class="num">$58.91</td></tr>
+      <tr class="total"><td>Gross profit</td><td class="num">&minus;$5.12</td></tr>
+    </tbody>
+  </table>
+  <p style="margin-top:8pt">
+    Actual margin is <strong>&minus;8.69%</strong>, not 70%. Infrastructure is
+    <strong>72.4%</strong> of what we spend. Break-even is
+    <strong>3.623&times;</strong> provider cost; we charge 3.333&times;.
+  </p>
+  <p>
+    This is a <em>volume</em> problem, not a rate problem. $47/month of fixed
+    cost divided by very little usage dominates everything. The same 3.333&times;
+    rate is comfortably profitable once usage grows &mdash; at roughly $650/month
+    of provider cost it yields about 68% actual margin, with infrastructure
+    falling to under 7% of spend. The two levers are growing usage or trimming
+    the container scale; raising the rate to the arithmetic 12&times; that would
+    force 70% margin at today's volume is not a real option.
+  </p>
+</div>
+
+<h3>If a dedicated customer ever needs it</h3>
+<p>
+  The engine keeps a <code>passthrough</code> mode that bills each tenant their
+  apportioned infrastructure share directly. It is off, and it should stay off
+  for self-serve customers; it exists for a large dedicated deployment where
+  the customer expects to see infrastructure itemised. Set it with
+  <code>BILLING_INFRA_MODE=passthrough</code>.
+</p>
+
+<h2>5. Current status</h2>
+
+<div class="panel warn">
+  <p class="t"><span class="tag off">Off</span> &nbsp;The billing engine is not running on a schedule.</p>
+  <p>
+    In absorb mode it never charges anyone, so the risk of enabling it is
+    reporting noise rather than a wrong invoice. It is still off until
+    deliberately switched on:
+  </p>
+</div>
+
+<table>
+  <thead>
+    <tr><th style="width:5%">#</th><th>Step</th><th>Status</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1</td>
+      <td>Apply <code>migrations/billing_period_charges.sql</code> (the audit table)</td>
+      <td>Not applied</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>Set <code>AWS_LIGHTSAIL_MONTHLY_USD=37</code> and <code>SUPABASE_MONTHLY_USD=10</code> (verified, section 4)</td>
+      <td>Unset in .env</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>Set <code>BILLING_ENGINE_ENABLED=true</code> and schedule <code>npm run billing:cycle:commit</code> hourly</td>
+      <td>Unset — in absorb mode this only writes audit rows, it charges nobody</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+  Until all three are done the engine reports and charges nothing. Running
+  <code>npm run billing:cycle</code> at any time prints exactly what
+  <em>would</em> be charged, writing nothing.
+</p>
+
+<div class="panel ok">
+  <p class="t">Every charge is reconstructable.</p>
+  <p>
+    Each period writes one row per tenant to <code>billing_period_charges</code>
+    holding the raw driver measurements, the per-provider cost breakdown, the
+    apportionment share, the margin used and the multiplier. A disputed charge
+    can be recomputed from first principles months later — a figure alone is not
+    an answer to a customer asking why.
+  </p>
+</div>
+
+<h2>6. Open items</h2>
+
+<table>
+  <thead>
+    <tr><th style="width:34%">Item</th><th>Detail</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Rate cards vs list prices</td>
+      <td>
+        Rates in <code>billing_rate_cards</code> were not read for this document
+        (production database). They should be reconciled against the vendor
+        prices in section 2.
+      </td>
+    </tr>
+    <tr>
+      <td>Subscription vendors</td>
+      <td>
+        ElevenLabs and Resend bill a monthly allowance, not pure per-unit. Their
+        effective rate depends on how much of the allowance we use, so a flat
+        per-character rate over- or under-charges depending on volume.
+      </td>
+    </tr>
+    <tr>
+      <td>Supabase overage</td>
+      <td>
+        Only the plan base is configured, and the Management API does not expose
+        bandwidth, MAU or storage-object usage. Read them off the org usage page
+        and update <code>SUPABASE_MONTHLY_USD</code> as overages appear.
+      </td>
+    </tr>
+    <tr>
+      <td>Margin below target</td>
+      <td>
+        Actual margin is negative at current volume (section 4). Re-check the
+        loss guard as usage grows; it turns positive without any rate change.
+      </td>
+    </tr>
+    <tr>
+      <td>Call cost quantities</td>
+      <td>
+        Section 3 token counts are illustrative. Measure real calls from
+        <code>billing_usage_events</code> before quoting these figures to
+        customers or using them for trial sizing.
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+</body>
+</html>

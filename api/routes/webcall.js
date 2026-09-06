@@ -177,7 +177,7 @@ router.get(
 
 // ── POST /api/webcall/verify-token ────────────────────────────
 // Server-to-server verifier used by agently-ws-server as a safe fallback
-// when Railway and Vercel do not share the same local JWT_SECRET. It does
+// when the ws host and Vercel do not share the same local JWT_SECRET. It does
 // not use requireAuth (there is no end-user session on this hop); instead it
 // is gated on the shared WEBCALL_VERIFY_SECRET, and it accepts ONLY
 // purpose-scoped webcall JWTs signed by this backend, returning just the

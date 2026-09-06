@@ -15,6 +15,7 @@ const {
 const { requireAuth } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 const { buildAppHashUrl } = require("../../lib/app-url");
+const { grantSignupCredit } = require("../../lib/activation-gate");
 
 const router = express.Router();
 
@@ -215,6 +216,18 @@ router.post(
         date: new Date().toISOString(),
       },
     ]);
+
+    /*
+     * Signup credit. Deliberately non-blocking and idempotent: a tenant that
+     * fails to receive it starts at $0 and tops up, which is recoverable — a
+     * registration that 500s because of a billing write is not.
+     */
+    const grant = await grantSignupCredit(db, org.id);
+    if (grant.granted) {
+      console.log(
+        `[register] granted $${grant.amountUsd.toFixed(2)} signup credit to org ${org.id}`,
+      );
+    }
 
     // Send welcome email — non-blocking, never fail registration because of it
     try {

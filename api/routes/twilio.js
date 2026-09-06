@@ -37,6 +37,7 @@ const {
   getWalletCreditStatus,
   creditStatusToTwimlMessage,
 } = require("../../lib/billing-credit-enforcement");
+const { assertCanActivate } = require("../../lib/activation-gate");
 const {
   listSupportedCountries,
   searchAvailableNumbers,
@@ -2747,6 +2748,15 @@ router.post(
       return res
         .status(400)
         .json({ error: { message: "phoneNumber is required." } });
+
+    /*
+     * A phone number is a recurring monthly cost we carry from the moment it
+     * is provisioned, so it sits behind the activation gate: the tenant must
+     * have completed at least one real top-up first. The signup grant alone
+     * does not unlock it. Enforced here, not only in the dashboard modal.
+     */
+    await assertCanActivate(getSupabase(), organizationId, "purchase_number");
+
     if (agentId) {
       const { data: agent } = await getSupabase()
         .from("voice_agents")
@@ -3709,7 +3719,7 @@ router.post(
         },
       });
 
-    // Lightweight context readiness check: Railway will load the full prompt, but
+    // Lightweight context readiness check: the ws server loads the full prompt, but
     // the outbound API verifies that the tenant/agent rows are readable first.
     const { data: organization } = await db
       .from("organizations")

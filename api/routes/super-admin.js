@@ -563,6 +563,86 @@ router.get(
   }),
 );
 
+// ── GET /api/super-admin/shared-infrastructure ───────────────
+// What the flat infrastructure bills (Lightsail, Supabase) cost us for a
+// window, how that cost splits across tenants, and whether the engine that
+// charges it is switched on.
+//
+// This ALWAYS runs as a dry run. The endpoint reports; it never moves money.
+// Charging happens only from scripts/billing-run-cycle.js --commit, so that
+// opening an admin page can never debit a customer.
+router.get(
+  "/shared-infrastructure",
+  asyncHandler(async (req, res) => {
+    const {
+      runBillingCycle,
+      COST_MODEL,
+      DRIVERS,
+    } = require("../../lib/usage-billing-engine");
+
+    const hours = Math.min(Math.max(Number(req.query.hours) || 720, 1), 24 * 90);
+    const to = new Date().toISOString();
+    const from = new Date(Date.now() - hours * 3600000).toISOString();
+
+    const { summary, rows } = await runBillingCycle(getSupabase(), {
+      from,
+      to,
+      dryRun: true,
+    });
+
+    res.json({
+      generatedAt: to,
+      window: { from, to, hours: summary.hours },
+      // Are we making money once the flat infrastructure bill is counted?
+      // In absorb mode nothing about infra reaches a tenant's invoice, so this
+      // is the only place a loss becomes visible.
+      economics: summary.economics,
+      engine: {
+        // Both must be true before anything is ever charged.
+        enabled: summary.engineEnabled,
+        configured: summary.sharedConfigured,
+        mode: summary.mode,
+        marginPercent: summary.marginPercent,
+        marginMultiple:
+          Math.round((100 / (100 - summary.marginPercent)) * 1000) / 1000,
+        marginSource: summary.marginSource,
+        warnings: summary.warnings,
+      },
+      cost: {
+        monthlyPools: summary.sharedMonthlyPools,
+        monthlyTotalUsd: summary.sharedMonthlyUsd,
+        windowPooledUsd: summary.pooledSharedCostUsd,
+        unallocatedUsd: summary.unallocatedUsd,
+        billableUsd: summary.totalSharedBillableUsd,
+        directCostUsd: summary.totalDirectCostUsd,
+      },
+      // How each bill was split and on what — so a tenant's share is explainable.
+      pools: summary.pools,
+      costModel: COST_MODEL,
+      drivers: Object.fromEntries(
+        Object.entries(DRIVERS).map(([name, d]) => [
+          name,
+          { label: d.label, kind: d.kind },
+        ]),
+      ),
+      tenants: rows
+        .map((r) => ({
+          organizationId: r.organizationId,
+          computeSeconds: r.drivers.computeSeconds,
+          storageBytes: r.drivers.storageBytes,
+          activityCostUsd: r.drivers.activityCostUsd,
+          eventCount: r.eventCount,
+          sharePercent: r.sharePercent,
+          sharedCostUsd: r.sharedCostUsd,
+          sharedBillableUsd: r.sharedBillableUsd,
+          directCostUsd: r.directCostUsd,
+          providers: r.providers,
+        }))
+        .sort((a, b) => b.sharedBillableUsd - a.sharedBillableUsd),
+    });
+  }),
+);
+
 router.get(
   "/overview",
   asyncHandler(async (_req, res) => {
@@ -933,6 +1013,26 @@ router.delete(
       },
     );
     if (error) throw error;
+
+    // Record WHO performed the erasure on the retention rows the function just
+    // wrote. The security log has it too, but an auditor reading the archive
+    // should not have to cross-reference a second table to find out.
+    try {
+      const archiveFilter = db
+        .from("deleted_account_archive")
+        .update({ deleted_by_email: req.superAdmin.email })
+        .is("deleted_by_email", null);
+      await (user.organization_id && scope === "organization"
+        ? archiveFilter.eq("organization_id", user.organization_id)
+        : archiveFilter.eq("user_id", userId));
+    } catch (archiveError) {
+      // Never fail a completed deletion over the audit stamp.
+      console.warn(
+        "[super-admin] could not stamp deleted_by_email:",
+        archiveError?.message || archiveError,
+      );
+    }
+
     await logSecurityEvent(req, "account_deleted", true, {
       adminEmail: req.superAdmin.email,
       userId,

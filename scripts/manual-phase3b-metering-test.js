@@ -3,7 +3,7 @@ require("dotenv").config();
 const {
   logOpenAIUsage,
   logElevenLabsUsage,
-  logRailwayRuntimeUsage,
+  logRuntimeUsage,
 } = require("../lib/usage-ledger");
 
 const organizationId = "747cf733-dd0d-42ba-87ab-bfea84590142";
@@ -42,12 +42,12 @@ async function main() {
     },
   });
 
-  await logRailwayRuntimeUsage({
+  await logRuntimeUsage({
     organizationId,
     service: "debug_metering_test",
-    eventType: "railway_debug_meter_test",
+    eventType: "runtime_debug_meter_test",
     seconds: 15,
-    externalId: "debug-railway-" + stamp,
+    externalId: "debug-runtime-" + stamp,
     metadata: {
       debug: true,
       purpose: "manual_phase3b_metering_test",

@@ -5,6 +5,7 @@ const { getSupabase } = require("../../lib/supabase");
 const { requireAuth, requireAdmin } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 const { serializeChatbot } = require("../../lib/serializers");
+const { assertCanActivate } = require("../../lib/activation-gate");
 const {
   CHATBOT_AVATAR_UPLOAD_PREFIX,
   CHATBOT_AVATAR_URL_PREFIX,
@@ -403,6 +404,14 @@ router.post(
       .single();
     if (!chatbot)
       return res.status(404).json({ error: { message: "Chatbot not found." } });
+
+    /*
+     * Activating puts the widget live on the tenant's public site, where any
+     * visitor can start conversations we pay per message for. Same gate as
+     * buying a number: one real top-up first. Configuring and previewing a
+     * chatbot stays free on the signup grant.
+     */
+    await assertCanActivate(db, req.orgId, "deploy_chatbot");
 
     await db
       .from("chatbots")

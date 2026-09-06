@@ -1147,7 +1147,7 @@ body>*:not(#agently-root):not(script){display:none!important}
   /* =========================================================
    * VOICE CONVERSATION MODE — OpenAI Realtime API
    * System prompt is built browser-side from injected config.
-   * Railway proxy gets it in session.init — no Supabase needed.
+   * The ws proxy gets it in session.init — no Supabase needed.
    * ========================================================= */
   var vmActive = false, vmWs = null, vmMicStream = null;
   var vmAudioCtx = null, vmScriptProc = null;

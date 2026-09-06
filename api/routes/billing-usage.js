@@ -14,7 +14,7 @@ const {
   buildTenantUsageReport,
   logRecordingUsage,
   logTranscriptUsage,
-  logRailwayRuntimeUsage,
+  logRuntimeUsage,
   logKnowledgeSyncUsage,
   logLeadStorageUsage,
   logOpenAIUsage,
@@ -425,7 +425,7 @@ const PRODUCTION_COST_SERVICE_CATALOG = [
       "Accuracy depends on receiving realtime usage objects. Add fallback estimate by call duration when usage is missing.",
   },
   {
-    provider: "railway",
+    provider: "aws",
     service: "runtime",
     eventType: "websocket_runtime",
     unit: "seconds",
@@ -434,15 +434,15 @@ const PRODUCTION_COST_SERVICE_CATALOG = [
     chargeTiming: "per_runtime_second_or_daily_allocation",
     customerChargeType: "included_in_call_minute_or_platform_fee",
     internalCostSource:
-      "Railway project/service usage export or estimated runtime seconds per call",
+      "Flat Lightsail bundle price, apportioned across tenants by runtime seconds (lib/usage-billing-engine.js)",
     sourceOfTruth: "billing_usage_events",
     existingEndpoint:
       "runtime inserts exist in backend bridge; ws-server needs consistent logging",
     requiredEndpoint:
-      "POST /api/billing-usage/reconcile/railway-runtime or runtime event on call end",
+      "POST /api/billing-usage/reconcile/runtime or runtime event on call end",
     status: "implemented",
     notes:
-      "Railway is account-level billing, so tenant attribution should be call-duration allocation unless Railway service-level export is imported.",
+      "Lightsail is a flat per-bundle monthly price with no per-tenant figure, so tenant attribution is share-of-runtime apportionment. Not billed per second.",
   },
   {
     provider: "supabase",
@@ -762,7 +762,8 @@ function classifyProductionCost(provider, service, eventType, unit) {
     (s.includes("lead") || e.includes("lead"))
   )
     return "crm.leads";
-  if (p === "railway") return "infrastructure.runtime";
+  if (p === "aws") return "infrastructure.runtime";
+  if (p === "railway") return "infrastructure.runtime"; // historical rows only
   if (
     p === "supabase" &&
     (s.includes("storage") || e.includes("storage") || u.includes("byte"))
@@ -2138,7 +2139,7 @@ async function buildCtoOrgCostBaseline({ organizationId, start, end } = {}) {
         "Enable/reconcile ElevenLabs usage into billing_usage_events.",
     },
     {
-      area: "railway.runtime",
+      area: "aws.runtime",
       status:
         exactRuntimeCost > 0
           ? "exact_cost_recorded"
@@ -2148,7 +2149,7 @@ async function buildCtoOrgCostBaseline({ organizationId, start, end } = {}) {
       currentExactFigure: ctoMoney(exactRuntimeCost),
       reason:
         "Runtime exact dollars require websocket/runtime allocation events.",
-      requiredAction: "Run/schedule Railway/runtime allocation reconciliation.",
+      requiredAction: "Run/schedule runtime allocation reconciliation.",
     },
     {
       area: "supabase.storage",
@@ -3464,7 +3465,7 @@ router.post("/record/knowledge-sync-cost", async (req, res, next) => {
   }
 });
 
-router.post("/record/railway-runtime", async (req, res, next) => {
+router.post("/record/runtime", async (req, res, next) => {
   try {
     const body = req.body || {};
     const organizationId = cleanOrgId(
@@ -3479,10 +3480,12 @@ router.post("/record/railway-runtime", async (req, res, next) => {
     );
     const event = await insertUsageEvent({
       organizationId,
-      provider: "railway",
+      // AWS now, not Railway. Railway-era rows keep provider "railway" so the
+      // period we actually paid Railway stays legible in the ledger.
+      provider: "aws",
       service: body.service || "runtime",
       eventType: body.eventType || body.event_type || "websocket_runtime",
-      source: "railway_runtime_endpoint",
+      source: "runtime_endpoint",
       externalId:
         body.externalId ||
         body.external_id ||
@@ -3814,7 +3817,7 @@ router.post("/reconcile/elevenlabs", async (req, res, next) => {
   }
 });
 
-router.post("/reconcile/railway-runtime", async (req, res, next) => {
+router.post("/reconcile/runtime", async (req, res, next) => {
   try {
     const body = req.body || {};
     const organizationId = cleanOrgId(
@@ -3840,7 +3843,7 @@ router.post("/reconcile/railway-runtime", async (req, res, next) => {
       const seconds = Number(row.call_duration || row.duration || 0);
       if (seconds <= 0) continue;
       events.push(
-        await logRailwayRuntimeUsage({
+        await logRuntimeUsage({
           organizationId,
           seconds,
           callId: row.id,
@@ -4845,11 +4848,6 @@ router.get(
             "OPENAI_ORG_ID optional",
           ],
           elevenlabs: ["ELEVENLABS_API_KEY"],
-          railway: [
-            "RAILWAY_API_TOKEN",
-            "RAILWAY_PROJECT_ID",
-            "RAILWAY_SERVICE_ID optional",
-          ],
           supabase: [
             "SUPABASE_ACCESS_TOKEN",
             "SUPABASE_PROJECT_REF",
@@ -4861,7 +4859,6 @@ router.get(
             "OPENAI_RATE_CARD_JSON",
             "ELEVENLABS_RATE_CARD_JSON",
             "TWILIO_RATE_CARD_JSON",
-            "RAILWAY_RATE_CARD_JSON",
             "SUPABASE_RATE_CARD_JSON",
             "RESEND_RATE_CARD_JSON",
           ],
@@ -5078,9 +5075,6 @@ router.get(
         OPENAI_API_KEY: "sk-... fallback",
         OPENAI_ORG_ID: "optional",
         ELEVENLABS_API_KEY: "...",
-        RAILWAY_API_TOKEN: "...",
-        RAILWAY_PROJECT_ID: "...",
-        RAILWAY_SERVICE_ID: "optional",
         SUPABASE_ACCESS_TOKEN: "sbp_...",
         SUPABASE_PROJECT_REF: "project ref",
         SUPABASE_SERVICE_ROLE_KEY: "existing backend key",
@@ -5131,7 +5125,7 @@ router.post("/wallets/:organizationId/settle", async (req, res, next) => {
   }
 });
 
-/** Cross-org sweep. Called hourly by the Railway scheduler. */
+/** Cross-org sweep. Called hourly by the scheduler. */
 router.post("/wallets/settle-all", async (req, res, next) => {
   try {
     const { sweepAllOrganizations } = require("../../lib/wallet-settlement");

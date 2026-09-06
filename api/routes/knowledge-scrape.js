@@ -10,7 +10,7 @@
  *
  * IMPORTANT: every route here is fast and returns immediately. None of them
  * does work that outlives the response — that was the original sin
- * (setImmediate on serverless). They only enqueue; the Railway worker executes.
+ * (setImmediate on serverless). They only enqueue; the worker executes.
  *
  * The existing POST /:id/sources/:sourceId/sync route is left in place and
  * untouched so nothing that depends on it breaks. Set
