@@ -92,6 +92,61 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── Slow-request log ───────────────────────────────────────────
+//
+// The browser aborts an API call at 15s and shows "Agently could not reach its
+// data service in time". When that happened in production there was nothing to
+// look at afterwards: the container had not restarted, CPU peaked at 48% of a
+// 0.25-vCPU box, memory sat at 15%, and Supabase served the whole window with
+// zero 5xx. A request was slow and left no trace, so the incident could only be
+// reasoned about, not diagnosed.
+//
+// This is deliberately not an access log — logging every request on a nano
+// container is its own cost, and Lightsail's log retention is short. It records
+// only the requests that are heading for, or past, the client's own deadline.
+const SLOW_REQUEST_MS = Math.max(
+  Number(process.env.SLOW_REQUEST_LOG_MS) || 3000,
+  250,
+);
+// The client gives up here; anything past it was, from the user's side, an
+// outage regardless of what the server eventually returned.
+const CLIENT_ABORT_MS = Math.max(
+  Number(process.env.CLIENT_REQUEST_TIMEOUT_MS) || 15000,
+  SLOW_REQUEST_MS,
+);
+
+app.use((req, res, next) => {
+  if (req.path === "/health") return next();
+  const startedAt = process.hrtime.bigint();
+
+  // 'close' as well as 'finish': a request the client abandoned never finishes,
+  // and those are exactly the ones worth seeing — they are the timeouts the
+  // user actually experienced.
+  let logged = false;
+  const record = (outcome) => {
+    if (logged) return;
+    logged = true;
+    const ms = Number(process.hrtime.bigint() - startedAt) / 1e6;
+    if (ms < SLOW_REQUEST_MS) return;
+    const line =
+      `[slow-request] ${req.method} ${req.originalUrl.split("?")[0]} ` +
+      `${Math.round(ms)}ms status=${res.statusCode} outcome=${outcome}`;
+    if (ms >= CLIENT_ABORT_MS) {
+      console.error(
+        line +
+          ` PAST THE CLIENT'S ${Math.round(CLIENT_ABORT_MS / 1000)}s DEADLINE` +
+          " — the user saw a timeout.",
+      );
+    } else {
+      console.warn(line);
+    }
+  };
+
+  res.on("finish", () => record("finished"));
+  res.on("close", () => record(res.writableEnded ? "finished" : "client-gone"));
+  next();
+});
+
 // Chatbot widget iframe must be embeddable from any domain
 app.use((req, res, next) => {
   if (req.path.startsWith("/chatbot-widget/")) {

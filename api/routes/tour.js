@@ -43,7 +43,7 @@ router.get(
         .eq("is_enabled", true),
       db
         .from("user_tour_progress")
-        .select("page_key,completed_version,status")
+        .select("tour_key,tour_version,status")
         .eq("user_id", userId),
     ]);
 
@@ -53,10 +53,21 @@ router.get(
       return res.json({ pages: [], progress: {}, degraded: true });
     }
 
+    /*
+     * A failed progress read is NOT the same as "this user has seen nothing".
+     * Treating it as the latter is exactly how a broken column name turned into
+     * every existing customer being shown the tour again, silently. Say
+     * degraded and let the client leave the tour shut.
+     */
+    if (progressResult.error) {
+      console.warn("[tour] progress read failed:", progressResult.error.message);
+      return res.json({ pages: [], progress: {}, degraded: true });
+    }
+
     const progress = {};
     for (const row of progressResult.data || []) {
-      progress[row.page_key] = {
-        completedVersion: Number(row.completed_version) || 0,
+      progress[row.tour_key] = {
+        completedVersion: Number(row.tour_version) || 0,
         status: row.status,
       };
     }
@@ -98,12 +109,18 @@ router.post(
       .upsert(
         {
           user_id: req.user.id,
-          page_key: pageKey,
-          completed_version: version,
+          // Carried so the row survives an organization delete cascade the same
+          // way the rest of a tenant's data does.
+          // requireAuth resolves the org and sets req.orgId; req.user carries
+          // the column only on some code paths, so prefer the middleware's.
+          organization_id: req.orgId || req.user.organization_id || null,
+          tour_key: pageKey,
+          tour_version: version,
           status,
           completed_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
         },
-        { onConflict: "user_id,page_key" },
+        { onConflict: "user_id,tour_key" },
       );
 
     if (error) {
@@ -134,7 +151,7 @@ router.post(
       .delete()
       .eq("user_id", req.user.id);
 
-    if (pageKey) query = query.eq("page_key", pageKey);
+    if (pageKey) query = query.eq("tour_key", pageKey);
 
     const { error } = await query;
     if (error) throw error;
