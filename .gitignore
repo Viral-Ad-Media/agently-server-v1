@@ -16,3 +16,5 @@ billing-report-*/
 # Billing local outputs and secrets
 reconcile-results/
 *.zip
+
+.vercel

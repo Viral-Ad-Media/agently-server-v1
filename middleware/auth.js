@@ -57,6 +57,13 @@ async function requireAuth(req, res, next) {
     req.user = session.user;
     req.organization = session.organization;
     req.orgId = session.organization.id;
+    /*
+     * The auth_sessions row behind this request, so POST /api/auth/logout can
+     * revoke exactly this session and leave the user's other devices alone.
+     * Undefined for tokens minted before the V1 auth migration; those carry no
+     * session row and simply cannot be revoked, which is what they did before.
+     */
+    req.sessionId = session.sessionId || null;
     next();
   } catch (error) {
     logAuthFailure(error);

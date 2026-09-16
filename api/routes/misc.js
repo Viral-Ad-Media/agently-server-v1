@@ -515,7 +515,18 @@ router.post(
         );
       }
 
-      const magicLinkUrl = buildAppHashUrl(`/login?magic=${token}`);
+      /*
+       * Invitations get their own route, not the sign-in route.
+       *
+       * This used to point at /login?magic=<token>, handled by the general
+       * magic-link verifier — an endpoint that accepted ANY token and created
+       * an organization for any address it did not recognise. That verifier is
+       * gone. POST /api/auth/accept-invitation replaces it and can only ever
+       * resolve a user row this admin already created.
+       */
+      const magicLinkUrl = buildAppHashUrl(
+        `/accept-invite?token=${encodeURIComponent(token)}`,
+      );
       await sendTeamInviteEmail(
         normalizedEmail,
         memberName,
