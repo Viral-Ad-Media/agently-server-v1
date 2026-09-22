@@ -159,6 +159,18 @@ app.use((req, res, next) => {
   next();
 });
 
+// Verify Resend signatures against exact bytes, before the global JSON parser.
+// A dedicated parser also bounds this public endpoint independently.
+app.post(
+  "/api/email/resend/webhook",
+  express.raw({ type: "application/json", limit: "256kb" }),
+  (req, res, next) => {
+    Promise.resolve().then(() =>
+      require("../lib/email-delivery").createResendWebhookHandler()(req, res)
+    ).catch(next);
+  },
+);
+
 app.use(
   express.json({
     limit: process.env.JSON_BODY_LIMIT || "4mb",

@@ -32,6 +32,7 @@ const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
 const { requireAuth, requireAdmin } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
+const { createBillingSyncHandler } = require("../../lib/billing-sync-handler");
 const {
   ensureWalletCreditOrRespond,
   getWalletCreditStatus,
@@ -52,8 +53,8 @@ const {
   createVoiceAccessToken,
   fetchCallLogs,
   // fetchMonthlyBilling intentionally removed — it returns master account totals
-  // and must never be exposed to users. Per-number costs are tracked internally
-  // by lib/billing-tracker.js. See the billing-sync route below.
+  // and must never be exposed to users. The API billing-tracker module is a
+  // placeholder; reconcile worker ownership before enabling the cron below.
   makeOutboundCall,
   sendWhatsAppMessage,
 } = require("../../lib/twilio");
@@ -5614,29 +5615,7 @@ router.get(
 // This also still accepts POST + `x-cron-secret` so it can be triggered
 // manually or from an external scheduler if you ever move off Vercel Cron.
 // ─────────────────────────────────────────────────────────────
-function verifyCronRequest(req) {
-  const secret = (process.env.CRON_SECRET || "").trim();
-  if (!secret) return false;
-  const authHeader = String(req.headers.authorization || "").trim();
-  const bearerMatch = authHeader === `Bearer ${secret}`;
-  const legacyHeaderMatch =
-    String(req.headers["x-cron-secret"] || "").trim() === secret;
-  return bearerMatch || legacyHeaderMatch;
-}
-
-async function runBillingSyncCron(req, res) {
-  if (!verifyCronRequest(req)) {
-    return res.status(401).json({ error: { message: "Unauthorized" } });
-  }
-  try {
-    const tracker = require("../../lib/billing-tracker");
-    void tracker.runOnce();
-    return res.json({ success: true, triggered: new Date().toISOString() });
-  } catch (err) {
-    console.error("[billing-sync cron] error:", err && err.message);
-    return res.status(500).json({ error: { message: "Billing sync failed." } });
-  }
-}
+const runBillingSyncCron = createBillingSyncHandler();
 
 router.get("/_internal/billing-sync", asyncHandler(runBillingSyncCron));
 router.post("/_internal/billing-sync", asyncHandler(runBillingSyncCron));

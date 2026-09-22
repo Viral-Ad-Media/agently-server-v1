@@ -1,0 +1,54 @@
+name: Backend CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Backend validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+
+  email-database:
+    name: Email delivery migration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: isolated-ci-only
+          POSTGRES_DB: email_delivery_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: isolated-ci-only
+      PGDATABASE: email_delivery_test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare isolated Supabase-style roles
+        run: psql -v ON_ERROR_STOP=1 -f test/setup-email-db.sql
+      - name: Apply email migration
+        run: psql -v ON_ERROR_STOP=1 -f migrations/20260921_email_delivery_blocks.sql
+      - name: Check ordering, duplicate handling and grants
+        run: psql -v ON_ERROR_STOP=1 -f test/email-delivery-migration.sql

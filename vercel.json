@@ -4,6 +4,10 @@
     {
       "path": "/api/billing-usage/vendor-rate-sync/cron",
       "schedule": "0 6 * * *"
+    },
+    {
+      "path": "/api/twilio/_internal/billing-sync",
+      "schedule": "0 2 * * *"
     }
   ],
   "builds": [
@@ -36,12 +40,6 @@
     {
       "src": "/api/(.*)",
       "dest": "/api/index.js"
-    }
-  ],
-  "crons": [
-    {
-      "path": "/api/twilio/_internal/billing-sync",
-      "schedule": "0 2 * * *"
     }
   ]
 }

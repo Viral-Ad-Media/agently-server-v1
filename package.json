@@ -9,7 +9,8 @@
   "scripts": {
     "dev": "node dev-server.js",
     "build": "echo 'No build step'",
-    "lint": "echo 'OK'",
+    "lint": "node scripts/check-syntax.js",
+    "test": "node test/run.js",
     "billing:audit-org": "node scripts/billing-ledger-audit.js",
     "billing:reconcile-org": "node scripts/reconcile-org-cost.js",
     "billing:phase2-provider-sync": "node scripts/billing-phase2-provider-sync.js",
@@ -30,6 +31,7 @@
     "openai": "^4.104.0",
     "resend": "^3.4.0",
     "sharp": "^0.35.3",
+    "svix": "1.76.1",
     "uuid": "^10.0.0",
     "ws": "^8.18.0"
   }

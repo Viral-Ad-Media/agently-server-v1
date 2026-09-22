@@ -235,12 +235,14 @@ async function deliverCode(req, res, { user, email, purpose, isResend }) {
       "[auth] code delivery failed:",
       emailErr?.message || String(emailErr),
     );
+    const recipientBlocked = emailErr?.code === "EMAIL_RECIPIENT_BLOCKED";
     res.status(502).json({
       error: {
         code: "EMAIL_DELIVERY_FAILED",
-        message:
-          "We could not send your code right now. Please try again in a moment.",
-        retryable: true,
+        message: recipientBlocked
+          ? "We could not deliver email to this address. Check the address or contact support before trying again."
+          : "We could not send your code right now. Please try again in a moment.",
+        retryable: !recipientBlocked,
       },
     });
     return null;
