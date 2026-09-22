@@ -10,7 +10,7 @@ This is the main progress summary for the launch-readiness work. Update it at th
 - Additional items: **1 conflicting board item (g4) + 4 newly discovered findings (N001-N004)**. Total tracked: **59**.
 - Fully verified/closed: **0**. Several local fixes are implemented and tested, but not deployed or verified end to end.
 - Backend is on **AWS Lightsail**: API and ingestion worker on `agently-ingest`; voice on `agently-calls`. Vercel inspection concerns legacy API cleanup/schedulers, not a move of the backend back to Vercel.
-- Current work is being published on `launch-readiness-2026-09-22` branches. No merge to `main`, production database migration, AWS deployment, or live scheduler change is part of this push.
+- Current work has been pushed to `launch-readiness-2026-09-22` branches in all three repositories. No merge to `main`, production database migration, AWS deployment, or live scheduler change was performed. Hosting integrations may independently create branch previews; their state has not been inspected.
 
 ## Implemented and tested locally
 
@@ -24,7 +24,7 @@ This is the main progress summary for the launch-readiness work. Update it at th
 | N001 | Consolidate duplicate Vercel cron keys | Configuration review | Verify scheduler ownership before enabling/deploying schedules |
 | N003 | Explicitly report missing billing worker; await installed worker and handle failures | Four backend test groups | Actual worker/endpoint ownership and billing reconciliation remain unresolved |
 | N004 | Preserve stored worker billing totals when call-page fetches fail, are malformed, or hit pagination limit | Five worker tests on Node 20 and 24 | Worker release, reconciliation and broader billing correctness |
-| p1 | Add backend, frontend and worker CI workflows; replace placeholder backend lint with syntax validation | Local validation below | Push workflows and verify successful remote CI |
+| p1 | Add backend, frontend and worker CI workflows; replace placeholder backend lint with syntax validation | Workflows pushed; local validation below | Verify successful remote CI |
 
 ## Verification evidence
 
@@ -53,7 +53,15 @@ Vercel CLI sign-in is optional for continuing AWS/local engineering; it is neede
 | `Viral-Ad-Media/agently-ws-server` | `launch-readiness-2026-09-22` | Partial-total safeguard and worker tests/CI |
 | `Viral-Ad-Media/agently-frontend-v1` | `launch-readiness-2026-09-22` | Six-line login-message change and frontend CI only |
 
-Publication verification will be appended after the remote branches are checked. Backend branch ancestry also includes the pre-existing local welcome-email commit `e1eafab`, which was one commit ahead of remote main before this work was committed.
+GitHub accepted all three branch pushes on 22 September 2026:
+
+- Backend implementation and initial documentation: [`7d45078`](https://github.com/Viral-Ad-Media/agently-server-v1/commit/7d450780729b319e74446714f703cbdb5b0c3a0c).
+- Worker safeguard/tests: [`1e0235e`](https://github.com/Viral-Ad-Media/agently-ws-server/commit/1e0235e318c09d8224e7a39150ad47754a138431).
+- Frontend messages/CI: [`e8f8123`](https://github.com/Viral-Ad-Media/agently-frontend-v1/commit/e8f8123189a560971178d993f8cb63173f4bec30).
+
+This publication-status update is a subsequent documentation-only commit on the backend branch. Check that branch's history for its current documentation revision. Remote CI results have not yet been verified; no pull request or merge was created.
+
+Backend branch ancestry also includes the pre-existing local welcome-email commit `e1eafab`, which was one commit ahead of remote main before this work was committed.
 
 Unrelated frontend changes in `.gitignore`, `App.tsx`, `services/api.ts`, the rest of `pages/Login.tsx`, `components/AuthCodePanel.tsx`, `pages/AcceptInvite.tsx`, and `brag-output/` are deliberately excluded and preserved locally. The small login-message change alone does not publish that unfinished authentication UI work.
 

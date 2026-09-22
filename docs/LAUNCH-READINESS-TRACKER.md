@@ -2,6 +2,8 @@
 
 Created 21 September 2026. This is the working checklist for remediation and final review, not a certification that the application has no defects.
 
+Last updated 22 September 2026. This backend-repository copy is now canonical; see [LAUNCH-PROGRESS.md](LAUNCH-PROGRESS.md) for the current summary and pushed commit references. The outer workspace copy is a historical snapshot.
+
 ## Baseline and counting
 
 Source: `C:/Users/DELL/Downloads/Agently Launch Gate_files/_t.html`, saved alongside `Agently Launch Gate.html`.
@@ -98,7 +100,7 @@ Current accounting: 54 original items awaiting closure evidence + 1 additional b
 
 ## Existing work and evidence limits
 
-- Local CI workflow files added in `agently/.github/workflows/ci.yml` and `agently-server/.github/workflows/ci.yml`. No successful GitHub run evidenced yet.
+- CI workflows for frontend, backend and worker were pushed on `launch-readiness-2026-09-22` branches. No successful GitHub run evidenced yet.
 - Backend placeholder lint replaced with a syntax checker; previous run passed for 123 JavaScript files. This is syntax validation, not behavioral or security testing.
 - Previous frontend TypeScript check completed, but a full production build was not conclusively verified. The escalated attempt showed transformation starting; the observed `dist/index.html` was older than that attempt. Re-run with a reliable completion/exit result before claiming build success.
 - Previous source inspection found organization-scoped Supabase tables/queries and billing/voice infrastructure. Deployed schema, complete tenant isolation and live feature behavior remain to be verified.
@@ -184,3 +186,10 @@ When working an item, append a record here containing ID, finding date, source r
 - AWS confirmed identical live voice/ingestion image digests, two voice replicas and one ingestion replica. This strengthens the duplicate-polling concern but does not prove the deployed source or successful polling. Recent log queries returned no events.
 - Vercel inspection is blocked on CLI sign-in; user asked to run `vercel login`, without sharing tokens. No live schedules/settings/deployments were changed.
 - N004 remains IN PROGRESS pending release verification. Rental estimates, billing-cycle semantics, price completeness, cross-process coordination and full reconciliation are not certified by this narrow fix.
+
+### Publication and p5 checkpoint — 22 September 2026
+
+- User requested committing/pushing completed work and a maintained Markdown progress record. All three repositories accepted pushes to `launch-readiness-2026-09-22`; implementation commits: API `7d45078`, worker `1e0235e`, frontend `e8f8123`. No main merge or AWS deployment was performed.
+- Added canonical `docs/LAUNCH-PROGRESS.md`, this complete checklist and the scheduler audit to the backend repository. Future work should update these copies, not the outer workspace snapshots.
+- Pre-push rerun: backend 35/35 tests, worker 5/5 tests and syntax/diff checks passed. Remote CI remains unverified. Frontend publication includes only the six-line error-message change and CI; unrelated local frontend changes were excluded and preserved.
+- p5 checkpoint: inspected API runtime directories contained no matching JSON file-persistence fallback; `getSupabase()` throws on missing configuration. This is preliminary source evidence only. Complete the audit and controlled runtime verification before closing p5.
