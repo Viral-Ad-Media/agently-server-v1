@@ -1,6 +1,7 @@
 "use strict";
 
 const { mentionsVendor, newReference } = require("../lib/provider-errors");
+const { logError } = require("../lib/logger");
 
 const recentDependencyLogs = new Map();
 
@@ -71,7 +72,10 @@ function errorHandler(err, req, res, _next) {
     logDependencyError(err, req);
     res.setHeader("Retry-After", "5");
   } else {
-    console.error("[app] request error:", err && err.stack ? err.stack : err);
+    // Structured, with the request id and route attached, so a user reporting
+    // "it failed around 2pm" can be matched to an exact request instead of
+    // grepped for. Message and stack are redacted by lib/logger.
+    logError(err, req, { handled: "errorHandler", status });
   }
 
   if (res.headersSent) return;

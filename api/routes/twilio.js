@@ -30,7 +30,8 @@
 
 const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
-const { requireAuth, requireAdmin } = require("../../middleware/auth");
+const { requireAuth, requireAdmin, requireOwner } = require("../../middleware/auth");
+const { log } = require("../../lib/logger");
 const { asyncHandler } = require("../../middleware/error");
 const { createBillingSyncHandler } = require("../../lib/billing-sync-handler");
 const {
@@ -4686,6 +4687,146 @@ router.get(
 );
 
 // Compatibility alias for older frontend builds that used POST /purchase-number.
+// ── Which countries can this tenant buy in? ───────────────────
+//
+// The UI used to learn this only from a SEARCH RESPONSE, and its dropdown was
+// seeded with ["US"]. So a tenant could not select CA to search for CA numbers,
+// because the list of countries only arrived after searching as US. This
+// endpoint breaks that circle: the dropdown is populated on mount, and adding
+// a country later is an environment change with no frontend edit.
+router.get(
+  "/number-countries",
+  requireAuth,
+  asyncHandler(async (_req, res) => {
+    const sellable = sellableCountries();
+    res.json({
+      sellableCountries: sellable,
+      lowRiskVoiceCountries: lowRiskCountries(),
+      defaultCountry: sellable.includes("US") ? "US" : sellable[0] || "US",
+      // Stated so the UI can warn before a tenant picks a country they cannot
+      // complete a purchase in. US and CA need no regulatory bundle; the
+      // others do, and whose name it must be in is still open (N016).
+      noBundleRequired: ["US", "CA"],
+    });
+  }),
+);
+
+// ── Release a number back to Twilio ───────────────────────────
+//
+// The only destructive action a tenant can take on their own, and it is
+// PERMANENT: once released, the number returns to Twilio's pool and may never
+// be re-acquirable. So the confirmation is real rather than decorative — the
+// caller must send back the exact phone number, which cannot be done by
+// clicking through a dialog without reading it.
+//
+// Owner-only. An admin can buy; only an owner can throw away.
+//
+// The row is NOT deleted. lifecycle_status becomes "released" and the billing
+// history stays attached, because the money that was spent on this number
+// still happened.
+router.post(
+  "/numbers/:id/release",
+  requireAuth,
+  requireOwner,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const { data: number, error } = await db
+      .from("twilio_phone_numbers")
+      .select("id, organization_id, phone_number, phone_sid, account_sid, lifecycle_status, assigned_voice_agent_id")
+      .eq("id", req.params.id)
+      .eq("organization_id", req.orgId)
+      .maybeSingle();
+    if (error) throw error;
+    if (!number) {
+      return res.status(404).json({
+        error: { code: "NUMBER_NOT_FOUND", message: "Number not found." },
+      });
+    }
+
+    if (String(number.lifecycle_status || "active").toLowerCase() === "released") {
+      return res.status(409).json({
+        error: { code: "ALREADY_RELEASED", message: "This number has already been released." },
+      });
+    }
+
+    // Typing the number back is the confirmation. Compared on digits only, so
+    // formatting differences do not block a genuine confirmation.
+    const digits = (v) => String(v || "").replace(/\D/g, "");
+    if (digits(req.body?.confirmPhoneNumber) !== digits(number.phone_number)) {
+      return res.status(400).json({
+        error: {
+          code: "CONFIRMATION_REQUIRED",
+          message:
+            "Releasing a number is permanent and it may never be available to buy again. " +
+            "Send confirmPhoneNumber exactly matching this number to proceed.",
+        },
+      });
+    }
+
+    const releasedAt = new Date().toISOString();
+
+    try {
+      await releaseIncomingNumber({
+        accountSid: number.account_sid,
+        phoneSid: number.phone_sid,
+      });
+    } catch (err) {
+      // Record WHY, and leave the number active. A failed provider release
+      // that silently marked the row released would leave the tenant paying
+      // Twilio for a number the platform no longer shows them.
+      await db
+        .from("twilio_phone_numbers")
+        .update({ provider_release_error: String(err?.message || err).slice(0, 500), updated_at: releasedAt })
+        .eq("id", number.id)
+        .eq("organization_id", req.orgId);
+
+      log.error("number.release_failed", {
+        requestId: req.id,
+        orgId: req.orgId,
+        numberId: number.id,
+        reason: err?.message,
+      });
+      const mapped = mapTwilioError(err, "Could not release this number.");
+      return res.status(502).json({ error: mapped });
+    }
+
+    await db
+      .from("twilio_phone_numbers")
+      .update({
+        lifecycle_status: "released",
+        released_at: releasedAt,
+        release_reason: "tenant_requested",
+        assigned_voice_agent_id: null,
+        provider_release_error: null,
+        updated_at: releasedAt,
+      })
+      .eq("id", number.id)
+      .eq("organization_id", req.orgId);
+
+    // Detach from any agent still pointing at it, or that agent keeps trying
+    // to place calls from a number the account no longer owns.
+    await db
+      .from("voice_agents")
+      .update({ twilio_phone_number: "", twilio_phone_sid: "", updated_at: releasedAt })
+      .eq("organization_id", req.orgId)
+      .eq("twilio_phone_sid", number.phone_sid);
+
+    log.warn("number.released", {
+      requestId: req.id,
+      orgId: req.orgId,
+      numberId: number.id,
+      releasedAt,
+    });
+
+    res.json({
+      released: true,
+      phoneNumber: number.phone_number,
+      releasedAt,
+      message: "Number released. It has returned to Twilio and monthly rental has stopped.",
+    });
+  }),
+);
+
 router.post("/purchase-number", requireAuth, requireAdmin, (req, res, next) => {
   req.url = "/numbers/purchase";
   return router.handle(req, res, next);

@@ -11,6 +11,9 @@ function harness(rpc) {
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../lib/auth-rate-limit.js"), "utf8"), {
     module, process: { env: {} }, console: { error: (...args) => logs.push(args) },
     require(id) {
+      // The real helper, not a stub: bucketing on a forgeable address is the
+      // same as having no per-IP limit, so this module must get the shared one.
+      if (id === "./client-ip") return require("../lib/client-ip");
       assert.equal(id, "./supabase");
       return { getSupabase: () => ({ rpc: async (...args) => { calls.push(args); return rpc(...args); } }) };
     },

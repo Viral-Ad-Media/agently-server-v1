@@ -52,6 +52,34 @@ for (const method of ["sendLoginOtpEmail", "sendEmailVerificationCodeEmail"]) {
   });
 }
 
+/*
+ * The object below is not invented. It was captured from the LIVE Resend API
+ * on 22 Sep 2026 by sending from a domain this account has not verified. em1
+ * exists because the SDK RESOLVES this rather than throwing, so the original
+ * code read .data.id off null and reported a send that never happened.
+ * Pinning the real shape means an SDK change that alters it fails here instead
+ * of silently restoring the bug.
+ */
+test("a real, measured Resend rejection is not reported as sent", async () => {
+  const h = mailHarness(async () => ({
+    data: null,
+    error: {
+      statusCode: 403,
+      name: "validation_error",
+      message:
+        "The example-unverified.com domain is not verified. Please, add and verify your domain on https://resend.com/domains",
+    },
+  }));
+  await assert.rejects(
+    h.mail.sendLoginOtpEmail("person@example.test", "123456", 600),
+    (e) =>
+      e.code === "EMAIL_SEND_FAILED" &&
+      !e.message.includes("domain is not verified") &&
+      !e.message.includes("resend.com"),
+  );
+  assert.equal(h.events.length, 0, "a rejected send must not be metered");
+});
+
 test("missing or malformed provider acknowledgement never counts as sent", async () => {
   for (const result of [undefined, {}, { data: {} }, { data: { id: 123 } }, { data: { id: " " } }, { data: { id: "message-1" }, error: { name: "error" } }]) {
     const h = mailHarness(async () => result);

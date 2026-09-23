@@ -9,6 +9,12 @@ const express = require("express");
 const path = require("path");
 const { errorHandler } = require("../middleware/error");
 const { CANONICAL_APP_URL, isProductionRuntime } = require("../lib/app-url");
+const { requestLogger, installProcessHandlers } = require("../lib/logger");
+
+// An unhandled rejection was previously a silent container restart with
+// nothing in the log saying why. Installed here rather than in dev-server.js
+// so it covers every entrypoint that requires this app.
+installProcessHandlers();
 const app = express();
 
 // ═══════════════════════════════════════════════════════════════
@@ -19,13 +25,16 @@ const app = express();
 // confusing CORS error on top of the real problem.
 // ═══════════════════════════════════════════════════════════════
 
+// Production only ever needs the real hosts. A developer machine is not a
+// trusted origin for an API holding live Stripe and Twilio credentials, so the
+// loopback entries are added back only when this is NOT production.
 const DEFAULT_ALLOWED_ORIGINS = [
   CANONICAL_APP_URL,
   "https://agentlycall.com",
   "https://www.agentlycall.com",
-  "http://localhost:3000",
-  "http://localhost:5173",
 ];
+
+const DEV_ONLY_ALLOWED_ORIGINS = ["http://localhost:3000", "http://localhost:5173"];
 
 function splitEnvList(value) {
   return String(value || "")
@@ -47,10 +56,37 @@ function normalizeOrigin(value) {
   }
 }
 
+/*
+ * Loopback origins in production: OFF by default, switchable ON by name.
+ *
+ * Blocking them outright was correct in principle and wrong in practice — it
+ * broke local development against this API within a day, including access to
+ * the super-admin panel, and a control that stops the operator working gets
+ * turned off in a hurry rather than thought about.
+ *
+ * So it is a deliberate, named switch instead of a silent default. Setting
+ * ALLOW_LOCALHOST_ORIGIN=true re-admits localhost and 127.0.0.1, and the
+ * startup log says so every boot, because the risk is real: any page on the
+ * developer's own machine can then make CREDENTIALED requests to production.
+ *
+ * The actual fix is a staging API to develop against (p9). This is the bridge
+ * until that exists, not the destination.
+ */
+const ALLOW_LOCALHOST = String(process.env.ALLOW_LOCALHOST_ORIGIN || "").toLowerCase() === "true";
+const LOOPBACK = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|$)/i;
+
 function collectAllowedOrigins() {
+  const configured = splitEnvList(process.env.ALLOWED_ORIGINS);
+  const allowLoopback = !isProductionRuntime() || ALLOW_LOCALHOST;
+  const fromEnv = allowLoopback ? configured : configured.filter((o) => !LOOPBACK.test(o));
+
   return Array.from(
     new Set(
-      [...DEFAULT_ALLOWED_ORIGINS, ...splitEnvList(process.env.ALLOWED_ORIGINS)]
+      [
+        ...DEFAULT_ALLOWED_ORIGINS,
+        ...(allowLoopback ? DEV_ONLY_ALLOWED_ORIGINS : []),
+        ...fromEnv,
+      ]
         .map(normalizeOrigin)
         .filter(Boolean),
     ),
@@ -59,11 +95,22 @@ function collectAllowedOrigins() {
 
 const ALLOWED_ORIGINS = collectAllowedOrigins();
 
+if (isProductionRuntime() && ALLOW_LOCALHOST) {
+  console.warn(
+    "[cors] ALLOW_LOCALHOST_ORIGIN=true — production is accepting credentialed " +
+      "requests from localhost. Intended for development against this API; " +
+      "turn it off once a staging API exists (p9).",
+  );
+}
+
 function isOriginAllowed(origin) {
   const normalizedOrigin = normalizeOrigin(origin);
-  if (!normalizedOrigin) return true; // server-to-server / curl
+  if (!normalizedOrigin) return true; // server-to-server / curl: no CORS involved
   if (!isProductionRuntime()) return true; // local development: allow all
-  if (ALLOWED_ORIGINS.length === 0) return true; // preserve existing fallback behavior
+  // An empty allowlist used to mean "allow everything", which made a
+  // misconfiguration indistinguishable from a working control — the same shape
+  // as a missing TOTP secret reading as 2FA passing. In production an empty
+  // list now means nothing is allowed, which is loud and safe.
   return ALLOWED_ORIGINS.includes(normalizedOrigin);
 }
 
@@ -89,6 +136,49 @@ function setCorsHeaders(req, res) {
 app.use((req, res, next) => {
   setCorsHeaders(req, res);
   if (req.method === "OPTIONS") return res.status(204).end();
+  next();
+});
+
+// Tag every request and log one structured line when it finishes. Placed
+// immediately after CORS so the id exists for anything that logs later, and
+// so a request that dies in a downstream middleware still gets a line.
+app.use(requestLogger());
+
+// ── p7: watch the webhook path ─────────────────────────────────
+//
+// One middleware rather than three wrapped handlers, so a webhook added later
+// is covered by adding a line here instead of being silently unmonitored.
+// It only listens to res.on("finish"): it cannot alter a response, which is
+// the point — a monitoring bug on this path would cause the outage it exists
+// to detect.
+const WEBHOOK_PROVIDERS = [
+  [/^\/api\/billing\/stripe\/webhook/, "stripe"],
+  [/^\/api\/email\/resend\/webhook/, "resend"],
+  [/^\/api\/twilio\//, "twilio"],
+];
+
+app.use((req, res, next) => {
+  const pathOnly = String(req.originalUrl || req.url || "").split("?")[0];
+  const match = WEBHOOK_PROVIDERS.find(([re]) => re.test(pathOnly));
+  if (!match) return next();
+
+  const startedAt = process.hrtime.bigint();
+  res.on("finish", () => {
+    const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+    const statusCode = res.statusCode;
+    void require("../lib/webhook-monitor").record({
+      provider: match[1],
+      eventType: res.locals?.webhookEventType || null,
+      externalId: res.locals?.webhookExternalId || null,
+      signatureOk:
+        res.locals?.webhookSignatureOk ??
+        (statusCode === 400 || statusCode === 401 || statusCode === 403 ? false : null),
+      statusCode,
+      durationMs,
+      outcome: statusCode < 300 ? "accepted" : statusCode < 500 ? "rejected" : "error",
+      detail: pathOnly,
+    });
+  });
   next();
 });
 
@@ -144,6 +234,25 @@ app.use((req, res, next) => {
 
   res.on("finish", () => record("finished"));
   res.on("close", () => record(res.writableEnded ? "finished" : "client-gone"));
+  next();
+});
+
+// ── s1: baseline security headers ──────────────────────────────
+//
+// Set before the widget block below, which deliberately RELAXES framing for
+// /chatbot-widget/ — the embed has to work on customer sites. Order matters:
+// the widget's own CSP overwrites what is set here, for that path only.
+app.disable("x-powered-by");
+app.use((req, res, next) => {
+  // Nothing here is served to be sniffed, framed or referred onward.
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Content-Security-Policy", "frame-ancestors 'none'");
+  // The API is HTTPS-only behind the Lightsail load balancer. Two years, and
+  // NOT preloaded — preload is close to irreversible and is a deliberate
+  // decision, not a default to inherit.
+  res.setHeader("Strict-Transport-Security", "max-age=63072000; includeSubDomains");
   next();
 });
 
@@ -334,6 +443,18 @@ safeMount(
   "chatbot-deploy",
 );
 safeMount("/api/messenger", () => require("./routes/messenger"), "messenger");
+// p7: webhook health for an external uptime checker. Shared-key gated.
+safeMount(
+  "/api/webhooks",
+  () => require("./routes/webhook-health"),
+  "webhook-health",
+);
+// s8: data export and erasure on request. Owner-only.
+safeMount(
+  "/api/account",
+  () => require("./routes/account-data"),
+  "account-data",
+);
 // PATCH: discovery -> select -> scrape job flow. Replaces the setImmediate()
 // background scrape, which never completed on Vercel serverless.
 safeMount(
@@ -422,6 +543,17 @@ try {
   require("../lib/billing-tracker").start();
 } catch (e) {
   console.warn("[app] billing-tracker failed to start:", e && e.message);
+}
+
+// ── N014: watch the webhook path and say something ──────────────
+// Off unless HEALTH_ALERTS_ENABLED=true and PLATFORM_ADMIN_EMAILS is set, so
+// it cannot start mailing by accident. It detects a SICK process, not an
+// absent one — liveness needs an external checker polling
+// GET /api/webhooks/health, which is why that endpoint exists.
+try {
+  require("../lib/health-alerts").start();
+} catch (e) {
+  console.warn("[app] health-alerts failed to start:", e && e.message);
 }
 
 // 404 for anything else

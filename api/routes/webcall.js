@@ -19,6 +19,8 @@
 const crypto = require("crypto");
 const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
+const { clientIp } = require("../../lib/client-ip");
+const { checkWebcallTokenIssue } = require("../../lib/public-abuse-limits");
 const { requireAuth } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 const { signScopedToken, verifyToken } = require("../../lib/auth");
@@ -109,9 +111,9 @@ const verifyHits = new Map();
 
 function rateLimitVerify(req, res, next) {
   const now = Date.now();
-  const key = String(
-    req.headers["x-forwarded-for"] || req.ip || "unknown",
-  ).split(",")[0].trim();
+  // Keyed on the address the proxy observed, not the one the caller wrote —
+  // otherwise rotating X-Forwarded-For resets this throttle every request.
+  const key = clientIp(req);
 
   const hits = (verifyHits.get(key) || []).filter(
     (t) => now - t < VERIFY_RATE_WINDOW_MS,
@@ -227,6 +229,19 @@ router.post(
   "/token",
   requireAuth,
   asyncHandler(async (req, res) => {
+    // c6: the cost is incurred HERE, at issuance — every token starts a paid
+    // realtime session. /verify-token had a throttle and this did not.
+    // Keyed on the organization and user from the verified session, so it is
+    // not resettable by anything the caller controls.
+    const gate = await checkWebcallTokenIssue({
+      organizationId: req.orgId,
+      userId: req.user?.id || "unknown",
+    });
+    if (!gate.ok) {
+      if (gate.retryAfter) res.setHeader("Retry-After", String(gate.retryAfter));
+      return res.status(gate.status).json(gate.body);
+    }
+
     const agentId = String(req.body?.agentId || "").trim();
     if (!agentId) {
       return res.status(400).json({

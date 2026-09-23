@@ -2,6 +2,8 @@
 
 const express = require("express");
 const { getSupabase } = require("../../lib/supabase");
+const { clientIp } = require("../../lib/client-ip");
+const { checkPublicRequest } = require("../../lib/public-abuse-limits");
 const { asyncHandler } = require("../../middleware/error");
 const { getOpenAI } = require("../../lib/openai-client");
 const { sendProviderFailure } = require("../../lib/provider-errors");
@@ -69,12 +71,10 @@ async function enforcePublicChatbotCredit(res, chatbotId, action) {
  * per-chatbot ceiling. A busy site is unaffected; a single abusive source is
  * cut off on its own key.
  */
-function clientIp(req) {
-  const forwarded = String(req.headers["x-forwarded-for"] || "")
-    .split(",")[0]
-    .trim();
-  return forwarded || req.socket?.remoteAddress || req.ip || "unknown";
-}
+// "Cut off on its own key" only holds if the key cannot be chosen by the
+// caller. This read the client-written end of X-Forwarded-For, so an abusive
+// source could rotate the header and never meet the per-IP ceiling at all.
+// lib/client-ip.js now supplies clientIp — see the require at the top.
 
 function isRateLimited(key, max = 80) {
   const now = Date.now(),
@@ -95,6 +95,44 @@ function isThrottled(req, chatbotId, scope) {
     isRateLimited(`${scope}:ip:${clientIp(req)}:${chatbotId}`, 20) ||
     isRateLimited(`${scope}:bot:${chatbotId}`, 300)
   );
+}
+
+/*
+ * c4: the in-memory check above is kept as a free same-instance fast path —
+ * it costs nothing and sheds the obvious floods before we pay a 313ms
+ * cross-Atlantic round trip. It is NOT the control. The durable, shared,
+ * restart-surviving ceilings and the daily spend cap live in
+ * lib/public-abuse-limits.js and are what actually decide.
+ *
+ * Returns true when the request was already answered.
+ */
+async function refusePublicRequest(req, res, chatbotId, scope) {
+  if (isThrottled(req, chatbotId, scope)) {
+    res.status(429).json({ error: { code: "RATE_LIMITED", message: "Too many requests. Please slow down." } });
+    return true;
+  }
+
+  const organizationId = await findChatbotOrganizationId(chatbotId);
+  const verdict = await checkPublicRequest({
+    scope,
+    clientIp: clientIp(req),
+    chatbotId,
+    organizationId,
+  });
+  if (verdict.ok) return false;
+
+  if (verdict.retryAfter) res.setHeader("Retry-After", String(verdict.retryAfter));
+  // The chat widget renders `response`; an `error`-shaped body shows the
+  // visitor an empty bubble. Same refusal, the shape each caller understands.
+  if (scope === "chat") {
+    res.status(verdict.status).json({
+      response: verdict.body.error.message,
+      code: verdict.body.error.code,
+    });
+  } else {
+    res.status(verdict.status).json(verdict.body);
+  }
+  return true;
 }
 
 // The map is process-global and never shrank. On a warm serverless instance or
@@ -262,11 +300,7 @@ router.post(
       return res
         .status(400)
         .json({ error: { message: "chatbotId is required." } });
-    if (isThrottled(req, chatbotId, "chat"))
-      return res.status(429).json({
-        response:
-          "I'm receiving many messages right now. Please try again in a moment.",
-      });
+    if (await refusePublicRequest(req, res, chatbotId, "chat")) return;
     if (!(await enforcePublicChatbotCredit(res, chatbotId, "chatbot_message")))
       return;
     let result;
@@ -441,10 +475,7 @@ router.post(
         .json({ error: { message: "chatbotId is required." } });
     if (!(await enforcePublicChatbotCredit(res, chatbotId, "voice_call")))
       return;
-    if (isThrottled(req, chatbotId, "voice"))
-      return res
-        .status(429)
-        .json({ error: { message: "Rate limit exceeded." } });
+    if (await refusePublicRequest(req, res, chatbotId, "voice")) return;
     if (!process.env.OPENAI_API_KEY)
       return res
         .status(500)

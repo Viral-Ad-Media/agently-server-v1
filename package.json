@@ -17,7 +17,8 @@
     "billing:phase3-metering-audit": "node scripts/billing-phase3-metering-audit.js",
     "admin:secrets": "node scripts/generate-super-admin-secrets.js",
     "billing:cycle": "node scripts/billing-run-cycle.js",
-    "billing:cycle:commit": "node scripts/billing-run-cycle.js --commit"
+    "billing:cycle:commit": "node scripts/billing-run-cycle.js --commit",
+    "test:integration": "node --test test/integration/run.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
