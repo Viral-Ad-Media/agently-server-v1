@@ -4765,6 +4765,34 @@ router.post(
 
     const releasedAt = new Date().toISOString();
 
+    /*
+     * A number with an emergency (E911) address attached cannot be released
+     * until that address is detached — the carrier refuses with "Please remove
+     * the emergency address on this number before performing this action", and
+     * the tenant has no way to do that from Agently. Measured in production on
+     * 24 Sep: the first real release attempt failed on exactly this.
+     *
+     * So detach it first. Best-effort: a number without one is unaffected, and
+     * if detaching fails the release below will fail too and report why. This
+     * is not silently swallowing an error — it is removing a prerequisite the
+     * tenant cannot reach, and the release is still the thing that must succeed.
+     */
+    try {
+      await twilioRequest({
+        method: "POST",
+        accountSid: number.account_sid,
+        path: `/IncomingPhoneNumbers/${number.phone_sid}.json`,
+        params: { EmergencyAddressSid: "", EmergencyStatus: "Inactive" },
+      });
+    } catch (prereqError) {
+      log.warn("number.release_prereq_failed", {
+        requestId: req.id,
+        orgId: req.orgId,
+        numberId: number.id,
+        reason: prereqError?.message,
+      });
+    }
+
     try {
       await releaseIncomingNumber({
         accountSid: number.account_sid,
@@ -4786,6 +4814,34 @@ router.post(
         numberId: number.id,
         reason: err?.message,
       });
+      /*
+       * The generic mapper hides the carrier's name by design, which is right
+       * — but it also hid the one thing the operator needed to know, and they
+       * were left with a 502 and no idea why. These conditions are actionable
+       * and can be described without naming any vendor.
+       */
+      const raw = String(err?.message || "");
+      const actionable = [
+        [
+          /emergency address/i,
+          "This number has an emergency address attached that could not be removed automatically. " +
+            "Contact support to release it.",
+        ],
+        [
+          /in use|active call|currently on a call/i,
+          "This number is handling a call right now. Try again once the call has ended.",
+        ],
+        [
+          /not found|does not exist/i,
+          "This number no longer exists at the carrier. Refresh the page — it may already be released.",
+        ],
+      ].find(([re]) => re.test(raw));
+
+      if (actionable) {
+        return res.status(409).json({
+          error: { code: "RELEASE_BLOCKED", message: actionable[1], retryable: true },
+        });
+      }
       const mapped = mapTwilioError(err, "Could not release this number.");
       return res.status(502).json({ error: mapped });
     }
