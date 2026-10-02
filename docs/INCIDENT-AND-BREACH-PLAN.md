@@ -48,7 +48,7 @@ select count(*), count(distinct organization_id) from leads;
 
 -- What was reachable? Re-run the exact probe that found it.
 --   node scratchpad/anon-probe.js
---   node infra/security-sweep.js
+--   node agently-ops/security-sweep.js
 
 -- When did it start? Find the migration or deploy that introduced it.
 select * from supabase_migrations.schema_migrations order by version desc limit 20;
@@ -87,7 +87,7 @@ telling the tenants.
 ## Preserving evidence
 
 - `pg_policies`, the deploy version, the image tag, and the manifest from
-  `infra/deployed-build-manifest.js` — all four say what was running.
+  `agently-ops/deployed-build-manifest.js` — all four say what was running.
 - Container logs: pull them **with `--start-time`**. Without it
   `get-container-log` returns a narrower window than you expect, which already
   hid the SSRF evidence for two attempts.

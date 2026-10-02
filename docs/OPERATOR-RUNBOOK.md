@@ -14,9 +14,9 @@ is measured, not assumed.
 | Database | Supabase `qozbmfwxlcuvwzbxtvnn`, **eu-central-1** |
 | Secret | `arn:aws:secretsmanager:us-east-1:808180619849:secret:agently/api-DIl9iX` |
 | Super-admin | `support@agentlycall.com` |
-| **Where to run `infra/` commands** | **`Agently-AWS/`** — the workspace root, NOT `agently-server/` |
+| **Where to run `agently-ops/` commands** | **`Agently-AWS/`** — the workspace root, NOT `agently-server/` |
 
-> **Every `node infra/...` command below runs from `Agently-AWS/`.** There is a
+> **Every `node agently-ops/...` command below runs from `Agently-AWS/`.** There is a
 > second `agently-server/infra/` holding two test tools, and running an ops
 > command from there fails with MODULE_NOT_FOUND. Get there first:
 >
