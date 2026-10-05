@@ -13,3 +13,6 @@ require("./webhook-monitor.test");
 require("./call-outcome.test");
 require("./public-abuse-limits.test");
 require("./health-alerts.test");
+require("./password-policy.test");
+require("./assistant-prompt-dedup.test");
+require("./blog-dedup.test");

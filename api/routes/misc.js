@@ -621,13 +621,25 @@ router.get(
       .eq("id", req.orgId)
       .single();
 
-    const { data: invoiceRows, error: invoicesError } = await db
-      .from("invoices")
-      .select("id,amount,status,pdf_url,date,created_at")
-      .eq("organization_id", req.orgId)
-      .order("date", { ascending: false });
-    if (invoicesError) throw invoicesError;
-    const invoices = Array.isArray(invoiceRows) ? invoiceRows : [];
+    /*
+     * The balance card is the most important thing on this page. A failing
+     * invoices query must never take the whole summary (wallet included) down
+     * with it — degrade to empty invoices and say so in `warnings`.
+     */
+    let invoiceRows = [];
+    let invoicesWarning = null;
+    try {
+      const { data, error: invoicesError } = await db
+        .from("invoices")
+        .select("id,amount,status,pdf_url,date,created_at")
+        .eq("organization_id", req.orgId)
+        .order("date", { ascending: false });
+      if (invoicesError) throw invoicesError;
+      invoiceRows = Array.isArray(data) ? data : [];
+    } catch (invoiceErr) {
+      invoicesWarning = `Invoices could not be loaded: ${invoiceErr?.message || String(invoiceErr)}`;
+    }
+    const invoices = invoiceRows;
 
     const serializedInvoices = invoices.map((invoice) => ({
       id: invoice.id,
@@ -755,6 +767,7 @@ router.get(
           hardStopBalanceUsd: -maxNegativeBalanceUsd(),
         },
       },
+      warnings: [invoicesWarning, wallet.warning].filter(Boolean),
     });
   }),
 );

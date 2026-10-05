@@ -87,6 +87,87 @@ const USER_COLUMNS =
 
 const normalizeEmail = (value) => String(value || "").toLowerCase().trim();
 
+/*
+ * Common-password denylist. Applied everywhere a password is SET (register,
+ * reset-confirm, change-password) — not at login, where rejecting would leak
+ * whether the guess was right. Matched case-insensitively against the
+ * normalized candidate; keep this list to genuinely common choices rather
+ * than inventing arbitrary complexity rules.
+ */
+const COMMON_PASSWORDS = new Set(
+  [
+    "password",
+    "password1",
+    "password123",
+    "password1234",
+    "passw0rd",
+    "123456",
+    "12345678",
+    "123456789",
+    "1234567890",
+    "qwerty",
+    "qwerty123",
+    "qwertyuiop",
+    "abc123",
+    "abc12345",
+    "letmein",
+    "welcome",
+    "welcome1",
+    "welcome123",
+    "admin",
+    "admin123",
+    "administrator",
+    "changeme",
+    "default",
+    "monkey",
+    "dragon",
+    "football",
+    "baseball",
+    "superman",
+    "trustno1",
+    "sunshine",
+    "master",
+    "shadow",
+    "princess",
+    "iloveyou",
+    "123123",
+    "111111",
+    "11111111",
+    "000000",
+    "00000000",
+    "654321",
+    "1q2w3e4r",
+    "1qaz2wsx",
+    "agently",
+    "agently123",
+  ].map((pw) => pw.toLowerCase()),
+);
+
+const isCommonPassword = (password) =>
+  COMMON_PASSWORDS.has(String(password || "").toLowerCase());
+
+/*
+ * Single password policy for every password-set endpoint. Returns a response
+ * descriptor ({ code, message }) when the candidate is rejected, or null when
+ * it passes. Keeps register / reset-confirm / change-password consistent.
+ */
+const validateNewPassword = (password) => {
+  if (!password || typeof password !== "string" || password.length < 8) {
+    return {
+      code: "PASSWORD_TOO_SHORT",
+      message: "Password must be at least 8 characters.",
+    };
+  }
+  if (isCommonPassword(password)) {
+    return {
+      code: "PASSWORD_TOO_COMMON",
+      message:
+        "That password is too common and easy to guess. Please choose a less predictable one.",
+    };
+  }
+  return null;
+};
+
 function isOrganizationDeletionRequested(org) {
   const deletion =
     org &&
@@ -323,13 +404,9 @@ router.post(
       });
     }
 
-    if (String(password).length < 8) {
-      return res.status(400).json({
-        error: {
-          code: "PASSWORD_TOO_SHORT",
-          message: "Password must be at least 8 characters.",
-        },
-      });
+    const passwordError = validateNewPassword(password);
+    if (passwordError) {
+      return res.status(400).json({ error: passwordError });
     }
 
     const normalizedEmail = normalizeEmail(email);
@@ -1005,13 +1082,9 @@ router.post(
       });
     }
 
-    if (!password || typeof password !== "string" || password.length < 8) {
-      return res.status(400).json({
-        error: {
-          code: "PASSWORD_TOO_SHORT",
-          message: "Password must be at least 8 characters.",
-        },
-      });
+    const passwordError = validateNewPassword(password);
+    if (passwordError) {
+      return res.status(400).json({ error: passwordError });
     }
 
     const db = getSupabase();
@@ -1122,17 +1195,9 @@ router.post(
   asyncHandler(async (req, res) => {
     const { currentPassword, newPassword } = req.body || {};
 
-    if (
-      !newPassword ||
-      typeof newPassword !== "string" ||
-      newPassword.length < 8
-    ) {
-      return res.status(400).json({
-        error: {
-          code: "PASSWORD_TOO_SHORT",
-          message: "New password must be at least 8 characters.",
-        },
-      });
+    const passwordError = validateNewPassword(newPassword);
+    if (passwordError) {
+      return res.status(400).json({ error: passwordError });
     }
 
     const db = getSupabase();
@@ -1385,3 +1450,7 @@ router.post(
  */
 
 module.exports = router;
+// Password-policy helpers, exported for unit tests. The router itself is
+// unchanged — Express still receives the same middleware function.
+module.exports.validateNewPassword = validateNewPassword;
+module.exports.isCommonPassword = isCommonPassword;

@@ -6,6 +6,33 @@ const { asyncHandler } = require("../../middleware/error");
 
 const router = express.Router();
 
+/*
+ * Stored articles can contain paste-duplicated blocks (the same paragraph
+ * saved 2-3x in a row). This is a data problem, but the public site should
+ * not render it: drop a block only when it is deeply identical (ignoring its
+ * id) to the block immediately before it. Intentional repeats separated by
+ * other content are preserved. Admin read paths are untouched so the owner
+ * can still see and fix the raw stored blocks.
+ */
+function blockSignature(block) {
+  if (!block || typeof block !== "object") return JSON.stringify(block);
+  const { id, ...rest } = block;
+  return JSON.stringify(rest);
+}
+
+function dedupeContentBlocks(blocks) {
+  if (!Array.isArray(blocks)) return blocks;
+  const kept = [];
+  let prevSignature = null;
+  for (const block of blocks) {
+    const signature = blockSignature(block);
+    if (signature === prevSignature) continue;
+    kept.push(block);
+    prevSignature = signature;
+  }
+  return kept;
+}
+
 function publicPost(row, includeContent = false) {
   const post = {
     id: row.id,
@@ -21,9 +48,9 @@ function publicPost(row, includeContent = false) {
     seoDescription: row.seo_description || row.excerpt || "",
   };
   if (includeContent)
-    post.contentBlocks = Array.isArray(row.content_blocks)
-      ? row.content_blocks
-      : [];
+    post.contentBlocks = dedupeContentBlocks(
+      Array.isArray(row.content_blocks) ? row.content_blocks : [],
+    );
   return post;
 }
 
@@ -81,3 +108,5 @@ router.get(
 );
 
 module.exports = router;
+// Exported for unit tests; the router itself is unchanged.
+module.exports.dedupeContentBlocks = dedupeContentBlocks;

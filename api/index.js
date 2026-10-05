@@ -315,35 +315,16 @@ app.use(
 // ═══════════════════════════════════════════════════════════════
 
 app.get("/health", (_req, res) => {
+  /*
+   * Public and unauthenticated by design (load-balancer checks). It used to
+   * enumerate every configured integration (envCheck booleans) and the full
+   * allowed-origin list — useful reconnaissance for an attacker, useless for
+   * a health check. Keep it to status + timestamp + env name.
+   */
   res.json({
     status: "ok",
     ts: new Date().toISOString(),
     env: process.env.NODE_ENV || "development",
-    allowedOrigins: ALLOWED_ORIGINS,
-    envCheck: {
-      SUPABASE_URL: !!process.env.SUPABASE_URL,
-      SUPABASE_SERVICE_KEY: !!(
-        process.env.SUPABASE_SERVICE_KEY ||
-        process.env.SUPABASE_SERVICE_ROLE_KEY
-      ),
-      JWT_SECRET: !!process.env.JWT_SECRET,
-      OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
-      ELEVENLABS_API_KEY: !!process.env.ELEVENLABS_API_KEY,
-      ELEVENLABS_DEFAULT_MODEL: !!process.env.ELEVENLABS_DEFAULT_MODEL,
-      VOICE_PROVIDER_DEFAULT: process.env.VOICE_PROVIDER_DEFAULT || "openai",
-      VOICE_PROVIDER_FALLBACK: process.env.VOICE_PROVIDER_FALLBACK || "openai",
-      RESEND_API_KEY: !!process.env.RESEND_API_KEY,
-      STRIPE_SECRET_KEY: !!process.env.STRIPE_SECRET_KEY,
-      STRIPE_WEBHOOK_SECRET: !!process.env.STRIPE_WEBHOOK_SECRET,
-      TWILIO_ACCOUNT_SID: !!process.env.TWILIO_ACCOUNT_SID,
-      TWILIO_AUTH_TOKEN: !!process.env.TWILIO_AUTH_TOKEN,
-      TWILIO_API_KEY_SID: !!process.env.TWILIO_API_KEY_SID,
-      TWILIO_API_KEY_SECRET: !!process.env.TWILIO_API_KEY_SECRET,
-      TWILIO_TWIML_APP_SID: !!process.env.TWILIO_TWIML_APP_SID,
-      TWILIO_WS_URL: !!process.env.TWILIO_WS_URL,
-      API_URL: !!process.env.API_URL,
-      APP_URL: !!process.env.APP_URL,
-    },
   });
 });
 
