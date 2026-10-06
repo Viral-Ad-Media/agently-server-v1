@@ -78,6 +78,12 @@ const GOOGLE_SCOPES = [
   "profile",
   "https://www.googleapis.com/auth/calendar.freebusy",
   "https://www.googleapis.com/auth/calendar.events",
+  // Read-only list of the account's calendars, so the tenant can pick which
+  // one the agent books into. Without it, calendarList answers 403 and the
+  // picker in Settings has nothing to show — booking still works, but only
+  // ever against "primary". This grants the names of calendars, not their
+  // contents; reading availability is calendar.freebusy above.
+  "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
 ].join(" ");
 
 // Minimum for the agent: read event types + availability, book/cancel, webhooks.
@@ -631,6 +637,29 @@ router.get(
         headers: { authorization: `Bearer ${accessToken}` },
       });
       if (!response.ok) {
+        /*
+         * Listing calendars needs calendar.calendarlist.readonly. Booking needs
+         * only freebusy + events, so a connection made before that scope was
+         * requested works perfectly and simply cannot enumerate calendars —
+         * Google answers 403 insufficientPermissions.
+         *
+         * That is not a fault worth a 502. Booking already falls back to the
+         * primary calendar, so the honest answer is "you are on primary,
+         * reconnect if you want to choose" — not "Could not list Google
+         * calendars", which reads as breakage and tells the tenant nothing
+         * about what to do.
+         */
+        if (response.status === 403) {
+          return res.json({
+            options: [],
+            selected: connection.calendar_id || "primary",
+            needsReconnect: true,
+            notice:
+              "Bookings go to this account's primary calendar. To choose a " +
+              "different one, disconnect and connect again — permission to " +
+              "list your calendars is only granted at connect time.",
+          });
+        }
         const error = new Error("Could not list Google calendars.");
         error.status = 502;
         throw error;
