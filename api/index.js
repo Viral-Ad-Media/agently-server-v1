@@ -280,6 +280,30 @@ app.post(
   },
 );
 
+// Calendar change-notification receivers. The Calendly receiver verifies an
+// HMAC over the exact request bytes, so like the Resend webhook above it needs
+// its own raw parser ahead of the global JSON one. Both authenticate
+// cryptographically (Calendly signature / Google channel token) rather than by
+// session; Google's push notifications are bodyless and only headers are read.
+app.post(
+  "/api/integrations/calendly/webhook/:orgId",
+  express.raw({ type: "application/json", limit: "256kb" }),
+  (req, res, next) => {
+    Promise.resolve()
+      .then(() =>
+        require("../lib/calendar-sync").createCalendlyWebhookHandler()(req, res)
+      )
+      .catch(next);
+  },
+);
+app.post("/api/integrations/google/push", (req, res, next) => {
+  Promise.resolve()
+    .then(() =>
+      require("../lib/calendar-sync").createGooglePushHandler()(req, res)
+    )
+    .catch(next);
+});
+
 app.use(
   express.json({
     limit: process.env.JSON_BODY_LIMIT || "4mb",
@@ -506,6 +530,26 @@ safeMount(
   "/api/internal/number-retention",
   () => require("./routes/number-retention"),
   "number-retention",
+);
+
+// Calendar integrations. business-groups mounts FIRST so the ":provider"
+// parameter inside the integrations router can never capture it as a provider
+// name. All three sit above the generic /api misc route for the same reason
+// billing-usage does: misc would otherwise swallow these nested paths.
+safeMount(
+  "/api/integrations/business-groups",
+  () => require("./routes/business-groups"),
+  "business-groups",
+);
+safeMount(
+  "/api/integrations",
+  () => require("./routes/integrations"),
+  "integrations",
+);
+safeMount(
+  "/api/internal/calendar",
+  () => require("./routes/internal-calendar"),
+  "internal-calendar",
 );
 
 safeMount("/api", () => require("./routes/misc"), "misc");

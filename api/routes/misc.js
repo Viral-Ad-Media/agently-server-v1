@@ -24,6 +24,11 @@ const { isAutoWalletChargeEnabled } = require("../../lib/usage-ledger");
 const { getBillingPlatformSettings } = require("../../lib/billing-settings");
 const { getActivationState } = require("../../lib/activation-gate");
 const {
+  encryptSecret,
+  isEncryptionConfigured,
+  keySetupHelp,
+} = require("../../lib/crypto");
+const {
   stripeConfigured,
   stripeCheckoutConfigured,
 } = require("../../lib/stripe-billing");
@@ -1176,8 +1181,22 @@ router.patch(
             twilio.accountSid,
           );
         if (twilio.authToken) {
-          // In production you'd encrypt this; for now store with last 4
-          updates.twilio_auth_token_encrypted = twilio.authToken; // Store securely in prod
+          // Per-tenant bearer credential: never plaintext. The old code stored
+          // the raw token in twilio_auth_token_encrypted; that column now holds
+          // an AES-256-GCM envelope bound to (organization, "twilio").
+          if (!isEncryptionConfigured()) {
+            return res.status(503).json({
+              error: {
+                code: "encryption_not_configured",
+                message:
+                  "Cannot save the Twilio auth token: " + keySetupHelp(),
+              },
+            });
+          }
+          updates.twilio_auth_token_encrypted = encryptSecret(
+            String(twilio.authToken),
+            { organizationId: req.orgId, provider: "twilio", connectionId: "primary" },
+          );
           updates.twilio_auth_token_last_four = String(twilio.authToken).slice(
             -4,
           );
