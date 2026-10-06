@@ -47,7 +47,7 @@ const crypto = require("crypto");
 const { getSupabase } = require("../../lib/supabase");
 const { requireAuth, requireAdmin } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
-const { buildAppHashUrl, isProductionRuntime } = require("../../lib/app-url");
+const { buildAppUrl, isProductionRuntime } = require("../../lib/app-url");
 const {
   isEncryptionConfigured,
   keySetupHelp,
@@ -222,7 +222,7 @@ function getCookie(req, name) {
 
 function settingsRedirect(params) {
   const query = new URLSearchParams(params).toString();
-  return `${buildAppHashUrl("/integrations")}?${query}`;
+  return `${buildAppUrl("/integrations")}?${query}`;
 }
 
 function setNonceCookie(res, provider, nonce) {

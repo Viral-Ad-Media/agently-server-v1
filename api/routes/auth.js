@@ -54,7 +54,7 @@ const {
 } = require("../../lib/email");
 const { requireAuth } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
-const { buildAppHashUrl } = require("../../lib/app-url");
+const { buildAppUrl } = require("../../lib/app-url");
 const { grantSignupCredit } = require("../../lib/activation-gate");
 const { publicAuthConfig } = require("../../lib/auth-providers");
 const {
@@ -190,7 +190,7 @@ function hashResetToken(token) {
 }
 
 function buildPasswordResetUrl(token) {
-  return buildAppHashUrl(
+  return buildAppUrl(
     `/reset-password?resetToken=${encodeURIComponent(token)}`,
   );
 }

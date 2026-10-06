@@ -22,7 +22,24 @@ function mailHarness(send, log = async () => {}, guard = async () => {}) {
         constructor() { this.emails = { send: async (options) => { sent.push(options); return send(options); } }; }
       } };
       if (id === "./usage-ledger") return { logEmailUsage: async (event) => { events.push(event); await log(event); } };
-      if (id === "./app-url") return { getAppBaseUrl: () => "https://example.test", buildAppHashUrl: () => "https://example.test/#/login" };
+      /*
+       * Mirror the real module's exports. This stub used to offer only
+       * buildAppHashUrl, so when email.js moved to buildAppUrl the
+       * destructured import came back undefined and every template that built
+       * a link threw — a failure the stub itself caused. A stub that is a
+       * subset of its subject reports the subject broken when it is not, and
+       * reports it fine when the subject drops an export it never offered.
+       */
+      if (id === "./app-url") {
+        const build = (route = "/login") => `https://example.test/#${route}`;
+        return {
+          getAppBaseUrl: () => "https://example.test",
+          usesHashRoutes: () => true,
+          buildAppPath: (route = "/login") => `#${route}`,
+          buildAppUrl: build,
+          buildAppHashUrl: build,
+        };
+      }
       throw new Error(`Unexpected dependency: ${id}`);
     },
   });

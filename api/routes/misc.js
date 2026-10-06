@@ -1,7 +1,7 @@
 "use strict";
 
 const express = require("express");
-const { buildAppHashUrl } = require("../../lib/app-url");
+const { buildAppUrl } = require("../../lib/app-url");
 const { getSupabase } = require("../../lib/supabase");
 const { clearSessionCache, primeSessionCache } = require("../../lib/auth");
 const {
@@ -529,7 +529,7 @@ router.post(
        * gone. POST /api/auth/accept-invitation replaces it and can only ever
        * resolve a user row this admin already created.
        */
-      const magicLinkUrl = buildAppHashUrl(
+      const magicLinkUrl = buildAppUrl(
         `/accept-invite?token=${encodeURIComponent(token)}`,
       );
       await sendTeamInviteEmail(
