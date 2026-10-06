@@ -18,6 +18,7 @@ require("./assistant-prompt-dedup.test");
 require("./blog-dedup.test");
 require("./crypto.test");
 require("./app-url-format.test");
+require("./calendar-save-connection.test");
 require("./integrations-oauth.test");
 require("./calendar-booking.test");
 require("./calendar-tool-definitions.test");
