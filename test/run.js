@@ -26,3 +26,4 @@ require("./calendar-tool-definitions.test");
 require("./calendar-sync.test");
 require("./calendar-groups.test");
 require("./calendar-multi-account.test");
+require("./calendar-projection.test");

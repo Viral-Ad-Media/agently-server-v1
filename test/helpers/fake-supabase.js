@@ -24,10 +24,99 @@
  * production database does not filter by tenant either. Every cross-tenant
  * test here therefore measures the application's own scoping, which is the
  * only thing doing that job.
+ *
+ * WHY select() PROJECTS
+ *
+ * select() used to be a no-op that ignored its column list and returned every
+ * column of every matching row. That hid a whole class of real bug: a
+ * PostgREST column projection is sometimes the ONLY thing standing between a
+ * client and a secret. lib/calendar-tokens.js listConnections() selects
+ * PUBLIC_CONNECTION_COLUMNS precisely so GET /api/integrations/status cannot
+ * ship access_token_encrypted / refresh_token_encrypted to the browser — and
+ * with a no-op select() no test could tell that projection from "*".
+ *
+ * So select(columns) now narrows the returned rows the way PostgREST does.
+ * Filters, ordering and the unique-index checks still see the WHOLE row,
+ * because PostgREST evaluates those server-side on the full row and only the
+ * response is projected.
  */
 
 function clone(row) {
   return JSON.parse(JSON.stringify(row));
+}
+
+/**
+ * Splits a PostgREST column list on its top-level commas, leaving the commas
+ * inside an embedded resource's parentheses alone: "*, organizations(id, name)"
+ * is two entries, not three.
+ */
+function splitColumns(text) {
+  const parts = [];
+  let depth = 0;
+  let current = "";
+  for (const char of text) {
+    if (char === "(") depth += 1;
+    if (char === ")") depth = Math.max(0, depth - 1);
+    if (char === "," && depth === 0) {
+      parts.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  parts.push(current);
+  return parts;
+}
+
+/**
+ * Turns a select() argument into the projection to apply, or null for "every
+ * column" — which is what PostgREST does for select(), select("*"), and any
+ * list containing "*".
+ *
+ * Each entry is { out, src }: "alias:column" is returned under the alias, the
+ * way PostgREST renames it. An embedded resource ("organizations(id, name)")
+ * is parsed but will simply be absent from the result, because this fake has
+ * no joins — a test that needs one has to stub it explicitly rather than get
+ * it by accident.
+ */
+function parseProjection(columns) {
+  if (columns === undefined || columns === null) return null;
+  const text = String(columns).trim();
+  if (!text) return null;
+  const keys = [];
+  for (const raw of splitColumns(text)) {
+    const part = raw.trim();
+    if (!part) continue;
+    if (part === "*") return null;
+    const name = part.split("(")[0].trim();
+    if (!name) continue;
+    /*
+     * PostgREST writes a column as "alias:column::cast", and a cast without
+     * an alias ("provider::text") still comes back under the column's own
+     * name. So strip the cast FIRST — otherwise the "::" is mistaken for the
+     * alias separator and the entry names a column that does not exist.
+     */
+    const cast = name.indexOf("::");
+    const base = (cast === -1 ? name : name.slice(0, cast)).trim();
+    if (!base) continue;
+    const colon = base.indexOf(":");
+    const out = colon === -1 ? base : base.slice(0, colon).trim();
+    const src = colon === -1 ? base : base.slice(colon + 1).trim();
+    if (!out || !src) continue;
+    keys.push({ out, src });
+  }
+  return keys.length ? keys : null;
+}
+
+function project(row, keys) {
+  if (!keys || !row || typeof row !== "object") return row;
+  const out = {};
+  for (const { out: name, src } of keys) {
+    // Absent rather than undefined: a column the row does not carry is a
+    // column the response does not carry.
+    if (Object.prototype.hasOwnProperty.call(row, src)) out[name] = row[src];
+  }
+  return out;
 }
 
 function accountKey(row) {
@@ -95,6 +184,7 @@ function makeFakeSupabase(seed = {}) {
     const filters = [];
     let pending = null; // { kind: "insert"|"update"|"delete", payload }
     let limitTo = null;
+    let projection = null; // null = every column, as PostgREST's "*" does
 
     function apply(row) {
       return filters.every(([op, column, value]) => {
@@ -116,7 +206,13 @@ function makeFakeSupabase(seed = {}) {
       return limitTo == null ? out : out.slice(0, limitTo);
     }
 
-    function commit() {
+    /*
+     * The write/read itself, on whole rows. Everything the database decides —
+     * which rows match, which unique index is violated — is decided here on
+     * the full row, exactly as Postgres does it. commit() below then narrows
+     * only what the caller gets back.
+     */
+    function execute() {
       const check = CONSTRAINED_TABLES[tableName];
 
       if (pending && pending.kind === "insert") {
@@ -160,8 +256,24 @@ function makeFakeSupabase(seed = {}) {
       return { data: matching().map(clone), error: null };
     }
 
+    function commit() {
+      const result = execute();
+      if (result.error || projection == null) return result;
+      const { data } = result;
+      if (Array.isArray(data)) {
+        return { data: data.map((row) => project(row, projection)), error: null };
+      }
+      return { data: project(data, projection), error: null };
+    }
+
     const api = {
-      select() {
+      /**
+       * Narrows the response to these columns. select() and select("*") keep
+       * every column, which is what PostgREST does, so the hundreds of
+       * existing select("*") call sites behave exactly as before.
+       */
+      select(columns) {
+        projection = parseProjection(columns);
         return api;
       },
       eq(column, value) {
@@ -258,4 +370,4 @@ function makeFakeSupabase(seed = {}) {
   };
 }
 
-module.exports = { makeFakeSupabase, accountKey };
+module.exports = { makeFakeSupabase, accountKey, parseProjection };
