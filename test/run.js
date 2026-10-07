@@ -25,3 +25,4 @@ require("./calendar-booking.test");
 require("./calendar-tool-definitions.test");
 require("./calendar-sync.test");
 require("./calendar-groups.test");
+require("./calendar-multi-account.test");

@@ -5,13 +5,31 @@
  *
  * ROUTES
  *
- *   GET  /api/integrations/status                        (auth)  connection list
- *   POST /api/integrations/:provider/start-token         (admin) mint a 2-min start token
- *   GET  /api/integrations/:provider/start?st=...        (token) begin OAuth (302 to provider)
- *   GET  /api/integrations/:provider/callback             (public*) provider redirect
- *   GET  /api/integrations/:provider/options               (auth)  calendars / event types
- *   PUT  /api/integrations/:provider/selection            (admin) choose calendar / event type
- *   POST /api/integrations/:provider/disconnect           (admin) revoke + delete
+ *   GET    /api/integrations/status                         (auth)  connection list
+ *   GET    /api/integrations/connections                    (auth)  one row per connected account
+ *   PATCH  /api/integrations/connections/:id                (admin) rename a connection
+ *   PUT    /api/integrations/connections/:id/booking-default(admin) choose the booking target
+ *   POST   /api/integrations/connections/:id/disconnect     (admin) revoke + delete one account
+ *   GET    /api/integrations/bookings                       (auth)  MERGED feed, all accounts
+ *   POST   /api/integrations/:provider/start-token          (admin) mint a 2-min start token
+ *   GET    /api/integrations/:provider/start?st=...         (token) begin OAuth (302 to provider)
+ *   GET    /api/integrations/:provider/callback             (public*) provider redirect
+ *   GET    /api/integrations/:provider/options              (auth)  calendars / event types
+ *   PUT    /api/integrations/:provider/selection            (admin) choose calendar / event type
+ *   POST   /api/integrations/:provider/disconnect           (admin) revoke + delete
+ *
+ * MULTI-ACCOUNT. One Agently login can run several businesses, each with its
+ * own Google account, so calendar_integrations holds one row per connected
+ * ACCOUNT — keyed on (organization_id, provider, provider_user_id) — not one
+ * per provider. The /connections/* routes address a connection by id; the
+ * older /:provider/* routes act on that provider's booking default and accept
+ * an optional connectionId to name a specific account instead.
+ *
+ * Every handler scopes by req.orgId, which comes from the verified session.
+ * No handler accepts an organization id from the client. The five calendar
+ * tables are RLS-enabled with ZERO policies and this API uses the service
+ * role, so those application-level filters are the whole of the tenant
+ * boundary — see lib/calendar-tokens.js getConnectionById.
  *
  * The SPA cannot send its Authorization header on a full-page navigation, so
  * /start does not use requireAuth: the frontend first POSTs to /start-token
@@ -56,14 +74,21 @@ const {
 } = require("../../lib/crypto");
 const {
   getConnection,
+  getConnectionById,
   listConnections,
   saveConnection,
+  setBookingDefault,
+  renameConnection,
+  promoteBookingDefault,
 } = require("../../lib/calendar-tokens");
 const {
   setupConnectionSync,
   teardownConnectionSync,
 } = require("../../lib/calendar-sync");
-const { invalidateAvailabilityCache } = require("../../lib/calendar-booking");
+const {
+  invalidateAvailabilityCache,
+  listMergedBookings,
+} = require("../../lib/calendar-booking");
 
 const router = express.Router();
 
@@ -253,7 +278,19 @@ function buildAuthorizeUrl(provider, config, state, codeChallenge) {
       response_type: "code",
       scope: GOOGLE_SCOPES,
       access_type: "offline", // ask for a refresh token
-      prompt: "consent", // force the consent screen so offline access is granted
+      /*
+       * "select_account consent" rather than "consent".
+       *
+       * This is what makes "Add another account" work. With "consent" alone
+       * Google silently reuses whichever account the browser is already
+       * signed in to, so a tenant adding their second business's Gmail would
+       * be sent straight back with the SAME provider_user_id — a reconnect of
+       * the account they already had, not a new connection, and no amount of
+       * correctness in saveConnection could tell the difference. The account
+       * chooser is the only place that decision can be made. "consent" stays
+       * alongside it so offline access is still granted on every run.
+       */
+      prompt: "select_account consent",
       include_granted_scopes: "false",
       code_challenge: codeChallenge,
       code_challenge_method: "S256",
@@ -437,6 +474,271 @@ router.get(
     });
   }),
 );
+
+// ---------------------------------------------------------------------------
+// Connections (multi-account)
+// ---------------------------------------------------------------------------
+//
+// One Agently login runs several businesses, each with its own Google
+// account, so these routes address a CONNECTION by id rather than a provider
+// by name. They are registered before the /:provider/* routes so a literal
+// "connections" or "bookings" path segment can never be read as a provider.
+//
+// EVERY handler here re-scopes by req.orgId. The connection id arrives from
+// the client, the five calendar tables are RLS-enabled with zero policies,
+// and the API is the service role — so the organization filter in
+// lib/calendar-tokens.js is the only thing between a guessed uuid and another
+// tenant's calendar. No handler reads an organization id from the request
+// body, query or params; req.orgId comes from the verified session and
+// nothing else.
+
+/**
+ * GET /api/integrations/connections
+ * The tenant-facing list: label, email, provider, booking default.
+ */
+router.get(
+  "/connections",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    /*
+     * The lighter camelCase summary shape (CalendarConnectionSummary in
+     * services/api.ts) plus the few extras a connection card shows.
+     * /status returns the raw snake_case rows AND the provider/encryption
+     * flags in one round trip, which is what the Integrations page uses; this
+     * route is for callers that want only the accounts.
+     */
+    const connections = await listConnections(db, req.orgId);
+    res.json({
+      connections: connections.map((row) => ({
+        ...connectionSummary(row),
+        name: row.provider_user_name || null,
+        calendarId: row.calendar_id || null,
+        eventTypeName: row.event_type_name || null,
+        timezone: row.timezone || null,
+        lastError: row.last_error || null,
+        connectedAt: row.connected_at,
+      })),
+      bookingDefaultId: (connections.find((row) => row.is_booking_default) || {}).id || null,
+    });
+  }),
+);
+
+/**
+ * PATCH /api/integrations/connections/:connectionId
+ * Rename a connection ("Nutra Wellness"). Cosmetic only.
+ */
+router.patch(
+  "/connections/:connectionId",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const label = req.body && req.body.label;
+    if (label === undefined) {
+      return res.status(400).json({
+        error: { code: "missing_label", message: "label is required." },
+      });
+    }
+    const db = getSupabase();
+    let updated;
+    try {
+      updated = await renameConnection(db, req.orgId, req.params.connectionId, label);
+    } catch (error) {
+      if (error.code === "invalid_label") {
+        return res.status(400).json({ error: { code: error.code, message: error.message } });
+      }
+      throw error;
+    }
+    if (!updated) return res.status(404).json(connectionNotFound());
+    res.json({ connection: connectionSummary(updated) });
+  }),
+);
+
+/**
+ * PUT /api/integrations/connections/:connectionId/booking-default
+ * Choose which connection the voice agent books into (design point 5).
+ *
+ * PUT rather than POST: it sets a value rather than creating anything, and
+ * sending it twice is the same as sending it once. The response describes only
+ * the connection that WON — setting a default also clears the previous one, so
+ * a client holding a list has to re-read it rather than flip a flag locally.
+ */
+router.put(
+  "/connections/:connectionId/booking-default",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const target = await getConnectionById(db, req.orgId, req.params.connectionId);
+    if (!target) return res.status(404).json(connectionNotFound());
+    if (target.status === "disconnected") {
+      return res.status(409).json({
+        error: {
+          code: "not_connected",
+          message: "That connection is disconnected, so the agent cannot book into it.",
+        },
+      });
+    }
+    const updated = await setBookingDefault(db, req.orgId, target.id);
+    // Availability is cached per organization and the booking target drives
+    // the slot grid, so the cache is stale the moment this changes.
+    invalidateAvailabilityCache(req.orgId);
+    res.json({ connection: connectionSummary(updated || target) });
+  }),
+);
+
+/**
+ * POST /api/integrations/connections/:connectionId/disconnect
+ * Remove ONE account: revoke at the provider, delete the row, and promote
+ * another connection if this one was the booking default (design point 7).
+ */
+router.post(
+  "/connections/:connectionId/disconnect",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const row = await getConnectionById(db, req.orgId, req.params.connectionId);
+    if (!row) return res.status(404).json(connectionNotFound());
+
+    const config = getProviderConfig(row.provider);
+    const revoked = await revokeAndDelete(db, req.orgId, row, config);
+    if (revoked.error) return res.status(revoked.status).json({ error: revoked.error });
+
+    // Point 7: the organization must still have somewhere to book.
+    const promoted = await promoteBookingDefault(db, req.orgId);
+    invalidateAvailabilityCache(req.orgId);
+    // promotedConnectionId names the replacement, or is null when nothing
+    // needed promoting, so the caller never has to guess.
+    res.json({
+      disconnected: true,
+      provider: row.provider,
+      connectionId: row.id,
+      promotedConnectionId: promoted && promoted.id !== row.id ? promoted.id : null,
+    });
+  }),
+);
+
+/**
+ * GET /api/integrations/bookings
+ * The merged feed: every appointment across all of this organization's
+ * connections, each labelled with its connection (design point 6).
+ *
+ * Scoped to req.orgId. An organizationId in the query string is ignored
+ * rather than honoured — see listMergedBookings.
+ */
+router.get(
+  "/bookings",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const result = await listMergedBookings(
+      req.orgId,
+      {
+        from: req.query.from || null,
+        to: req.query.to || null,
+        status: req.query.status || null,
+        connectionId: req.query.connectionId || null,
+        limit: req.query.limit ? Number(req.query.limit) : 200,
+      },
+      db,
+    );
+    res.json(result);
+  }),
+);
+
+/**
+ * Which connection a provider-shaped route is talking about.
+ *
+ * The picker, the selection and the booking-settings routes predate
+ * multi-account and address a provider by name. A tenant with two Google
+ * accounts has to be able to configure each, so they now accept an optional
+ * connectionId — resolved through getConnectionById, which re-scopes by
+ * organization, so a foreign id is a 404 and never another tenant's row.
+ * Without one they fall back to the provider's booking default, which is what
+ * the single-account case always meant.
+ */
+async function resolveProviderConnection(db, organizationId, provider, connectionId) {
+  if (connectionId) {
+    const row = await getConnectionById(db, organizationId, connectionId);
+    if (!row || row.provider !== provider) return null;
+    return row;
+  }
+  return getConnection(db, organizationId, provider);
+}
+
+function connectionNotFound() {
+  return {
+    error: {
+      code: "connection_not_found",
+      message: "That calendar connection does not belong to this business.",
+    },
+  };
+}
+
+/**
+ * CalendarConnectionSummary: the small camelCase shape the per-connection
+ * routes answer with. An explicit whitelist, never a spread — the row it is
+ * built from carries the token ciphertext, and a spread would publish it the
+ * first time someone passed a full row in by mistake.
+ */
+function connectionSummary(row) {
+  return {
+    id: row.id,
+    provider: row.provider,
+    // Never blank, so a connection card always has a name to show.
+    label: row.label || row.provider_user_email || row.provider,
+    email: row.provider_user_email || null,
+    status: row.status,
+    isBookingDefault: Boolean(row.is_booking_default),
+  };
+}
+
+/**
+ * Revoke a connection's grant at the provider, tear down its sync hooks, and
+ * delete the row. Shared by the per-connection and per-provider disconnect
+ * routes so both behave identically: the row survives a failed revocation,
+ * so the tenant can retry rather than being left with a live grant that
+ * Agently no longer tracks.
+ */
+async function revokeAndDelete(db, organizationId, row, config) {
+  let tokenToRevoke = null;
+  try {
+    if (row.refresh_token_encrypted) {
+      tokenToRevoke = decryptSecret(row.refresh_token_encrypted, {
+        organizationId: row.organization_id,
+        provider: row.provider,
+        connectionId: row.id,
+      });
+    }
+  } catch (_) {
+    tokenToRevoke = null;
+  }
+  if (tokenToRevoke) {
+    const revoked = await revokeProviderToken(row.provider, config, tokenToRevoke);
+    if (!revoked) {
+      return {
+        status: 502,
+        error: {
+          code: "revoke_failed",
+          message: `Could not revoke the ${row.provider} grant. The connection was kept so you can retry.`,
+        },
+      };
+    }
+  }
+
+  // Best-effort: stop the webhook / push channel. Runs before the delete
+  // because teardown may need to refresh the access token.
+  await teardownConnectionSync(db, organizationId, row.provider, row);
+
+  const { error } = await db
+    .from("calendar_integrations")
+    .delete()
+    .eq("organization_id", organizationId)
+    .eq("id", row.id);
+  if (error) throw error;
+  return { ok: true };
+}
 
 // ---------------------------------------------------------------------------
 // OAuth start / callback
@@ -628,9 +930,24 @@ router.get(
   requireAuth,
   asyncHandler(async (req, res) => {
     const { provider } = req.params;
-    const { getValidAccessToken } = require("../../lib/calendar-tokens");
+    const {
+      getValidAccessToken,
+      getValidAccessTokenForConnection,
+    } = require("../../lib/calendar-tokens");
     const db = getSupabase();
-    const { accessToken, connection } = await getValidAccessToken(req.orgId, provider, db);
+    // ?connectionId= picks ONE of several accounts of this provider; without
+    // it the provider's booking default is used, as before.
+    let accessToken;
+    let connection;
+    if (req.query.connectionId) {
+      const row = await getConnectionById(db, req.orgId, req.query.connectionId);
+      if (!row || row.provider !== provider) {
+        return res.status(404).json(connectionNotFound());
+      }
+      ({ accessToken, connection } = await getValidAccessTokenForConnection(row, db));
+    } else {
+      ({ accessToken, connection } = await getValidAccessToken(req.orgId, provider, db));
+    }
 
     if (provider === "google") {
       const response = await fetch("https://www.googleapis.com/calendar/v3/users/me/calendarList", {
@@ -700,7 +1017,7 @@ router.put(
   asyncHandler(async (req, res) => {
     const { provider } = req.params;
     const db = getSupabase();
-    const row = await getConnection(db, req.orgId, provider);
+    const row = await resolveProviderConnection(db, req.orgId, provider, req.body && req.body.connectionId);
     if (!row) {
       return res.status(404).json({
         error: { code: "not_connected", message: `No ${provider} calendar connected.` },
@@ -726,9 +1043,10 @@ router.put(
     const { data, error } = await db
       .from("calendar_integrations")
       .update(updates)
+      .eq("organization_id", req.orgId)
       .eq("id", row.id)
       .select(
-        "id, provider, status, provider_user_email, calendar_id, event_type_uri, event_type_name, updated_at",
+        "id, provider, label, status, provider_user_email, calendar_id, event_type_uri, event_type_name, updated_at",
       )
       .single();
     if (error) throw error;
@@ -814,7 +1132,7 @@ router.put(
       });
     }
     const db = getSupabase();
-    const row = await getConnection(db, req.orgId, provider);
+    const row = await resolveProviderConnection(db, req.orgId, provider, req.body && req.body.connectionId);
     if (!row) {
       return res.status(404).json({
         error: { code: "not_connected", message: `No ${provider} calendar connected.` },
@@ -828,8 +1146,9 @@ router.put(
     const { data, error: updateError } = await db
       .from("calendar_integrations")
       .update({ booking_settings: merged, updated_at: new Date().toISOString() })
+      .eq("organization_id", req.orgId)
       .eq("id", row.id)
-      .select("id, provider, booking_settings, updated_at")
+      .select("id, provider, label, booking_settings, updated_at")
       .single();
     if (updateError) throw updateError;
     invalidateAvailabilityCache(req.orgId);
@@ -854,41 +1173,30 @@ router.post(
       return res.json({ disconnected: false, message: "Nothing was connected." });
     }
 
-    // Revoke at the provider first; keep the row if revocation fails so the
-    // tenant can retry instead of orphaning a live grant.
-    const { decryptSecret: decrypt } = require("../../lib/crypto");
-    let tokenToRevoke = null;
-    try {
-      if (row.refresh_token_encrypted) {
-        tokenToRevoke = decrypt(row.refresh_token_encrypted, {
-          organizationId: row.organization_id,
-          provider: row.provider,
-          connectionId: row.id,
-        });
-      }
-    } catch (_) {
-      tokenToRevoke = null;
-    }
-    if (tokenToRevoke) {
-      const revoked = await revokeProviderToken(provider, config, tokenToRevoke);
-      if (!revoked) {
-        return res.status(502).json({
-          error: {
-            code: "revoke_failed",
-            message: `Could not revoke the ${provider} grant. The connection was kept so you can retry.`,
-          },
-        });
-      }
-    }
+    /*
+     * Revoke at the provider, tear down the sync hooks, delete the row —
+     * shared with the per-connection route so the two cannot drift. The row
+     * survives a failed revocation so the tenant can retry instead of
+     * orphaning a live grant.
+     *
+     * This route removes ONE row: the booking default for the provider, or
+     * its oldest healthy connection. A tenant with several accounts of the
+     * same provider should use
+     * POST /connections/:connectionId/disconnect, which names the account.
+     */
+    const outcome = await revokeAndDelete(db, req.orgId, row, config);
+    if (outcome.error) return res.status(outcome.status).json({ error: outcome.error });
 
-    // Best-effort: remove the webhook subscription / push channel so the
-    // providers stop notifying us. Runs before the row is deleted because
-    // teardown may refresh the access token. Failures only log.
-    await teardownConnectionSync(db, req.orgId, provider, row);
-
-    const { error } = await db.from("calendar_integrations").delete().eq("id", row.id);
-    if (error) throw error;
-    res.json({ disconnected: true, provider });
+    // Point 7: if that was the booking default, promote another connection so
+    // the agent still has somewhere to book.
+    const promoted = await promoteBookingDefault(db, req.orgId);
+    invalidateAvailabilityCache(req.orgId);
+    res.json({
+      disconnected: true,
+      provider,
+      connectionId: row.id,
+      promotedConnectionId: promoted && promoted.id !== row.id ? promoted.id : null,
+    });
   }),
 );
 

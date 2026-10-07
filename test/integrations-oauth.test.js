@@ -118,7 +118,17 @@ test("google authorize url requests offline access and minimal scopes", () => {
   const url = new URL(buildAuthorizeUrl("google", config, "STATE", "CHALLENGE"));
   assert.equal(url.hostname, "accounts.google.com");
   assert.equal(url.searchParams.get("access_type"), "offline");
-  assert.equal(url.searchParams.get("prompt"), "consent");
+  /*
+   * "select_account consent", not "consent".
+   *
+   * A tenant running several businesses adds a SECOND Google account from the
+   * same browser. With "consent" alone Google reuses whichever account is
+   * already signed in and returns the same provider_user_id, so the add is
+   * indistinguishable from a reconnect and the second business can never be
+   * connected. The account chooser is the only place that choice exists;
+   * "consent" stays so offline access is still granted every time.
+   */
+  assert.equal(url.searchParams.get("prompt"), "select_account consent");
   assert.equal(url.searchParams.get("response_type"), "code");
   assert.equal(url.searchParams.get("state"), "STATE");
   assert.equal(url.searchParams.get("code_challenge"), "CHALLENGE");
