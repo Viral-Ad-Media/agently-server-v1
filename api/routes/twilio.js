@@ -1325,6 +1325,49 @@ function dbRunStatusFromOutcome(outcome, callStatus) {
   return "initiated";
 }
 
+router.post(
+  "/transfer-status",
+  asyncHandler(async (req, res) => {
+    const callSid = String(req.body?.CallSid || "").trim();
+    const dialStatus = String(req.body?.DialCallStatus || "").trim().toLowerCase();
+    const bridged =
+      String(req.body?.DialBridged || "").toLowerCase() === "true" ||
+      dialStatus === "completed";
+    if (callSid) {
+      const db = getSupabase();
+      const { data: record } = await db
+        .from("call_records")
+        .select("metadata")
+        .eq("twilio_call_sid", callSid)
+        .maybeSingle();
+      if (record?.metadata?.human_transfer?.redirected === true) {
+        await updateCallRecordMetadataBySid(
+          callSid,
+          {
+            human_transfer: {
+              ...record.metadata.human_transfer,
+              dial_status: dialStatus,
+              bridged,
+              dial_call_sid: String(req.body?.DialCallSid || "").trim(),
+              dial_duration_seconds: Number(req.body?.DialCallDuration || 0) || 0,
+              completed_at: new Date().toISOString(),
+            },
+          },
+          bridged
+            ? { call_category: "transferred", disposition: "transfer_completed", outcome: "Escalated" }
+            : { disposition: `transfer_${dialStatus || "failed"}` },
+        );
+      }
+    }
+    res.setHeader("Content-Type", "text/xml");
+    res.send(
+      bridged
+        ? '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+        : '<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, the team is unavailable right now. Please call back later.</Say><Hangup/></Response>',
+    );
+  }),
+);
+
 // ─────────────────────────────────────────────────────────────
 // ── PUBLIC: Async AMD Status Callback ────────────────────────
 // Twilio sends AnsweredBy here when AsyncAmd=true. Keep this separate from
