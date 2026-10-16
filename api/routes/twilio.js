@@ -74,6 +74,7 @@ const {
 const { mapTwilioError } = require("../../lib/twilio-errors");
 const { checkOpenAIRealtimeProvider } = require("../../lib/ai-provider-health");
 const voiceBehavior = require("../../lib/voice-behavior");
+const transferFlow = require("../../lib/transfer-flow");
 const { loadVoiceContext } = require("../../lib/context-builder");
 const {
   ensureTenantTwilioAccount,
@@ -410,6 +411,7 @@ function mediaStreamUrl(params) {
       "openAiVoice",
       "selectedVoiceId",
       "selectedVoiceName",
+      "transferResume",
     ]);
     Object.entries(params || {}).forEach(([key, value]) => {
       if (!criticalKeys.has(key)) return;
@@ -447,6 +449,7 @@ function buildRealtimeTwiml({
   precomputedOpeningGreeting = "",
   precomputedNormalizedPurpose = "",
   accountSid = "",
+  transferResume = "",
 }) {
   const normalizedPurpose =
     precomputedNormalizedPurpose ||
@@ -605,6 +608,8 @@ function buildRealtimeTwiml({
     maxCallSeconds: maxCallSeconds || "",
     platformTestMode: platformTestMode ? "true" : "",
     platformTestEventId: platformTestEventId || "",
+    // "failed" when /transfer-status reconnects a caller after an unanswered transfer.
+    transferResume: transferResume || "",
   };
   console.log("[twilio-stream] voice params", {
     callSid: streamParams.callSid || "",
@@ -1328,13 +1333,17 @@ function dbRunStatusFromOutcome(outcome, callStatus) {
 router.post(
   "/transfer-status",
   asyncHandler(async (req, res) => {
-    const callSid = String(req.body?.CallSid || "").trim();
-    const dialStatus = String(req.body?.DialCallStatus || "").trim().toLowerCase();
-    const bridged =
-      String(req.body?.DialBridged || "").toLowerCase() === "true" ||
-      dialStatus === "completed";
+    const body = req.body || {};
+    const query = req.query || {};
+    const callSid = String(body.CallSid || "").trim();
+    const dialStatus = String(body.DialCallStatus || "").trim().toLowerCase();
+    const bridged = transferFlow.isBridged(body);
+    const attempt = transferFlow.clampAttempts(query.attempt, 1);
+    const maxAttempts = transferFlow.clampAttempts(query.max);
+    const step = transferFlow.nextTransferStep({ bridged, attempt, maxAttempts });
+    const db = getSupabase();
+
     if (callSid) {
-      const db = getSupabase();
       const { data: record } = await db
         .from("call_records")
         .select("metadata")
@@ -1346,25 +1355,75 @@ router.post(
           {
             human_transfer: {
               ...record.metadata.human_transfer,
+              attempts: attempt,
+              max_attempts: maxAttempts,
               dial_status: dialStatus,
               bridged,
-              dial_call_sid: String(req.body?.DialCallSid || "").trim(),
-              dial_duration_seconds: Number(req.body?.DialCallDuration || 0) || 0,
-              completed_at: new Date().toISOString(),
+              dial_call_sid: String(body.DialCallSid || "").trim(),
+              dial_duration_seconds: Number(body.DialCallDuration || 0) || 0,
+              outcome: step === "hangup" ? "connected" : step === "retry" ? "retrying" : "returned_to_agent",
+              completed_at: step === "retry" ? null : new Date().toISOString(),
             },
           },
           bridged
             ? { call_category: "transferred", disposition: "transfer_completed", outcome: "Escalated" }
-            : { disposition: `transfer_${dialStatus || "failed"}` },
+            : step === "resume"
+              ? { disposition: `transfer_${dialStatus || "failed"}` }
+              : {},
         );
       }
     }
+
     res.setHeader("Content-Type", "text/xml");
-    res.send(
-      bridged
-        ? '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
-        : '<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, the team is unavailable right now. Please call back later.</Say><Hangup/></Response>',
-    );
+    if (step === "hangup") return res.send(transferFlow.HANGUP_TWIML);
+
+    const agentId = String(query.agentId || "").trim();
+    const orgId = String(query.orgId || "").trim();
+    let agent = null;
+    if (agentId) {
+      let lookup = db.from("voice_agents").select("*").eq("id", agentId);
+      if (orgId) lookup = lookup.eq("organization_id", orgId);
+      const { data } = await lookup.maybeSingle();
+      agent = data || null;
+    }
+
+    if (step === "retry") {
+      const number = transferFlow.transferNumberForAgent(agent);
+      if (number) {
+        const actionUrl = transferFlow.nextAttemptActionUrl(API_URL(), query, attempt + 1);
+        console.log("[call-transfer] retrying", { callSid, attempt: attempt + 1, maxAttempts, dialStatus });
+        return res.send(transferFlow.buildRetryTwiml(number, actionUrl));
+      }
+    }
+
+    // Every attempt went unanswered: hand the caller back to the agent, which
+    // apologises and offers to take a message or arrange a callback.
+    if (agent) {
+      const { data: organization } = await db
+        .from("organizations")
+        .select("*")
+        .eq("id", agent.organization_id)
+        .maybeSingle();
+      const recipientName = String(query.recipientName || "").trim();
+      console.log("[call-transfer] returning caller to agent", { callSid, attempt, maxAttempts, dialStatus });
+      return res.send(
+        buildRealtimeTwiml({
+          agent,
+          organization: organization || null,
+          callRecordId: String(query.callRecordId || "").trim(),
+          callSid,
+          direction: String(query.direction || "inbound").trim() || "inbound",
+          callerPhone: String(query.callerPhone || "").trim(),
+          recipientPhone: String(query.recipientPhone || "").trim(),
+          recipientName,
+          targetName: recipientName,
+          callPurpose: String(query.callPurpose || "").trim(),
+          accountSid: String(query.accountSid || "").trim(),
+          transferResume: "failed",
+        }),
+      );
+    }
+    return res.send(transferFlow.UNAVAILABLE_TWIML);
   }),
 );
 

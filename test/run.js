@@ -27,3 +27,5 @@ require("./calendar-sync.test");
 require("./calendar-groups.test");
 require("./calendar-multi-account.test");
 require("./calendar-projection.test");
+require("./transfer-flow.test");
+require("./transfer-status-route.test");
