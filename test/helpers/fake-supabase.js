@@ -197,6 +197,7 @@ function makeFakeSupabase(seed = {}) {
         if (op === "gte") return String(actual) >= String(value);
         if (op === "in") return value.includes(actual);
         if (op === "isNotNull") return actual !== null && actual !== undefined;
+        if (op === "isNull") return actual === null || actual === undefined;
         return true;
       });
     }
@@ -302,6 +303,10 @@ function makeFakeSupabase(seed = {}) {
       },
       in(column, values) {
         filters.push(["in", column, values]);
+        return api;
+      },
+      is(column, value) {
+        if (value === null) filters.push(["isNull", column, null]);
         return api;
       },
       not(column, operator, value) {

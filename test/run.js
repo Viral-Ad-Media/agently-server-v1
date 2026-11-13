@@ -29,3 +29,4 @@ require("./calendar-multi-account.test");
 require("./calendar-projection.test");
 require("./transfer-flow.test");
 require("./transfer-status-route.test");
+require("./chat-media.test");

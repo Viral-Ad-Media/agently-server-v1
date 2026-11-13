@@ -880,6 +880,58 @@ router.delete(
   }),
 );
 
+// ── GET /api/leads/:id/media ───────────────────────────────────
+// Photos and video clips the customer sent through the chat widget, with
+// short-lived signed URLs and the assistant's notes. Private bucket; the URL
+// expires after an hour so a copied link does not stay valid.
+router.get(
+  "/:id/media",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { listLeadMedia } = require("../../lib/chat-media");
+    try {
+      const media = await listLeadMedia(getSupabase(), {
+        organizationId: req.orgId,
+        leadId: req.params.id,
+      });
+      res.json({ media });
+    } catch (e) {
+      // Before the chat_media migration runs the table does not exist; an
+      // empty list keeps the lead page working.
+      console.warn("[leads] media list failed:", e.message);
+      res.json({ media: [] });
+    }
+  }),
+);
+
+// ── DELETE /api/leads/:id/media/:mediaId ───────────────────────
+router.delete(
+  "/:id/media/:mediaId",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const { BUCKET } = require("../../lib/chat-media");
+    const db = getSupabase();
+    const { data: row } = await db
+      .from("chat_media")
+      .select("id,storage_path,poster_path")
+      .eq("id", req.params.mediaId)
+      .eq("lead_id", req.params.id)
+      .eq("organization_id", req.orgId)
+      .maybeSingle();
+    if (!row)
+      return res.status(404).json({ error: { message: "Media not found." } });
+    const paths = [row.storage_path, row.poster_path].filter(Boolean);
+    if (paths.length) {
+      const { error: rmErr } = await db.storage.from(BUCKET).remove(paths);
+      if (rmErr)
+        return res.status(500).json({ error: { message: "Could not delete the file." } });
+    }
+    await db.from("chat_media").delete().eq("id", row.id);
+    res.json({ success: true });
+  }),
+);
+
 // ── PATCH /api/leads/:id ───────────────────────────────────────
 // NOTE: Wildcard — must come AFTER all named PATCH routes
 router.patch(

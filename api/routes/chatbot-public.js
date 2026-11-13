@@ -19,6 +19,7 @@ const {
   cleanAssistantResponse,
   looksUnanswered,
 } = require("../../lib/assistant-intelligence");
+const chatMedia = require("../../lib/chat-media");
 
 const router = express.Router();
 const LANG_NAMES = {
@@ -345,7 +346,8 @@ router.post(
 router.post(
   "/capture-lead",
   asyncHandler(async (req, res) => {
-    const { chatbotId, name, phone, email, reason, tags } = req.body || {};
+    const { chatbotId, name, phone, email, reason, tags, sessionId } =
+      req.body || {};
     if (!chatbotId)
       return res
         .status(400)
@@ -355,7 +357,38 @@ router.post(
         chatbotId,
         lead: { name, phone, email, reason, tags },
       });
-      res.json({ success: true, leadId: lead.id, deduped: !!lead._deduped });
+      // Photos / clips sent earlier in this visit now belong to the lead and
+      // stop expiring. Never fails the lead capture itself.
+      let mediaLinked = 0;
+      try {
+        mediaLinked = await chatMedia.linkSessionMediaToLead(getSupabase(), {
+          chatbotId,
+          sessionId,
+          leadId: lead.id,
+        });
+        if (mediaLinked) {
+          await recordLeadActivity(getSupabase(), {
+            leadId: lead.id,
+            organizationId: lead.organization_id,
+            activityType: "chat",
+            title: `Customer sent ${mediaLinked} photo${mediaLinked === 1 ? "" : "s"}/clip${mediaLinked === 1 ? "" : "s"} in chat`,
+            channel: "chat",
+            direction: "inbound",
+            provider: "agently_chatbot",
+            chatbotId,
+            metadata: { media_linked: mediaLinked },
+          });
+        }
+      } catch (e) {
+        console.warn("[chatbot-public] media link skipped:", e.message);
+      }
+      res.json({
+        success: true,
+        leadId: lead.id,
+        deduped: !!lead._deduped,
+        mediaToken: chatMedia.signMediaToken({ leadId: lead.id, chatbotId }),
+        mediaLinked,
+      });
     } catch (e) {
       res
         .status(400)
@@ -546,6 +579,273 @@ router.post(
       model: process.env.OPENAI_REALTIME_MODEL || "gpt-realtime",
       voice,
     });
+  }),
+);
+
+/* ── Customer photos and video clips (Front Desk port) ─────────
+ * See lib/chat-media.js for the flow and the privacy rules.
+ */
+async function loadMediaChatbot(chatbotId) {
+  const { data } = await getSupabase()
+    .from("chatbots")
+    .select("*")
+    .eq("id", chatbotId)
+    .maybeSingle();
+  return data || null;
+}
+
+router.post(
+  "/media",
+  express.raw({
+    type: ["image/*", "video/*", "application/octet-stream"],
+    limit: `${Math.ceil(chatMedia.LIMITS.videoBytes / (1024 * 1024)) + 1}mb`,
+  }),
+  asyncHandler(async (req, res) => {
+    const chatbotId = String(req.query.chatbotId || "").trim();
+    if (!chatbotId)
+      return res
+        .status(400)
+        .json({ error: { message: "chatbotId is required." } });
+    if (await refusePublicRequest(req, res, chatbotId, "media")) return;
+    if (!(await enforcePublicChatbotCredit(res, chatbotId, "chatbot_message")))
+      return;
+
+    const chatbot = await loadMediaChatbot(chatbotId);
+    if (!chatbot)
+      return res.status(404).json({ error: { message: "Chat not found." } });
+    if (chatbot.media_uploads_enabled === false)
+      return res.status(403).json({
+        error: {
+          code: "MEDIA_DISABLED",
+          message: "Photos and videos aren't enabled for this chat.",
+        },
+      });
+
+    const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    const check = chatMedia.classifyUpload(raw, req.headers["content-type"]);
+    if (!check.ok)
+      return res.status(check.status).json({ error: { message: check.message } });
+
+    let stored = { buffer: raw, mime: check.mime, width: null, height: null };
+    if (check.kind === "photo") {
+      try {
+        stored = await chatMedia.normalizeImage(raw);
+      } catch (_) {
+        return res.status(415).json({
+          error: { message: "I couldn't open that photo. Please try a JPG or PNG." },
+        });
+      }
+    }
+
+    const db = getSupabase();
+    const leadId = chatMedia.verifyMediaToken(
+      req.headers["x-agently-media-token"],
+      chatbotId,
+    );
+    const sessionId = chatMedia.cleanSessionId(req.query.sessionId);
+    if (!leadId && !sessionId)
+      return res
+        .status(400)
+        .json({ error: { message: "sessionId is required." } });
+
+    const mediaId = chatMedia.newMediaId();
+    const storagePath = chatMedia.storagePathFor({
+      organizationId: chatbot.organization_id,
+      chatbotId,
+      mediaId,
+      mime: stored.mime,
+    });
+    const durationMs = Math.round(Number(req.query.durationMs));
+    try {
+      await chatMedia.uploadObject(db, storagePath, stored.buffer, stored.mime);
+      const { error } = await db.from("chat_media").insert({
+        id: mediaId,
+        organization_id: chatbot.organization_id,
+        chatbot_id: chatbotId,
+        voice_agent_id: chatbot.voice_agent_id || null,
+        lead_id: leadId,
+        session_id: sessionId,
+        kind: check.kind,
+        mime: stored.mime,
+        bytes: stored.buffer.length,
+        width: stored.width,
+        height: stored.height,
+        duration_ms:
+          check.kind === "video" && Number.isFinite(durationMs) && durationMs > 0
+            ? Math.min(durationMs, chatMedia.LIMITS.videoSeconds * 1000 + 2000)
+            : null,
+        storage_path: storagePath,
+        analysis_status: "pending",
+        expires_at: chatMedia.retentionFor(leadId),
+      });
+      if (error) throw new Error(error.message);
+    } catch (e) {
+      console.error("[chatbot-public/media] store failed:", e.message);
+      return res.status(500).json({
+        error: { message: "That upload didn't go through. Please try again." },
+      });
+    }
+    chatMedia.maybePurge(db);
+    res.json({ mediaId, kind: check.kind });
+  }),
+);
+
+router.post(
+  "/media/:id/analyze",
+  asyncHandler(async (req, res) => {
+    const { chatbotId, sessionId, frames, note, history, language, mediaToken } =
+      req.body || {};
+    const fallback =
+      "Thanks for sending that! I couldn't look at it properly just now. Could you describe what's going on, or leave your details so the team can take a look?";
+    if (!chatbotId)
+      return res
+        .status(400)
+        .json({ error: { message: "chatbotId is required." } });
+    if (await refusePublicRequest(req, res, chatbotId, "media")) return;
+    if (!(await enforcePublicChatbotCredit(res, chatbotId, "chatbot_message")))
+      return;
+
+    const db = getSupabase();
+    const { data: row } = await db
+      .from("chat_media")
+      .select("*")
+      .eq("id", req.params.id)
+      .eq("chatbot_id", chatbotId)
+      .maybeSingle();
+    // Only the visit that uploaded it (same session) or the lead's own token
+    // may spend an analysis on it.
+    const tokenLead = chatMedia.verifyMediaToken(mediaToken, chatbotId);
+    const sid = chatMedia.cleanSessionId(sessionId);
+    const owns =
+      row &&
+      ((sid && row.session_id === sid) ||
+        (tokenLead && row.lead_id === tokenLead));
+    if (!owns)
+      return res.status(404).json({ error: { message: "Upload not found." } });
+    if (row.analysis_status === "done" && row.analysis?.reply)
+      return res.json({ response: row.analysis.reply, mediaId: row.id });
+
+    const languageName = LANG_NAMES[language] || "English";
+    const visitorNote = String(note || "").slice(0, chatMedia.LIMITS.noteChars);
+    let images = [];
+    let posterPath = null;
+    try {
+      if (row.kind === "photo") {
+        images = [await chatMedia.downloadObject(db, row.storage_path)];
+      } else {
+        const decoded = (Array.isArray(frames) ? frames : [])
+          .slice(0, chatMedia.LIMITS.frames)
+          .map(chatMedia.decodeFrame)
+          .filter(Boolean);
+        for (const f of decoded)
+          images.push(
+            (await chatMedia.normalizeImage(f, chatMedia.LIMITS.frameMaxEdge)).buffer,
+          );
+        if (images.length) {
+          posterPath = chatMedia.storagePathFor({
+            organizationId: row.organization_id,
+            chatbotId,
+            mediaId: row.id,
+            mime: "image/jpeg",
+            suffix: "-poster",
+          });
+          try {
+            await chatMedia.uploadObject(db, posterPath, images[0], "image/jpeg");
+          } catch (e) {
+            console.warn("[chatbot-public/media] poster skipped:", e.message);
+            posterPath = null;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("[chatbot-public/media] could not prepare images:", e.message);
+    }
+    if (!images.length) {
+      await db
+        .from("chat_media")
+        .update({ analysis_status: "failed", visitor_note: visitorNote, updated_at: new Date().toISOString() })
+        .eq("id", row.id);
+      return res.json({ response: fallback, mediaId: row.id });
+    }
+
+    let result;
+    try {
+      result = await chatMedia.analyzeMedia({
+        chatbotId,
+        kind: row.kind,
+        images,
+        note: visitorNote,
+        history: Array.isArray(history) ? history : [],
+        languageName,
+      });
+    } catch (e) {
+      console.error("[chatbot-public/media] vision failed:", e.message);
+      await db
+        .from("chat_media")
+        .update({
+          analysis_status: "failed",
+          visitor_note: visitorNote,
+          poster_path: posterPath,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", row.id);
+      return res.status(502).json({ response: fallback, mediaId: row.id });
+    }
+
+    const { analysis, usage } = result;
+    await db
+      .from("chat_media")
+      .update({
+        analysis,
+        analysis_status: "done",
+        visitor_note: visitorNote,
+        poster_path: posterPath,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", row.id);
+
+    if (row.lead_id) {
+      try {
+        await recordLeadActivity(db, {
+          leadId: row.lead_id,
+          organizationId: row.organization_id,
+          activityType: "chat",
+          title: row.kind === "video" ? "Customer sent a video clip" : "Customer sent a photo",
+          body: analysis.summary || analysis.reply,
+          channel: "chat",
+          direction: "inbound",
+          provider: "agently_chatbot",
+          chatbotId,
+          voiceAgentId: row.voice_agent_id,
+          metadata: {
+            media_id: row.id,
+            kind: row.kind,
+            urgency: analysis.urgency,
+            needs_human: analysis.needs_human,
+          },
+        });
+      } catch (e) {
+        console.warn("[chatbot-public/media] CRM activity skipped:", e.message);
+      }
+    }
+
+    try {
+      const { logOpenAIUsage } = require("../../lib/usage-ledger");
+      await logOpenAIUsage({
+        organizationId: row.organization_id,
+        service: "chatbot_vision",
+        model: analysis.model,
+        usage,
+        chatbotId,
+        leadId: row.lead_id || null,
+        externalId: `chat_media:${row.id}`,
+        metadata: { media_id: row.id, kind: row.kind, frames: images.length },
+      });
+    } catch (e) {
+      console.warn("[chatbot-public/media] usage log skipped:", e.message);
+    }
+
+    res.json({ response: analysis.reply, mediaId: row.id });
   }),
 );
 
