@@ -819,7 +819,7 @@ router.post(
           });
         }
         const apiUrl = (process.env.API_URL || "").replace(/\/$/, "");
-        const embedScript = `<!-- Agently Chat Widget -->\n<iframe id="agently-widget-${chatbotRow.id}" src="${apiUrl}/chatbot-widget/${chatbotRow.id}" style="position:fixed;bottom:20px;right:20px;width:420px;height:700px;max-width:90vw;max-height:90vh;border:none;background:transparent;z-index:1000000;overflow:hidden;" scrolling="no" frameborder="0" allow="microphone" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"></iframe>`;
+        const embedScript = `<!-- Agently Chat Widget -->\n<iframe id="agently-widget-${chatbotRow.id}" src="${apiUrl}/chatbot-widget/${chatbotRow.id}" style="position:fixed;bottom:20px;right:20px;width:420px;height:700px;max-width:90vw;max-height:90vh;border:none;background:transparent;z-index:1000000;overflow:hidden;" scrolling="no" frameborder="0" allow="microphone *; camera *; autoplay *" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"></iframe>`;
         await db
           .from("chatbots")
           .update({ embed_script: embedScript })
