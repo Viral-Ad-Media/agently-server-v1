@@ -64,6 +64,7 @@ async function requireAuth(req, res, next) {
      * session row and simply cannot be revoked, which is what they did before.
      */
     req.sessionId = session.sessionId || null;
+    res.setHeader("Cache-Control", "no-store");
     next();
   } catch (error) {
     logAuthFailure(error);

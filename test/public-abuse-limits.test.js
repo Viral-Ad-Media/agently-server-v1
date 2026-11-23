@@ -203,3 +203,18 @@ test("a per-user ceiling is tighter than the per-org one", () => {
   assert.ok(m.POLICIES.webcall_token_user.max < m.POLICIES.webcall_token_org.max);
   assert.ok(m.POLICIES.webcall_token_org_hour.windowSecs > m.POLICIES.webcall_token_org.windowSecs);
 });
+
+test("media uploads use their own, tighter ceilings", async () => {
+  const seen = [];
+  const m = load({
+    rpc: async (_fn, params) => {
+      seen.push(params.p_bucket.split(":")[0]);
+      return { data: [{ allowed: true }], error: null };
+    },
+    ledger: [],
+  });
+  const v = await m.checkPublicRequest({ ...args, scope: "media" });
+  assert.equal(v.ok, true);
+  assert.deepEqual(seen, ["public_media_ip", "public_media_bot"]);
+  assert.ok(m.POLICIES.public_media_ip.max < m.POLICIES.public_chat_ip.max);
+});

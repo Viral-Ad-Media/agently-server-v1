@@ -54,5 +54,7 @@ test("the retry callback keeps the call identity and moves the counter on", () =
 test("retry TwiML holds the caller and dials again with an escaped callback", () => {
   const twiml = flow.buildRetryTwiml("+12542688827", "https://api.example.test/api/twilio/transfer-status?attempt=2&max=2");
   assert.match(twiml, /<Say>I'm still trying to reach someone for you\. Please hold\.<\/Say>/);
-  assert.match(twiml, /<Dial answerOnBridge="true" timeout="20" action="https:\/\/api\.example\.test\/api\/twilio\/transfer-status\?attempt=2&amp;max=2" method="POST"><Number>\+12542688827<\/Number><\/Dial>/);
+  assert.match(twiml, /<Dial answerOnBridge="true" timeout="20" action="https:\/\/api\.example\.test\/api\/twilio\/transfer-status\?attempt=2&amp;max=2" method="POST"[^>]*><Number>\+12542688827<\/Number><\/Dial>/);
+  assert.match(twiml, /record="record-from-answer-dual"/);
+  assert.match(twiml, /recordingStatusCallback="https:\/\/api\.example\.test\/api\/twilio\/recording-status"/);
 });

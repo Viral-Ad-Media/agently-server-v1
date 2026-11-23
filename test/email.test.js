@@ -137,7 +137,7 @@ function authDeliveryHarness(mail) {
   const module = { exports: {} };
   const invalidated = [];
   const dependencies = {
-    express: { Router: () => ({ get() {}, post() {} }) },
+    express: { Router: () => ({ get() {}, post() {}, delete() {} }) },
     crypto: {}, bcryptjs: {},
     "../../lib/supabase": {}, "../../lib/auth": {}, "../../lib/serializers": {},
     "../../lib/email": mail,

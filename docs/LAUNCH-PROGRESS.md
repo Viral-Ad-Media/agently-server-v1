@@ -1,6 +1,18 @@
 # Agently launch progress
 
-Last updated: 22 September 2026.
+Last updated: 20 October 2026.
+
+## Latest operational update
+
+The [Immediate containment and session security release](SECURITY-RELEASE-2026-10-20.md) is live: API deployment 51 and voice deployment 21. Database public grants, callback signatures/recording download handling, token-purpose enforcement and atomic session/password revocation are addressed. Session policy is 30 minutes idle, eight hours absolute and three concurrent sessions; super-admin is 15 minutes. The legacy /realtime endpoint is contained, and device controls remain local. Runtime/dependency upgrades and the broader reliability work remain open.
+
+The read-only [Platform security and reliability audit](PLATFORM-AUDIT-2026-10-20.md) confirms urgent database privilege, Twilio callback, token-purpose and public voice admission gaps. It also records current session limits, AWS scaling, cache behavior, dependency advisories and remaining verification work. These findings are open; the audit did not change production permissions or session policy.
+
+The October voice incident, backend fixes, production verification, recording recovery and local-only UI work are tracked in [Voice incident and local UI update](VOICE-INCIDENT-2026-10-20.md). The backend and frontend have progressed substantially beyond the September snapshot below. Do not use the old test totals or deployment statements as today's state.
+
+The original launch-readiness checklist has not been recertified by this voice/UI work. Its outstanding security, operational and pilot acceptance requirements remain separate.
+
+## September launch-readiness snapshot
 
 This is the main progress summary for the launch-readiness work. Update it at the end of each work session and whenever an issue changes status, tests run, code is pushed, or a release is verified. This is maintained during our work, not by an unattended monitoring service.
 

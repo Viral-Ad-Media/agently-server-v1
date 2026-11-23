@@ -30,7 +30,9 @@ async function withServer(fn) {
     }],
   });
   const originalGet = supabaseModule.getSupabase;
-  const prev = { API_URL: process.env.API_URL, TWILIO_WS_URL: process.env.TWILIO_WS_URL };
+  const prev = Object.fromEntries(['API_URL','TWILIO_WS_URL','TWILIO_ACCOUNT_SID','TWILIO_AUTH_TOKEN'].map(k=>[k,process.env[k]]));
+  process.env.TWILIO_ACCOUNT_SID='AC'+'1'.repeat(32);
+  process.env.TWILIO_AUTH_TOKEN='synthetic-test-secret';
   supabaseModule.getSupabase = () => db;
   process.env.API_URL = "https://api.example.test";
   process.env.TWILIO_WS_URL = "wss://calls.example.test";
@@ -47,7 +49,7 @@ async function withServer(fn) {
     });
     const r = await fetch(`http://127.0.0.1:${server.address().port}/api/twilio/transfer-status?${qs}`, {
       method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
+      headers: { "content-type": "application/x-www-form-urlencoded",'x-twilio-signature':require('../lib/twilio-request-auth').signatureFor(process.env.TWILIO_AUTH_TOKEN,`https://api.example.test/api/twilio/transfer-status?${qs}`,{CallSid:CALL_SID,...body}) },
       body: new URLSearchParams({ CallSid: CALL_SID, ...body }).toString(),
     });
     return { status: r.status, text: await r.text() };

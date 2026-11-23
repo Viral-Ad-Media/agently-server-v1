@@ -2,6 +2,9 @@
 // node:test runs these registered tests without spawning subprocesses.
 require("./email.test");
 require("./auth-rate-limit.test");
+require("./session-security.test");
+require("./twilio-request-auth.test");
+require("./twilio-route-admission.test");
 require("./email-delivery.test");
 require("./billing-sync.test");
 require("./super-admin-client-ip.test");
@@ -18,6 +21,9 @@ require("./assistant-prompt-dedup.test");
 require("./blog-dedup.test");
 require("./crypto.test");
 require("./app-url-format.test");
+require("./backend-url.test");
+require("./recording-transcript.test");
+require("./recording-callback.test");
 require("./calendar-save-connection.test");
 require("./calendar-event-id.test");
 require("./integrations-oauth.test");
@@ -27,5 +33,18 @@ require("./calendar-sync.test");
 require("./calendar-groups.test");
 require("./calendar-multi-account.test");
 require("./calendar-projection.test");
+require("./calendar-per-agent.test");
+require("./gmail-send.test");
+require("./internal-owner.test");
+require("./manual-booking-cancel.test");
+require("./owner-operator.test");
+
+require("./operator-workspace.test");
+require("./lead-qualifier.test");
+require("./voicemail-followup.test");
 require("./transfer-flow.test");
 require("./transfer-status-route.test");
+
+require("./chat-media.test");
+require("./chat-media-widget.test");
+require("./frontdesk.test");

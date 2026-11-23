@@ -72,13 +72,22 @@ function makeFakeSupabase(seed = {}) {
         return api;
       },
       eq(col, val) {
-        if (state.isUpdate) {
-          const hit = rows.filter((r) => matches(r, [...state.filters, ["eq", col, val]]));
-          for (const r of hit) Object.assign(r, state.updateObj);
-          return Promise.resolve({ data: hit, error: null });
-        }
         state.filters.push(["eq", col, val]);
         return api;
+      },
+      // Awaiting the chain runs it: an update applies to every row matching
+      // ALL of its filters (so .eq(org).eq(id) is honoured), a read returns rows.
+      then(resolve, reject) {
+        try {
+          if (state.isUpdate) {
+            const hit = rows.filter((r) => matches(r, state.filters));
+            for (const r of hit) Object.assign(r, state.updateObj);
+            return Promise.resolve({ data: hit, error: null }).then(resolve, reject);
+          }
+          return Promise.resolve({ data: api._run(), error: null }).then(resolve, reject);
+        } catch (error) {
+          return Promise.reject(error).then(resolve, reject);
+        }
       },
       lt(col, val) {
         state.filters.push(["lt", col, val]);

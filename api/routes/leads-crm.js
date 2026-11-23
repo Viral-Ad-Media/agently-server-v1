@@ -432,6 +432,9 @@ router.get(
 
     let query = applyOrg(db.from("leads").select("*", { count: "exact" }), req);
 
+    if (req.query.voice_agent_id) query = query.eq("voice_agent_id", req.query.voice_agent_id);
+    if (req.query.active_only === "true") query = query.in("crm_stage", ["new", "contacted", "qualified", "appointment_set", "proposal_sent"]);
+
     if (req.query.stage && req.query.stage !== "all") {
       query = query.eq("crm_stage", req.query.stage);
     }
@@ -578,6 +581,16 @@ router.patch(
     res.json({ leads: leads || [], count: (leads || []).length });
   }),
 );
+
+router.get("/:leadId/qualification", asyncHandler(async (req, res) => {
+  const db = getSupabase();
+  const lead = await getLeadForOrg(db, req, req.params.leadId);
+  const result = await db.from("lead_activities").select("id,body,metadata,occurred_at")
+    .eq("organization_id", req.orgId).eq("lead_id", lead.id).eq("activity_type", "ai_qualification")
+    .order("occurred_at", {ascending:false}).limit(1);
+  if (result.error) throw result.error;
+  res.json({lead, assessment:result.data?.[0] || null});
+}));
 
 router.get(
   "/:leadId",

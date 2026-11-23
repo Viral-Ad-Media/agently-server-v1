@@ -203,6 +203,7 @@ router.post(
       claims.purpose !== "webcall" ||
       !claims.orgId ||
       !claims.agentId
+      || !(await require('../../lib/session-admission').validateBoundSession(claims))
     ) {
       return res.status(401).json({
         valid: false,
@@ -217,6 +218,11 @@ router.post(
         orgId: claims.orgId,
         agentId: claims.agentId,
         userId: claims.userId || null,
+        sid: claims.sid,
+        sev: claims.sev,
+        // Tokens minted before owner/operator calls existed remain
+        // caller-facing. Owner access is granted only by an explicit claim.
+        mode: claims.mode === "owner" ? "owner" : "caller",
         iat: claims.iat || null,
         exp: claims.exp || null,
       },
@@ -243,6 +249,17 @@ router.post(
     }
 
     const agentId = String(req.body?.agentId || "").trim();
+    const mode = String(req.body?.mode || "caller").trim().toLowerCase();
+    if (!["caller", "owner"].includes(mode)) {
+      return res.status(400).json({
+        error: { code: "WEBCALL_MODE_INVALID", message: "mode must be caller or owner." },
+      });
+    }
+    if (mode === "owner" && !["Owner", "Admin"].includes(req.user?.role)) {
+      return res.status(403).json({
+        error: { code: "OWNER_MODE_REQUIRED", message: "Owner or admin access is required." },
+      });
+    }
     if (!agentId) {
       return res.status(400).json({
         error: { code: "AGENT_ID_REQUIRED", message: "agentId is required." },
@@ -290,6 +307,9 @@ router.post(
         orgId: req.orgId,
         agentId: agent.id,
         userId: req.user?.id || null,
+        sid: req.sessionId,
+        sev: Number(req.user?.session_epoch || 0),
+        mode,
       },
       `${WEBCALL_TOKEN_TTL_SECONDS}s`,
     );

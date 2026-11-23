@@ -91,6 +91,34 @@ router.post(
   }),
 );
 
+/* ── Auto top-up with a monthly cap (the card-on-file plan) ──────────────── */
+router.get(
+  "/auto-topup",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const { getAutoTopUpStatus } = require("../../lib/auto-topup");
+    res.json({ success: true, autoTopUp: await getAutoTopUpStatus(req.orgId) });
+  }),
+);
+
+router.put(
+  "/auto-topup",
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (req, res) => {
+    const { updateAutoTopUpSettings } = require("../../lib/auto-topup");
+    const body = req.body || {};
+    const autoTopUp = await updateAutoTopUpSettings(req.orgId, {
+      enabled: body.enabled,
+      thresholdUsd: body.thresholdUsd,
+      amountUsd: body.amountUsd,
+      monthlyCapUsd: body.monthlyCapUsd,
+    });
+    res.json({ success: true, autoTopUp });
+  }),
+);
+
 router.post(
   "/checkout-session",
   requireAuth,

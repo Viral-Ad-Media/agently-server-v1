@@ -153,7 +153,8 @@ function checkCalendarIntegrations(rows) {
   return null;
 }
 
-const CONSTRAINED_TABLES = { calendar_integrations: checkCalendarIntegrations };
+function uniqueColumns(keys) { return rows => {const seen=new Set();for(const r of rows){const key=JSON.stringify(keys.map(k=>r[k]));if(seen.has(key))return uniqueViolation("test_unique");seen.add(key);}return null;}; }
+const CONSTRAINED_TABLES = { calendar_integrations: checkCalendarIntegrations, operator_send_receipts:uniqueColumns(["id"]),agent_automation_runs:uniqueColumns(["automation_id","event_key"]) };
 
 function makeFakeSupabase(seed = {}) {
   const tables = {
@@ -197,6 +198,7 @@ function makeFakeSupabase(seed = {}) {
         if (op === "gte") return String(actual) >= String(value);
         if (op === "in") return value.includes(actual);
         if (op === "isNotNull") return actual !== null && actual !== undefined;
+        if (op === "isNull") return actual === null || actual === undefined;
         return true;
       });
     }
@@ -304,6 +306,10 @@ function makeFakeSupabase(seed = {}) {
         filters.push(["in", column, values]);
         return api;
       },
+      is(column, value) {
+        if (value === null) filters.push(["isNull", column, null]);
+        return api;
+      },
       not(column, operator, value) {
         if (operator === "is" && value === null) filters.push(["isNotNull", column, null]);
         return api;
@@ -321,6 +327,18 @@ function makeFakeSupabase(seed = {}) {
       },
       update(payload) {
         pending = { kind: "update", payload };
+        return api;
+      },
+      // Single-row upsert on one conflict column, which is all the callers use.
+      upsert(payload, { onConflict } = {}) {
+        const key = onConflict || "id";
+        const existing = rows.find((row) => row[key] === payload[key]);
+        if (existing) {
+          filters.push(["eq", key, payload[key]]);
+          pending = { kind: "update", payload };
+        } else {
+          pending = { kind: "insert", payload };
+        }
         return api;
       },
       delete() {

@@ -889,6 +889,12 @@ router.get(
         duration: serialized.duration,
         summary: call.summary || "",
         transcript: normalizeTranscript(call.transcript),
+        recordings: Object.values(call.metadata?.recordings || {}).map((entry) => ({
+          sid: entry.recording_sid, phase: entry.phase || "agent",
+          status: entry.recording_status, duration: entry.recording_duration,
+          transcriptionStatus: entry.transcription_status,
+          transcript: normalizeTranscript(entry.transcript || []),
+        })),
         recording_available: Boolean(call.recording_available),
         recording_status: call.recording_status || null,
         recording_sid: call.recording_sid || null,
@@ -935,6 +941,15 @@ router.get(
     const expiresIn = Number(
       process.env.RECORDING_SIGNED_URL_TTL_SECONDS || 300,
     );
+    const selectedSid = String(req.query.recordingSid || "");
+    if (selectedSid) {
+      const entry = call.metadata?.recordings?.[selectedSid];
+      if (!entry) return res.status(404).json({ error: { message: "Recording not found for this call." } });
+      call.recording_storage_path = entry.storage_path || null;
+      call.recording_url = entry.recording_url || null;
+      call.recording_public_url = null;
+      call.recording_status = entry.recording_status || null;
+    }
 
     if (call.recording_storage_path) {
       const { data, error: signedError } = await db.storage

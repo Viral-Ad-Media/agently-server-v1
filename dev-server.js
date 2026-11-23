@@ -24,6 +24,8 @@ async function start() {
     app.attachWebSocket(server);
   }
 
+  if (process.env.AGENT_AUTOMATIONS_ENABLED === "true") require("./lib/agent-automations").startScheduler(require("./lib/supabase").getSupabase());
+
   server.listen(PORT, () => {
     console.log(`\n✅ Agently backend running on http://localhost:${PORT}`);
     console.log(`📡 Health:      http://localhost:${PORT}/health`);

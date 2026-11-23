@@ -225,6 +225,7 @@ async function establishSession(req, user) {
   const { sessionId, absoluteExpiresAt } = await createSession({
     userId: user.id,
     organizationId: user.organization_id,
+    expectedEpoch: Number(user.session_epoch || 0),
     client: String(req.body?.client || req.headers["x-agently-client"] || "web"),
     requestIp: rateLimit.clientIp(req),
     userAgent: rateLimit.userAgent(req),
@@ -1090,12 +1091,14 @@ router.post(
     const db = getSupabase();
     const tokenHash = hashResetToken(token.trim());
 
-    const { data: record } = await db
+    const { data: record, error: resetLookupError } = await db
       .from("password_reset_tokens")
       .select("id, user_id, email, expires_at, used")
       .eq("token_hash", tokenHash)
       .eq("used", false)
       .maybeSingle();
+
+    if(resetLookupError) throw Object.assign(new Error('Password recovery is temporarily unavailable. Please retry.'),{status:503,code:'AUTH_DEPENDENCY_UNAVAILABLE'});
 
     if (!record) {
       return res.status(400).json({
@@ -1140,18 +1143,13 @@ router.post(
     const passwordHash = await bcrypt.hash(password, 12);
     const now = new Date().toISOString();
 
-    const { error: updateErr } = await db
-      .from("users")
-      .update({
-        password_hash: passwordHash,
-        password_changed_at: now,
-        updated_at: now,
-      })
-      .eq("id", user.id);
+    const { error: updateErr } = await db.rpc('auth_replace_password',{
+      p_user_id:user.id,p_password_hash:passwordHash,p_reset_id:record.id,p_reset_hash:tokenHash,
+    });
 
     if (updateErr) {
       console.error("[password-reset] password update failed:", updateErr);
-      return res.status(500).json({
+      return res.status(503).json({
         error: {
           code: "PASSWORD_RESET_FAILED",
           message: "Unable to update password. Please try again.",
@@ -1159,11 +1157,7 @@ router.post(
       });
     }
 
-    await db
-      .from("password_reset_tokens")
-      .update({ used: true, used_at: now })
-      .eq("user_id", user.id)
-      .eq("used", false);
+    // The password, reset-token consumption and session revocation committed together.
 
     /*
      * The whole point of a reset.
@@ -1173,7 +1167,6 @@ router.post(
      * would keep access for up to thirty days. Every session dies, and any OTP
      * challenge already in flight dies with it via the epoch bump.
      */
-    await revokeAllSessionsForUser(user.id, "password_reset");
     await invalidateCodes(user.email, PURPOSE_LOGIN_OTP);
 
     return res.json({
@@ -1241,19 +1234,13 @@ router.post(
 
     const passwordHash = await bcrypt.hash(newPassword, 12);
     const now = new Date().toISOString();
-    const { error: updateErr } = await db
-      .from("users")
-      .update({
-        password_hash: passwordHash,
-        password_changed_at: now,
-        updated_at: now,
-      })
-      .eq("id", user.id)
-      .eq("organization_id", req.orgId);
+    const { error: updateErr } = await db.rpc('auth_replace_password',{
+      p_user_id:user.id,p_password_hash:passwordHash,p_expected_hash:user.password_hash,
+    });
 
     if (updateErr) {
       console.error("[change-password] update failed:", updateErr);
-      return res.status(500).json({
+      return res.status(503).json({
         error: {
           code: "PASSWORD_CHANGE_FAILED",
           message: "Unable to update password. Please try again.",
@@ -1268,14 +1255,15 @@ router.post(
      * re-issuing, changing your password in Settings would sign you out of the
      * tab you were standing in. The client swaps the token in and carries on.
      */
-    await revokeAllSessionsForUser(user.id, "password_changed");
     clearSessionCache(req.authToken);
 
-    const { data: refreshed } = await db
+    const { data: refreshed, error: refreshError } = await db
       .from("users")
       .select(USER_COLUMNS)
       .eq("id", user.id)
       .single();
+
+    if(refreshError||!refreshed) throw Object.assign(new Error('Password updated and previous sessions closed. Please sign in again.'),{status:503,code:'PASSWORD_CHANGED_REAUTH_REQUIRED'});
 
     const session = await establishSession(req, refreshed);
 
@@ -1297,7 +1285,7 @@ router.post(
   "/logout",
   requireAuth,
   asyncHandler(async (req, res) => {
-    if (req.sessionId) await revokeSession(req.sessionId, "logout");
+    await revokeSession(req.sessionId, "logout", req.user.id);
     clearSessionCache(req.authToken);
     return res.json({ success: true, sessionRevoked: Boolean(req.sessionId) });
   }),
@@ -1316,6 +1304,19 @@ router.post(
     return res.json({ success: true, allSessionsRevoked: true });
   }),
 );
+
+// Only the signed-in user's devices are visible or revocable here.
+router.get("/sessions", requireAuth, asyncHandler(async (req,res) => {
+  const {listSessionsForUser,SESSION_POLICY}=require("../../lib/auth-sessions");
+  const rows=await listSessionsForUser(req.user.id);
+  res.json({sessions:rows.map(row=>({...row,current:row.id===req.sessionId})),policy:SESSION_POLICY});
+}));
+router.delete("/sessions/:sessionId", requireAuth, asyncHandler(async (req,res) => {
+  if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(req.params.sessionId)) return res.status(400).json({error:{message:"Invalid session."}});
+  await revokeSession(req.params.sessionId,"device_signed_out",req.user.id);
+  clearSessionCache(req.authToken);
+  res.json({success:true,currentSessionRevoked:req.params.sessionId===req.sessionId});
+}));
 
 
 // ─────────────────────────────────────────────────────────────

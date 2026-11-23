@@ -241,6 +241,10 @@ router.patch(
       updates.chat_languages = body.chatLanguages;
     if (body.collectLeads !== undefined)
       updates.collect_leads = !!body.collectLeads;
+    // Needs migrations/20261113_chat_media.sql; the dashboard only sends it
+    // when the owner actually flips the switch.
+    if (body.mediaUploadsEnabled !== undefined)
+      updates.media_uploads_enabled = !!body.mediaUploadsEnabled;
     updates.updated_at = new Date().toISOString();
 
     // Always recompute embed script (position may have changed)

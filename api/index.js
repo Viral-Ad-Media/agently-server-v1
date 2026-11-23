@@ -285,8 +285,11 @@ app.post(
 // its own raw parser ahead of the global JSON one. Both authenticate
 // cryptographically (Calendly signature / Google channel token) rather than by
 // session; Google's push notifications are bodyless and only headers are read.
+// Two paths: /:orgId/:connectionId is what new subscriptions register, so an
+// event is attributed to the Calendly account it came from; /:orgId alone
+// stays for subscriptions Calendly already holds from before that change.
 app.post(
-  "/api/integrations/calendly/webhook/:orgId",
+  ["/api/integrations/calendly/webhook/:orgId/:connectionId", "/api/integrations/calendly/webhook/:orgId"],
   express.raw({ type: "application/json", limit: "256kb" }),
   (req, res, next) => {
     Promise.resolve()
@@ -474,6 +477,7 @@ safeMount(
 );
 safeMount("/api/calls", () => require("./routes/calls"), "calls");
 safeMount("/api/leads", () => require("./routes/leads"), "leads");
+safeMount("/api/leads-crm", () => require("./routes/leads-crm"), "leads-crm");
 safeMount("/api/outreach", () => require("./routes/outreach"), "outreach");
 safeMount(
   "/api/call-schedules",
@@ -485,6 +489,14 @@ safeMount(
   () => require("./routes/chatbot-public"),
   "chatbot-public",
 );
+// Front Desk: public quote/booking/conversation endpoints share the
+// chatbot-public prefix (no path overlaps); the owner API needs a session.
+safeMount(
+  "/api/chatbot-public",
+  () => require("./routes/frontdesk-public"),
+  "frontdesk-public",
+);
+safeMount("/api/frontdesk", () => require("./routes/frontdesk"), "frontdesk");
 safeMount("/api/twilio", () => require("./routes/twilio"), "twilio");
 safeMount(
   "/api/test-agent",
@@ -551,6 +563,21 @@ safeMount(
   () => require("./routes/internal-calendar"),
   "internal-calendar",
 );
+safeMount(
+  "/api/internal/owner",
+  () => require("./routes/internal-owner"),
+  "internal-owner",
+);
+safeMount(
+  "/api/email/gmail",
+  () => require("./routes/email-gmail"),
+  "email-gmail",
+);
+safeMount(
+  "/api/operator",
+  () => require("./routes/owner-operator"),
+  "owner-operator",
+);
 
 safeMount("/api", () => require("./routes/misc"), "misc");
 safeMount(
@@ -568,6 +595,15 @@ try {
   require("../lib/billing-tracker").start();
 } catch (e) {
   console.warn("[app] billing-tracker failed to start:", e && e.message);
+}
+
+// ── Auto top-up sweep (card-on-file plan) ───────────────────────
+// Off unless AUTO_TOPUP_ENABLED=true; charges saved cards when a tenant who
+// opted in drops below their threshold, never past their monthly cap.
+try {
+  require("../lib/auto-topup").start();
+} catch (e) {
+  console.warn("[app] auto-topup failed to start:", e && e.message);
 }
 
 // ── N014: watch the webhook path and say something ──────────────

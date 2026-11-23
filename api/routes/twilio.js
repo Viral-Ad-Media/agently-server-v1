@@ -75,6 +75,13 @@ const { mapTwilioError } = require("../../lib/twilio-errors");
 const { checkOpenAIRealtimeProvider } = require("../../lib/ai-provider-health");
 const voiceBehavior = require("../../lib/voice-behavior");
 const transferFlow = require("../../lib/transfer-flow");
+const {
+  readVoicemailSettings,
+  machineDetectionModeForSettings,
+  isMachineAnsweredBy,
+  buildVoicemailMessage,
+} = require("../../lib/voicemail-policy");
+const { applyVoicemailFollowup } = require("../../lib/voicemail-followup");
 const { loadVoiceContext } = require("../../lib/context-builder");
 const {
   ensureTenantTwilioAccount,
@@ -103,8 +110,11 @@ const {
 } = require("../../lib/twilio-number-readiness");
 
 const router = express.Router();
+// These endpoints are called by the provider, not authenticated browsers.
+const signedProviderPaths=new Set(['/voice-inbound','/incoming-call','/voice','/inbound','/inbound-call','/outbound-twiml','/transfer-status','/amd-status','/call-status','/recording-status','/sms-inbound','/voice-app','/import/challenge-callback']);
+router.use((req,res,next)=>signedProviderPaths.has(req.path.toLowerCase().replace(/\/+$/,''))?require('../../lib/twilio-request-auth').requireTwilio(req,res,next):next());
 
-const API_URL = () => (process.env.API_URL || "").trim().replace(/\/+$/, "");
+const API_URL = require("../../lib/backend-url").getBackendBaseUrl;
 
 /** WebSocket base URL — defaults to API_URL but can be overridden for separate WS server */
 function normalizeWebSocketBase(value) {
@@ -172,13 +182,22 @@ async function updateCallRecordMetadataBySid(
   try {
     const { data: existing } = await db
       .from("call_records")
-      .select("id, metadata")
+      .select("id, metadata, transcript")
       .eq("twilio_call_sid", callSid)
       .maybeSingle();
     if (!existing?.id) return null;
+    const nextMeta = mergeMetadata(existing.metadata, metadataPatch);
+    if (metadataPatch?.recordings) {
+      nextMeta.recordings = { ...(existing.metadata?.recordings || {}) };
+      for (const [sid, entry] of Object.entries(metadataPatch.recordings)) {
+        nextMeta.recordings[sid] = { ...(nextMeta.recordings[sid] || {}), ...entry };
+      }
+    }
+    const { _recordingTranscript, ...safeColumns } = columnsPatch;
+    if (_recordingTranscript) safeColumns.transcript = require("../../lib/recording-transcript").mergeRecordingTranscript(existing.transcript, _recordingTranscript.tx, _recordingTranscript.context);
     const patch = {
-      ...columnsPatch,
-      metadata: mergeMetadata(existing.metadata, metadataPatch),
+      ...safeColumns,
+      metadata: nextMeta,
     };
     const { data, error } = await db
       .from("call_records")
@@ -223,20 +242,27 @@ function twilioBasicAuthHeader() {
   return "Basic " + Buffer.from(`${sid}:${token}`).toString("base64");
 }
 
-async function downloadTwilioRecordingMp3(recordingUrl) {
-  if (!recordingUrl) throw new Error("Missing RecordingUrl");
-  const mediaUrl = String(recordingUrl).endsWith(".mp3")
-    ? String(recordingUrl)
-    : `${recordingUrl}.mp3`;
+async function downloadTwilioRecordingMp3({accountSid,recordingSid,callSid}) {
+  if(!/^AC[0-9a-f]{32}$/i.test(accountSid)||!/^RE[0-9a-f]{32}$/i.test(recordingSid)||!/^CA[0-9a-f]{32}$/i.test(callSid)) throw new Error('Invalid recording identity');
+  const resourceUrl=`https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Recordings/${recordingSid}`;
+  const mediaUrl=resourceUrl+'.mp3';
   const auth = twilioBasicAuthHeader();
   if (!auth)
     throw new Error("Missing Twilio credentials for recording download");
-  const res = await fetch(mediaUrl, { headers: { Authorization: auth } });
+  const options={headers:{Authorization:auth},redirect:'error',signal:AbortSignal.timeout(20000)};
+  const resource=await fetch(resourceUrl+'.json',options);
+  if(!resource.ok) throw new Error('Recording verification failed');
+  const verified=await resource.json();
+  if(verified.account_sid!==accountSid||verified.call_sid!==callSid||verified.sid!==recordingSid||verified.status!=='completed') throw new Error('Recording does not match this call');
+  const res = await fetch(mediaUrl, { ...options,signal:AbortSignal.timeout(30000) });
   if (!res.ok)
     throw new Error(`Twilio recording download failed: ${res.status}`);
-  const arrayBuffer = await res.arrayBuffer();
+  const limit=50*1024*1024;
+  if(Number(res.headers.get('content-length'))>limit) throw new Error('Recording exceeds size limit');
+  const chunks=[];let size=0;
+  for await(const chunk of res.body) {size+=chunk.length;if(size>limit) {await res.body.cancel?.().catch(()=>{});throw new Error('Recording exceeds size limit');}chunks.push(Buffer.from(chunk));}
   return {
-    buffer: Buffer.from(arrayBuffer),
+    buffer: Buffer.concat(chunks),
     mediaUrl,
     mimeType: res.headers.get("content-type") || "audio/mpeg",
   };
@@ -284,6 +310,7 @@ function transcriptToText(transcript) {
 async function transcribeRecordingWithOpenAI({
   buffer,
   filename = "call-recording.mp3",
+  source = "",
 }) {
   if (
     String(process.env.TRANSCRIBE_CALL_RECORDINGS || "false").toLowerCase() !==
@@ -304,15 +331,22 @@ async function transcribeRecordingWithOpenAI({
   );
   if (buffer.length > maxBytes)
     return { skipped: true, status: "file_too_large" };
-  const model =
-    process.env.OPENAI_TRANSCRIPTION_MODEL || "gpt-4o-mini-transcribe";
+  const humanTransfer = require("../../lib/recording-transcript").recordingPhase(source) === "human_transfer";
+  const model = humanTransfer
+    ? process.env.OPENAI_TRANSFER_TRANSCRIPTION_MODEL || "gpt-4o-transcribe-diarize"
+    : process.env.OPENAI_TRANSCRIPTION_MODEL || "gpt-4o-mini-transcribe";
   const form = new FormData();
   form.append("model", model);
+  if (model === "gpt-4o-transcribe-diarize") {
+    form.append("response_format", "diarized_json");
+    form.append("chunking_strategy", "auto");
+  }
   form.append("file", new Blob([buffer], { type: "audio/mpeg" }), filename);
   const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
     method: "POST",
     headers: { Authorization: `Bearer ${apiKey}` },
     body: form,
+    signal: AbortSignal.timeout(90000),
   });
   const text = await res.text();
   let data;
@@ -736,7 +770,7 @@ function mediaStreamUrlPreview(params = {}) {
   return mediaStreamUrl(params);
 }
 
-function preparedOpeningGreetingForCall({
+async function preparedOpeningGreetingForCall({
   agent = {},
   organization = null,
   direction = "inbound",
@@ -786,7 +820,14 @@ function preparedOpeningGreetingForCall({
    * first, pre-call intelligence second, synthesis last, and an introduction
    * guaranteed on top of whichever won.
    */
+  const precall = outbound ? await require("../../lib/precall-intelligence").buildPrecallOpening({
+    direction, agentName, businessName: organizationName,
+    recipientName: cleanRecipientName, callPurpose,
+    customPrompt: agent.custom_prompt || agent.system_prompt || agent.prompt || "",
+    tone: agent.tone || "Professional", language: agent.language || "English",
+  }) : null;
   return voiceBehavior.resolveOpeningGreeting({
+    precomputed: precall?.openingLine || "",
     agent,
     organization,
     direction,
@@ -1268,6 +1309,30 @@ async function handleOutboundTwiMl(req, res) {
     });
   }
 
+  // With synchronous AMD, Twilio requests this TwiML after detecting the end
+  // of the machine greeting. Deliver the configured message at the beep.
+  const answeredBy = String(req.body?.AnsweredBy || req.query?.AnsweredBy || "");
+  if (isMachineAnsweredBy(answeredBy)) {
+    const settings = readVoicemailSettings(agent);
+    await updateCallRecordMetadataBySid(callSid, {
+      answered_by: answeredBy,
+      voicemail_detected: true,
+      voicemail_action: settings.action,
+    });
+    const message = settings.action === "leave_message"
+      ? buildVoicemailMessage(settings, {
+          agentName: agent.name,
+          organizationName: organization?.name || organization?.business_name,
+          callPurpose,
+          callbackNumber: fromPhone,
+          recipientName,
+        })
+      : "";
+    const escaped = message.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    res.setHeader("Content-Type", "text/xml");
+    return res.send(`<?xml version="1.0" encoding="UTF-8"?><Response>${escaped ? `<Say>${escaped}</Say>` : ""}<Hangup/></Response>`);
+  }
+
   const twiml = buildRealtimeTwiml({
     agent,
     organization,
@@ -1440,7 +1505,7 @@ router.post(
     const answeredBy = String(
       body.AnsweredBy || body.answeredBy || body.Answeredby || "",
     ).trim();
-    const machineDetected = /machine|fax|unknown/i.test(answeredBy);
+    const machineDetected = /machine|fax/i.test(answeredBy);
     if (callSid) {
       console.log("[latency] async_amd_status_callback", {
         callSid,
@@ -1456,7 +1521,7 @@ router.post(
               call_category: "voicemail",
               disposition: "async_amd_machine_detected",
             }
-          : answeredBy
+          : /human/i.test(answeredBy)
             ? {
                 call_category: "answered_human",
                 disposition: "async_amd_human_detected",
@@ -1527,6 +1592,16 @@ router.post(
           error: err.message || String(err),
         });
       }
+      if (machineDetected) {
+        try {
+          await applyVoicemailFollowup(getSupabase(), callSid);
+        } catch (err) {
+          console.warn("[Twilio async-amd] voicemail follow-up skipped", {
+            callSid,
+            error: err.message || String(err),
+          });
+        }
+      }
     }
     res.status(204).send();
   }),
@@ -1553,7 +1628,7 @@ router.post(
         AnsweredBy || req.body?.AnsweredBy || "",
       ).trim();
       if (answeredBy) {
-        const voicemailDetected = /machine|fax|unknown/i.test(answeredBy);
+        const voicemailDetected = /machine|fax/i.test(answeredBy);
         console.log("[outbound-call] answeredBy=" + answeredBy, {
           callSid: CallSid,
           voicemailDetected,
@@ -1593,13 +1668,34 @@ router.post(
           AnsweredBy,
           durationSeconds,
         );
+        const { data: priorRecord } = await getSupabase()
+          .from("call_records")
+          .select("call_category,voicemail_detected,metadata")
+          .eq("twilio_call_sid", CallSid)
+          .maybeSingle();
+        const priorMetadata = priorRecord?.metadata || {};
+        const preservedCategory = priorMetadata.human_transfer?.bridged === true
+          ? "transferred"
+          : priorMetadata.voicemail_followup?.kind
+            ? priorRecord.call_category
+            : priorRecord?.voicemail_detected === true || priorMetadata.voicemail_detected === true
+              ? "voicemail"
+              : null;
+        const effectiveCategory = preservedCategory ||
+          (statusOutcome === "answered" ? "answered_human" : statusOutcome);
+        const transferDisposition = priorMetadata.human_transfer?.dial_status
+          ? `transfer_${priorMetadata.human_transfer.dial_status}`
+          : null;
         const generalColumnsPatch = {
           status: CallStatus || undefined,
-          call_category:
-            statusOutcome === "answered" ? "answered_human" : statusOutcome,
-          disposition: statusOutcome,
+          call_category: effectiveCategory,
+          disposition: transferDisposition || statusOutcome,
           answered_by: AnsweredBy || undefined,
-          voicemail_detected: statusOutcome === "voicemail" || undefined,
+          voicemail_detected:
+            statusOutcome === "voicemail" ||
+            priorRecord?.voicemail_detected === true ||
+            priorMetadata.voicemail_detected === true ||
+            undefined,
           ...(direction ? { direction } : {}),
           ...(durationSeconds > 0 ? { duration: durationSeconds } : {}),
           ...(terminalStatuses.has(normalizedStatus)
@@ -1707,7 +1803,6 @@ router.post(
             AnsweredBy,
             durationSeconds,
           );
-          let runStatus = dbRunStatusFromOutcome(outcome, CallStatus);
           const { data: existingRun } = await db
             .from("lead_outreach_runs")
             .select(
@@ -1720,7 +1815,22 @@ router.post(
             typeof existingRun.outcome_metadata === "object"
               ? existingRun.outcome_metadata
               : {};
-          const voicemailDetected = outcome === "voicemail";
+          const retryAlreadyQueued =
+            existingRun?.status === "queued" &&
+            (existingMeta.voicemailRetryPreviousCallSid === CallSid ||
+              existingMeta.busyRetryPreviousCallSid === CallSid);
+          if (retryAlreadyQueued) {
+            console.log("[scheduled-outreach] duplicate terminal callback kept queued retry", {
+              callSid: CallSid,
+              scheduleRunId,
+            });
+          } else {
+          const voicemailDetected =
+            outcome === "voicemail" ||
+            scheduledRecord?.metadata?.voicemail_detected === true ||
+            existingMeta.voicemailDetected === true;
+          const effectiveOutcome = voicemailDetected ? "voicemail" : outcome;
+          const runStatus = dbRunStatusFromOutcome(effectiveOutcome, CallStatus);
           const patch = {
             status: runStatus,
             twilio_call_sid: CallSid,
@@ -1732,17 +1842,17 @@ router.post(
               answeredBy: AnsweredBy || "",
               callDuration: durationSeconds,
               durationSeconds,
-              outcome,
+              outcome: effectiveOutcome,
               outcomeSummary:
-                outcome === "answered"
+                effectiveOutcome === "answered"
                   ? "Recipient answered the scheduled call."
-                  : outcome === "no_answer"
+                  : effectiveOutcome === "no_answer"
                     ? "Recipient did not answer."
-                    : outcome === "voicemail"
+                    : effectiveOutcome === "voicemail"
                       ? "Voicemail or machine detected."
-                      : outcome === "busy"
+                      : effectiveOutcome === "busy"
                         ? "Recipient line was busy."
-                        : outcome === "failed"
+                        : effectiveOutcome === "failed"
                           ? "Twilio reported the call failed."
                           : `Twilio status: ${CallStatus || "unknown"}`,
               voicemailDetected,
@@ -1754,7 +1864,7 @@ router.post(
           if (
             terminalStatuses.has(String(CallStatus || "").toLowerCase()) ||
             ["completed", "failed", "busy", "no_answer", "voicemail"].includes(
-              outcome,
+              effectiveOutcome,
             )
           ) {
             patch.completed_at = new Date().toISOString();
@@ -1763,21 +1873,25 @@ router.post(
             String(CallStatus || "").toLowerCase() === "busy" &&
             existingRun
           ) {
-            const retryDelayMinutes = Number(
-              process.env.SCHEDULED_CALL_BUSY_RETRY_DELAY_MINUTES || 60,
-            );
-            patch.scheduled_for = new Date(
-              Date.now() + retryDelayMinutes * 60_000,
-            ).toISOString();
-            patch.status = "queued";
-            patch.completed_at = null;
-            patch.error_code = "BUSY_RETRY_SCHEDULED";
-            patch.error_message = `Busy; retry scheduled in ${retryDelayMinutes} minutes.`;
-            patch.outcome_metadata = {
-              ...patch.outcome_metadata,
-              outcome: "retry_scheduled",
-              retryAt: patch.scheduled_for,
-            };
+            const retriesAllowed = Math.max(0, Number(process.env.SCHEDULED_CALL_BUSY_MAX_RETRIES ?? 1) || 0);
+            const attemptNumber = Math.max(1, Number(existingRun.attempt_number) || 1);
+            if (attemptNumber <= retriesAllowed) {
+              const retryDelayMinutes = Math.max(5, Number(process.env.SCHEDULED_CALL_BUSY_RETRY_DELAY_MINUTES || 60) || 60);
+              patch.scheduled_for = new Date(Date.now() + retryDelayMinutes * 60_000).toISOString();
+              patch.status = "queued";
+              patch.completed_at = null;
+              patch.twilio_call_sid = null;
+              patch.call_record_id = null;
+              patch.attempt_number = attemptNumber + 1;
+              patch.error_code = "BUSY_RETRY_SCHEDULED";
+              patch.error_message = `Busy; retry scheduled in ${retryDelayMinutes} minutes.`;
+              patch.outcome_metadata = {
+                ...patch.outcome_metadata,
+                outcome: "retry_scheduled",
+                retryAt: patch.scheduled_for,
+                busyRetryPreviousCallSid: CallSid,
+              };
+            }
           }
           await db
             .from("lead_outreach_runs")
@@ -1788,16 +1902,33 @@ router.post(
             .update({
               status: CallStatus || undefined,
               duration: durationSeconds || undefined,
-              outcome: outcome || undefined,
+              outcome: effectiveOutcome || undefined,
               metadata: {
                 ...(scheduledRecord.metadata || {}),
                 scheduledOutcome: patch.outcome_metadata,
               },
             })
             .eq("id", scheduledRecord.id);
+          }
         }
       } catch (err) {
         console.warn("[scheduled-outreach] run status update skipped", {
+          callSid: CallSid,
+          error: err.message || String(err),
+        });
+      }
+    }
+
+    if (
+      CallSid &&
+      ["completed", "failed", "busy", "no-answer", "canceled", "cancelled"].includes(
+        String(CallStatus || "").toLowerCase(),
+      )
+    ) {
+      try {
+        await applyVoicemailFollowup(getSupabase(), CallSid);
+      } catch (err) {
+        console.warn("[Twilio call-status] voicemail follow-up skipped", {
           callSid: CallSid,
           error: err.message || String(err),
         });
@@ -1884,7 +2015,7 @@ router.post(
     if (!CallSid)
       return res.json({ received: true, ignored: "missing_call_sid" });
 
-    const recordingUrl = RecordingUrl ? `${RecordingUrl}.mp3` : "";
+    const recordingUrl = /^RE[0-9a-f]{32}$/i.test(RecordingSid||'') ? `https://api.twilio.com/2010-04-01/Accounts/${req.twilioAccountSid}/Recordings/${RecordingSid}.mp3` : "";
     const callRecord = await loadCallRecordForRecording(CallSid);
     const baseRecordingMeta = {
       recording: {
@@ -1903,6 +2034,9 @@ router.post(
       },
     };
 
+    const priorRecording = callRecord?.metadata?.recordings?.[RecordingSid];
+    if (priorRecording?.transcription_status === "completed" || (priorRecording?.recording_status === "completed" && RecordingStatus !== "completed")) return res.json({ received: true, duplicate: true });
+    baseRecordingMeta.recordings = RecordingSid ? { [RecordingSid]: { ...baseRecordingMeta.recording, phase: require("../../lib/recording-transcript").recordingPhase(RecordingSource) } } : {};
     const baseColumns = {
       recording_sid: RecordingSid || null,
       recording_url: recordingUrl || null,
@@ -1934,13 +2068,17 @@ router.post(
     let metadataPatch = { ...baseRecordingMeta };
 
     try {
-      if (callRecord?.id && RecordingSid && RecordingUrl) {
-        const downloaded = await downloadTwilioRecordingMp3(RecordingUrl);
+      if (callRecord?.id && RecordingSid) {
+        const downloaded = await downloadTwilioRecordingMp3({accountSid:req.twilioAccountSid,recordingSid:RecordingSid,callSid:CallSid});
         const upload = await uploadRecordingToSupabase({
           callRecord,
           recordingSid: RecordingSid,
           buffer: downloaded.buffer,
           mimeType: downloaded.mimeType,
+        }).catch(err => {
+          columnsPatch.recording_error = err.message || String(err);
+          metadataPatch.recording.error = columnsPatch.recording_error;
+          return { skipped: true, error: columnsPatch.recording_error };
         });
         if (!upload?.skipped) {
           columnsPatch = {
@@ -1984,10 +2122,12 @@ router.post(
             });
           }
 
+        }
           try {
             const tx = await transcribeRecordingWithOpenAI({
               buffer: downloaded.buffer,
               filename: `${RecordingSid}.mp3`,
+              source: RecordingSource,
             });
             columnsPatch.transcription_provider = "openai";
             columnsPatch.transcription_status =
@@ -2028,17 +2168,9 @@ router.post(
               });
             }
             if (tx.text) {
-              const existingTranscript = transcriptToText(
-                callRecord.transcript,
-              );
-              if (!existingTranscript)
-                columnsPatch.transcript = [
-                  {
-                    role: "transcription",
-                    text: tx.text,
-                    ts: new Date().toISOString(),
-                  },
-                ];
+              columnsPatch._recordingTranscript = {
+                tx, context: { recordingSid: RecordingSid, source: RecordingSource, startedAt: RecordingStartTime },
+              };
               if (!callRecord.summary)
                 columnsPatch.summary = makeShortSummary(tx.text);
             }
@@ -2057,8 +2189,17 @@ router.post(
               error: columnsPatch.transcription_error,
             });
           }
-        }
       }
+      if (RecordingSid) metadataPatch.recordings = {
+        [RecordingSid]: {
+          ...metadataPatch.recordings[RecordingSid], ...metadataPatch.recording,
+          transcription_status: columnsPatch.transcription_status || "pending",
+          transcription_error: columnsPatch.transcription_error || null,
+          transcript: columnsPatch._recordingTranscript
+            ? require("../../lib/recording-transcript").recordingTranscriptLines(columnsPatch._recordingTranscript.tx, columnsPatch._recordingTranscript.context)
+            : priorRecording?.transcript || [],
+        },
+      };
       await updateCallRecordMetadataBySid(CallSid, metadataPatch, columnsPatch);
       console.log("[recording] saved recordingSid=" + (RecordingSid || ""), {
         callSid: CallSid,
@@ -3925,7 +4066,7 @@ router.post(
       },
     });
 
-    const preparedOpeningGreeting = preparedOpeningGreetingForCall({
+    const preparedOpeningGreeting = await preparedOpeningGreetingForCall({
       agent,
       organization,
       direction: "outbound",
@@ -4002,14 +4143,24 @@ router.post(
         accountSid: number.account_sid || account.account_sid,
         twimlUrl,
         statusCallbackUrl: `${base}/api/twilio/call-status`,
-        machineDetection: process.env.OUTBOUND_MACHINE_DETECTION ?? "",
+        machineDetection:
+          readVoicemailSettings(agent).action === "leave_message"
+            ? "DetectMessageEnd"
+            : process.env.OUTBOUND_MACHINE_DETECTION ||
+              machineDetectionModeForSettings(readVoicemailSettings(agent)),
+        asyncAmd: readVoicemailSettings(agent).action === "leave_message" ? false : undefined,
         record: callRecordingEnabled(),
       });
       console.log("[outbound-call] machineDetection enabled", {
-        value: process.env.OUTBOUND_MACHINE_DETECTION ?? "disabled",
+        value:
+          readVoicemailSettings(agent).action === "leave_message"
+            ? "DetectMessageEnd"
+            : process.env.OUTBOUND_MACHINE_DETECTION ||
+              machineDetectionModeForSettings(readVoicemailSettings(agent)),
         asyncAmd:
+          readVoicemailSettings(agent).action !== "leave_message" &&
           String(process.env.OUTBOUND_ASYNC_AMD || "true").toLowerCase() !==
-          "false",
+            "false",
       });
       console.log("[outbound-call] callSid", result.callSid);
       await updateCallRecordById(record.id, {
@@ -5453,7 +5604,7 @@ router.post(
       });
     }
 
-    const apiUrl = (process.env.API_URL || "").trim().replace(/\/$/, "");
+    const apiUrl = API_URL();
     const callbackUrl = apiUrl
       ? `${apiUrl}/api/twilio/numbers/verify-callback`
       : undefined;
@@ -6140,7 +6291,7 @@ router.post(
       },
     });
 
-    const preparedOpeningGreeting = preparedOpeningGreetingForCall({
+    const preparedOpeningGreeting = await preparedOpeningGreetingForCall({
       agent,
       organization: req.organization || null,
       direction: "outbound",
@@ -6208,11 +6359,20 @@ router.post(
         accountSid: number?.account_sid || undefined,
         twimlUrl,
         statusCallbackUrl: `${apiBase}/api/twilio/call-status`,
-        machineDetection: process.env.OUTBOUND_MACHINE_DETECTION ?? "",
+        machineDetection:
+          readVoicemailSettings(agent).action === "leave_message"
+            ? "DetectMessageEnd"
+            : process.env.OUTBOUND_MACHINE_DETECTION ||
+              machineDetectionModeForSettings(readVoicemailSettings(agent)),
+        asyncAmd: readVoicemailSettings(agent).action === "leave_message" ? false : undefined,
         record: callRecordingEnabled(),
       });
       console.log("[outbound-call] machineDetection enabled", {
-        value: process.env.OUTBOUND_MACHINE_DETECTION ?? "disabled",
+        value:
+          readVoicemailSettings(agent).action === "leave_message"
+            ? "DetectMessageEnd"
+            : process.env.OUTBOUND_MACHINE_DETECTION ||
+              machineDetectionModeForSettings(readVoicemailSettings(agent)),
       });
       console.log("[outbound-call] callSid", result.callSid);
 

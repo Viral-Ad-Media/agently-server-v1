@@ -16,6 +16,7 @@
 
 node_modules
 npm-debug.log*
+security-test-results.txt
 
 # Local-only tooling and notes; none of it runs in the container.
 .claude

@@ -5,6 +5,7 @@ const { getSupabase } = require("../../lib/supabase");
 const { requireAuth, requireAdmin } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 const { serializeAgent } = require("../../lib/serializers");
+const { getConnectionById } = require("../../lib/calendar-tokens");
 const { updateNumberWebhooks } = require("../../lib/twilio");
 const {
   ensureDefaultKnowledgeBaseForOrg,
@@ -133,10 +134,10 @@ function buildVoiceAgentOptionalPayload({ body, knowledgeBaseId }) {
         60,
     ),
     voicemail_max_redial_attempts: Number(
-      body.voicemailMaxRedialAttempts ||
-        body.voicemail_max_redial_attempts ||
-        body.voicemail_settings?.maxRedialAttempts ||
-        body.voicemailSettings?.maxRedialAttempts ||
+      body.voicemailMaxRedialAttempts ??
+        body.voicemail_max_redial_attempts ??
+        body.voicemail_settings?.maxRedialAttempts ??
+        body.voicemailSettings?.maxRedialAttempts ??
         1,
     ),
     voicemail_settings: body.voicemailSettings || body.voicemail_settings || {},
@@ -393,7 +394,9 @@ router.patch(
         Number(body.voicemailCallbackDelayMinutes) || 60;
     if (body.voicemailMaxRedialAttempts !== undefined)
       updates.voicemail_max_redial_attempts =
-        Number(body.voicemailMaxRedialAttempts) || 1;
+        Number.isFinite(Number(body.voicemailMaxRedialAttempts))
+          ? Math.max(0, Math.min(10, Math.round(Number(body.voicemailMaxRedialAttempts))))
+          : 1;
     if (
       body.voicemailSettings !== undefined ||
       body.voicemail_settings !== undefined
@@ -418,6 +421,37 @@ router.patch(
     if (body.twilioPhoneSid !== undefined)
       updates.twilio_phone_sid = body.twilioPhoneSid;
 
+    if (body.qualificationPlaybook !== undefined) {
+      updates.qualification_playbook = String(body.qualificationPlaybook || "")
+        .trim()
+        .slice(0, 8000);
+    }
+    if (body.qualificationRules !== undefined) {
+      const input =
+        body.qualificationRules && typeof body.qualificationRules === "object"
+          ? body.qualificationRules
+          : {};
+      const boundedScore = (value, fallback) => {
+        const number = Number(value);
+        return Number.isFinite(number)
+          ? Math.max(0, Math.min(100, Math.round(number)))
+          : fallback;
+      };
+      updates.qualification_rules = {
+        qualified_min_score: boundedScore(input.qualified_min_score, 80),
+        nurture_min_score: boundedScore(input.nurture_min_score, 50),
+        disqualify_signals: (Array.isArray(input.disqualify_signals)
+          ? input.disqualify_signals
+          : [])
+          .map((value) => String(value || "").trim().slice(0, 120))
+          .filter(Boolean)
+          .slice(0, 20),
+        booking_criteria: String(input.booking_criteria || "")
+          .trim()
+          .slice(0, 2000),
+      };
+    }
+
     // Call purposes — outbound only, an array of plain-text call reasons
     if (body.callPurposes !== undefined)
       updates.call_purposes = Array.isArray(body.callPurposes)
@@ -435,6 +469,25 @@ router.patch(
       updates.twilio_phone_number = "";
       updates.twilio_phone_sid = "";
       updates.number_source = null;
+    }
+
+    /*
+     * Which business calendar this agent books into. Several agents may share
+     * one. The id must be one of THIS organization's connections — RLS will
+     * not stop a foreign id, so the check is here. null/"" clears it back to
+     * the organization's booking default.
+     */
+    if (body.calendarIntegrationId !== undefined) {
+      const requested = body.calendarIntegrationId || null;
+      if (requested) {
+        const connection = await getConnectionById(db, req.orgId, requested);
+        if (!connection || connection.status === "disconnected") {
+          return res.status(400).json({
+            error: { message: "That calendar is not connected to this account." },
+          });
+        }
+      }
+      updates.calendar_integration_id = requested;
     }
 
     updates.updated_at = new Date().toISOString();

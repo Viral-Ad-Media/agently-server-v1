@@ -494,12 +494,12 @@ test("the merge reads only this organization's connections and appointments", as
   }
 });
 
-test("one unusable account degrades the merge instead of emptying the day", async () => {
+test("one unreadable account fails availability CLOSED instead of offering unchecked slots", async () => {
   /*
-   * If a second account's freeBusy fails we could either offer slots that may
-   * clash or offer nothing at all. Offering nothing turns one expired token
-   * into "the business has no availability", so the failure is absorbed and
-   * reported rather than propagated.
+   * This used to absorb the failure and offer every slot, so an expired token
+   * on business B silently re-opened all of B's busy time and the agent
+   * double-booked — the exact thing the merge exists to prevent. Unknown busy
+   * time is not free time.
    */
   const db = makeFakeSupabase({
     calendar_integrations: [
@@ -522,10 +522,27 @@ test("one unusable account degrades the merge instead of emptying the day", asyn
       "2026-10-08T12:00:00.000Z",
       "2026-10-08T20:00:00.000Z",
     );
-    assert.equal(result.success, true);
-    assert.ok(result.slots.length > 0, "a broken sibling account must not erase availability");
+    assert.equal(result.success, false);
+    assert.equal(result.code, "availability_unverified");
   } finally {
     global.fetch = original;
+  }
+});
+
+test("a google account awaiting reconnect also fails availability closed", async () => {
+  // Its freeBusy cannot be read at all, so it must not count as "free".
+  const db = makeFakeSupabase({
+    calendar_integrations: [
+      connectionRow({ id: "nutra", isBookingDefault: true, bookingSettings: ALL_DAY }),
+      connectionRow({ id: "expired", status: "needs_reconnect" }),
+    ],
+  });
+  const busy = stubFreeBusy({});
+  try {
+    const result = await freshAvailability(db, ORG, "2026-10-08T12:00:00.000Z", "2026-10-08T20:00:00.000Z");
+    assert.equal(result.code, "availability_unverified");
+  } finally {
+    busy.restore();
   }
 });
 

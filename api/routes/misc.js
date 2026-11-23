@@ -103,9 +103,11 @@ async function loadCustomerWalletSummary(db, organizationId, limit = 150) {
           walletId: rawWallet.id,
           currency: rawWallet.currency || "USD",
           balanceUsd: Number(rawWallet.balance_usd || 0),
+          // The platform setting is the authority. The wallet row only holds
+          // a snapshot from when it was created, and old snapshots said $30.
           minimumRechargeUsd: Number(
-            rawWallet.minimum_recharge_usd ||
-              platformSettings.minimumTopUpUsd ||
+            platformSettings.minimumTopUpUsd ||
+              rawWallet.minimum_recharge_usd ||
               10,
           ),
           status: rawWallet.status || "active",

@@ -7,6 +7,8 @@ const {
 } = require("../../lib/knowledge-bases");
 const { searchScopedFaqs } = require("../../lib/knowledge-retrieval");
 const { getApiBaseUrl } = require("../../lib/chatbot-widget-utils");
+const mediaWidget = require("../../lib/chat-media-widget");
+const frontdeskWidget = require("../../lib/frontdesk-widget");
 
 const router = express.Router();
 
@@ -149,6 +151,9 @@ router.get("/:id", async (req, res) => {
           .replace(/\/$/, ""),
       ),
       collectLeads: chatbot.collect_leads !== false,
+      // Customer photo / video uploads. Column defaults to true; undefined
+      // (before the migration) also means on.
+      mediaUploads: chatbot.media_uploads_enabled !== false,
       agentName: safeStr(agentName),
     };
 
@@ -612,6 +617,8 @@ body>*:not(#agently-root):not(script){display:none!important}
 #spk{background:none;border:none;color:#fff;cursor:pointer;padding:6px;border-radius:8px;display:flex;align-items:center;justify-content:center;opacity:.6;transition:opacity .2s,background .2s;}
 #spk:hover{opacity:1;background:rgba(255,255,255,.15)}
 #spk.on{opacity:1;background:rgba(255,255,255,.2)}
+${mediaWidget.CSS}
+${frontdeskWidget.CSS}
 </style>
 </head>
 <body>
@@ -631,11 +638,13 @@ body>*:not(#agently-root):not(script){display:none!important}
   <div id="msgs" role="log" aria-live="polite" aria-label="Chat messages"></div>
   <div id="chips" role="list" aria-label="Suggested questions"></div>
   <div class="ir">
+    ${mediaWidget.BUTTON}
     <button id="mic" aria-label="Record voice message" title="Record voice"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg></button>
     <textarea id="ci" placeholder="${cfg.placeholder.replace(/\\'/g, "'")}" rows="1" aria-label="Message input"></textarea>
     <div id="recBar" aria-live="polite"><span class="dotRed"></span><span class="recWave"><span></span><span></span><span></span><span></span><span></span><span></span><span></span></span><span class="recTime" id="recTime">0:00</span></div>
     <button id="sb" aria-label="Send message" disabled><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></button>
   </div>
+  ${mediaWidget.MARKUP}
   <div class="pw">Powered by <a href="https://agently.ai" target="_blank" rel="noopener">Agently</a></div>
   <div id="vMode" role="dialog" aria-label="Voice conversation">
     <div class="vmTop"><span class="vmLabel">Voice Mode</span><span class="vmLang" id="vmLang">EN</span></div>
@@ -671,6 +680,7 @@ body>*:not(#agently-root):not(script){display:none!important}
   var CHAT_VOICE = '${cfg.chatVoice}';
   var REALTIME_WS_BASE = '${cfg.realtimeWsUrl}';
   var COLLECT_LEADS = ${cfg.collectLeads};
+  var MEDIA_UPLOADS_ENABLED = ${cfg.mediaUploads === true};
   var STORAGE_KEY = 'agently:' + CID;
   var IDLE_TTL_MS = 5 * 60 * 1000; // Clear local widget chat cache only after the widget has been closed for 5 minutes
   var LEAD_CAPTURED_KEY = 'agently:' + CID + ':leadCaptured';
@@ -761,6 +771,7 @@ body>*:not(#agently-root):not(script){display:none!important}
 
     isOpen = !isOpen;
     cw.classList.toggle('hide', !isOpen);
+    if (!isOpen && window.__agentlyCloseCapture) window.__agentlyCloseCapture();
     launcher.setAttribute('aria-expanded', String(isOpen));
     icoChat.style.display = isOpen ? 'none' : '';
     icoClose.style.display = isOpen ? '' : 'none';
@@ -907,11 +918,14 @@ body>*:not(#agently-root):not(script){display:none!important}
     fetch(API + '/api/chatbot-public/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, chatbotId: CID, history: history.slice(-12), language: currentLang })
+      body: JSON.stringify({ message: text, chatbotId: CID, history: history.slice(-12), language: currentLang, sessionId: (window.__agentlyMediaSessionId ? window.__agentlyMediaSessionId() : undefined), leadToken: (window.__agentlyLeadToken ? window.__agentlyLeadToken() : undefined) })
     })
     .then(function(r) { return r.json(); })
     .then(function(d) {
       hideTyping();
+      // A team member has taken this chat over: their reply arrives by polling.
+      if (d && d.human) { if (window.__agentlyFrontdesk) window.__agentlyFrontdesk.afterReply(d); return; }
+      setTimeout(function() { if (window.__agentlyFrontdesk) window.__agentlyFrontdesk.afterReply(d); }, 0);
       var reply = (d.response || (d.error && d.error.message) || "I'm here to help! Could you rephrase that?");
       addBotMsg(reply); speakReply(reply);
     })
@@ -1129,11 +1143,12 @@ body>*:not(#agently-root):not(script){display:none!important}
       subBtn.disabled = true; subBtn.textContent = '...';
       fetch(API + '/api/chatbot-public/capture-lead', {
         method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ chatbotId: CID, name: name, phone: phone, email: email })
+        body: JSON.stringify({ chatbotId: CID, name: name, phone: phone, email: email, sessionId: (window.__agentlyMediaSessionId ? window.__agentlyMediaSessionId() : undefined) })
       })
       .then(function(r) { if (!r.ok) throw new Error('failed'); return r.json(); })
       .then(function(d) {
         markLeadCaptured();
+        if (d && d.mediaToken && window.__agentlySetMediaToken) window.__agentlySetMediaToken(d.mediaToken);
         form.style.opacity = '0.5'; leadFormVisible = false;
         ci.disabled = false; sb.disabled = !ci.value.trim();
         addBotMsg(d && d.deduped ? 'Thank you — I found your existing details. How else can I help you?' : 'Thank you! How else can I help you?');
@@ -1592,11 +1607,12 @@ body>*:not(#agently-root):not(script){display:none!important}
       subBtn.disabled = true; subBtn.textContent = '...';
       fetch(API + '/api/chatbot-public/capture-lead', {
         method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ chatbotId: CID, name: name, phone: phone, email: email })
+        body: JSON.stringify({ chatbotId: CID, name: name, phone: phone, email: email, sessionId: (window.__agentlyMediaSessionId ? window.__agentlyMediaSessionId() : undefined) })
       })
       .then(function(r) { if (!r.ok) throw new Error('failed'); return r.json(); })
       .then(function(d) {
         markLeadCaptured();
+        if (d && d.mediaToken && window.__agentlySetMediaToken) window.__agentlySetMediaToken(d.mediaToken);
         form.style.opacity = '0.5'; leadFormVisible = false;
         ci.disabled = false; sb.disabled = !ci.value.trim();
         addBotMsg(d && d.deduped ? 'Thank you — I found your existing details. How else can I help you?' : 'Thank you! How else can I help you?');
@@ -1607,6 +1623,8 @@ body>*:not(#agently-root):not(script){display:none!important}
     [nEl, pEl, eEl].forEach(function(el){ el.addEventListener('keydown', function(e){ if(e.key==='Enter'){e.preventDefault();sub();} }); });
   }
 
+${mediaWidget.SCRIPT}
+${frontdeskWidget.SCRIPT}
   /* ========================================================= */
 })();
 </script>

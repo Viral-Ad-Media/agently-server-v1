@@ -88,9 +88,18 @@ const {
 const {
   invalidateAvailabilityCache,
   listMergedBookings,
+  cancelAppointment,
 } = require("../../lib/calendar-booking");
 
+const { GMAIL_SCOPES, saveGmailConnection } = require("../../lib/gmail-send");
+
 const router = express.Router();
+
+// Gmail (send-only) rides the same OAuth client and flow as Google Calendar.
+// Its tokens are saved to email_integrations, never calendar_integrations.
+function isGoogleFamily(provider) {
+  return provider === "google" || provider === "gmail";
+}
 
 const STATE_TTL_MS = 10 * 60 * 1000;
 const NONCE_COOKIE_PREFIX = "agently_oauth_";
@@ -221,6 +230,26 @@ function getProviderConfig(provider) {
     }
     return { provider, clientId, clientSecret, redirectUri };
   }
+  if (provider === "gmail") {
+    const clientId = process.env.GOOGLE_CLIENT_ID;
+    const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+    // Its own callback path, so it must be registered as an authorized
+    // redirect URI on the Google OAuth client. Defaults to the calendar one
+    // with /google/ swapped for /gmail/.
+    const redirectUri =
+      process.env.INTEGRATIONS_GMAIL_REDIRECT_URI ||
+      String(process.env.INTEGRATIONS_GOOGLE_REDIRECT_URI || "").replace("/google/callback", "/gmail/callback");
+    if (!clientId || !clientSecret || !redirectUri) {
+      const error = new Error(
+        "Gmail sending is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and " +
+          "INTEGRATIONS_GMAIL_REDIRECT_URI (or INTEGRATIONS_GOOGLE_REDIRECT_URI).",
+      );
+      error.status = 503;
+      error.code = "provider_not_configured";
+      throw error;
+    }
+    return { provider, clientId, clientSecret, redirectUri };
+  }
   if (provider === "calendly") {
     const clientId = process.env.CALENDLY_CLIENT_ID;
     const clientSecret = process.env.CALENDLY_CLIENT_SECRET;
@@ -251,9 +280,21 @@ function getCookie(req, name) {
   return match ? match[1] : null;
 }
 
-function settingsRedirect(params) {
+/**
+ * Where the browser lands after OAuth: the page the user started from, so a
+ * connect begun in Agent Settings or onboarding returns there, not to a fixed
+ * screen. Only an in-app PATH is accepted (no scheme, no host, no "//"), so a
+ * crafted returnTo cannot turn the callback into an open redirect.
+ */
+function safeReturnTo(value) {
+  const path = String(value || "").trim();
+  if (!/^\/[A-Za-z0-9/_-]{0,200}$/.test(path) || path.startsWith("//")) return "/integrations";
+  return path;
+}
+
+function settingsRedirect(params, returnTo = "/integrations") {
   const query = new URLSearchParams(params).toString();
-  return `${buildAppUrl("/integrations")}?${query}`;
+  return `${buildAppUrl(safeReturnTo(returnTo))}?${query}`;
 }
 
 function setNonceCookie(res, provider, nonce) {
@@ -271,12 +312,13 @@ function clearNonceCookie(res, provider) {
 }
 
 function buildAuthorizeUrl(provider, config, state, codeChallenge) {
-  if (provider === "google") {
+  if (isGoogleFamily(provider)) {
     const params = new URLSearchParams({
       client_id: config.clientId,
       redirect_uri: config.redirectUri,
       response_type: "code",
-      scope: GOOGLE_SCOPES,
+      // gmail: send-only (sensitive scope, no inbox access).
+      scope: provider === "gmail" ? GMAIL_SCOPES : GOOGLE_SCOPES,
       access_type: "offline", // ask for a refresh token
       /*
        * "select_account consent" rather than "consent".
@@ -312,7 +354,7 @@ function buildAuthorizeUrl(provider, config, state, codeChallenge) {
 
 async function exchangeCode(provider, config, code, codeVerifier) {
   let response;
-  if (provider === "google") {
+  if (isGoogleFamily(provider)) {
     response = await fetch("https://oauth2.googleapis.com/token", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -366,7 +408,7 @@ async function exchangeCode(provider, config, code, codeVerifier) {
 }
 
 async function fetchProviderIdentity(provider, accessToken) {
-  if (provider === "google") {
+  if (isGoogleFamily(provider)) {
     const response = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
       headers: { authorization: `Bearer ${accessToken}` },
     });
@@ -402,7 +444,7 @@ async function fetchProviderIdentity(provider, accessToken) {
 
 async function revokeProviderToken(provider, config, token) {
   try {
-    if (provider === "google") {
+    if (isGoogleFamily(provider)) {
       await fetch("https://oauth2.googleapis.com/revoke", {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -434,12 +476,13 @@ async function revokeProviderToken(provider, config, token) {
  * never appears in a URL. (Replay of an unused token would only restart the
  * same org's flow; the callback still requires the browser's nonce cookie.)
  */
-function signStartToken({ orgId, userId, provider }) {
+function signStartToken({ orgId, userId, provider, returnTo }) {
   return signState({
     kind: "start",
     orgId,
     userId,
     provider,
+    returnTo: safeReturnTo(returnTo),
     nonce: crypto.randomBytes(16).toString("hex"),
     exp: Date.now() + 2 * 60 * 1000,
   });
@@ -658,6 +701,11 @@ router.get(
  * Without one they fall back to the provider's booking default, which is what
  * the single-account case always meant.
  */
+router.post("/bookings/:id/cancel", requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const result = await cancelAppointment(req.orgId, req.params.id, getSupabase());
+  res.json(result);
+}));
+
 async function resolveProviderConnection(db, organizationId, provider, connectionId) {
   if (connectionId) {
     const row = await getConnectionById(db, organizationId, connectionId);
@@ -760,6 +808,7 @@ router.post(
       orgId: req.orgId,
       userId: req.user && req.user.id,
       provider,
+      returnTo: req.body && req.body.returnTo,
     });
     res.json({ url: `/api/integrations/${provider}/start?st=${encodeURIComponent(token)}` });
   }),
@@ -817,6 +866,7 @@ router.get(
       userId: payload.userId,
       provider,
       nonce,
+      returnTo: safeReturnTo(payload.returnTo),
       pkce: sealCodeVerifier(codeVerifier, payload.orgId, provider),
       exp: Date.now() + STATE_TTL_MS,
     });
@@ -829,9 +879,11 @@ router.get(
   "/:provider/callback",
   asyncHandler(async (req, res) => {
     const { provider } = req.params;
+    // Known only once the signed state verifies; until then, Integrations.
+    let returnTo = "/integrations";
     const fail = (code, message) => {
       clearNonceCookie(res, provider);
-      return res.redirect(settingsRedirect({ error: code, message }));
+      return res.redirect(settingsRedirect({ error: code, message, provider }, returnTo));
     };
 
     let config;
@@ -845,6 +897,7 @@ router.get(
     if (!payload || payload.kind !== "oauth" || payload.provider !== provider) {
       return fail("invalid_state", "The connection request expired or was tampered with. Please try again.");
     }
+    returnTo = safeReturnTo(payload.returnTo);
     const cookieNonce = getCookie(req, `${NONCE_COOKIE_PREFIX}${provider}`);
     if (!cookieNonce || cookieNonce !== payload.nonce) {
       return fail("invalid_state", "The connection request did not come from your browser session. Please try again.");
@@ -894,6 +947,28 @@ router.get(
       return fail("identity_failed", error.message);
     }
 
+    if (provider === "gmail") {
+      // Send-only Gmail: refuse a grant that did not include gmail.send
+      // (the user can untick it on Google's consent screen).
+      if (!String(tokens.scopes || "").includes("gmail.send")) {
+        return fail("scope_missing", "Gmail sending permission was not granted. Please connect again and allow sending.");
+      }
+      try {
+        await saveGmailConnection(db, payload.orgId, {
+          accessToken: tokens.accessToken,
+          refreshToken: tokens.refreshToken,
+          expiresAt: tokens.expiresAt,
+          scopes: tokens.scopes,
+          providerUserId: identity.providerUserId,
+          providerUserEmail: identity.providerUserEmail,
+          providerUserName: identity.providerUserName,
+        });
+      } catch (error) {
+        return fail("save_failed", error.message);
+      }
+      return res.redirect(settingsRedirect({ connected: "gmail" }, returnTo));
+    }
+
     let connectionRow;
     try {
       connectionRow = await saveConnection(db, payload.orgId, provider, {
@@ -916,7 +991,7 @@ router.get(
     await setupConnectionSync(db, payload.orgId, provider, config, connectionRow);
 
     return res.redirect(
-      settingsRedirect({ connected: provider }),
+      settingsRedirect({ connected: provider }, returnTo),
     );
   }),
 );
@@ -1218,5 +1293,6 @@ module.exports._internals = {
   sealCodeVerifier,
   openCodeVerifier,
   normalizeBookingSettings,
+  safeReturnTo,
   STATE_TTL_MS,
 };

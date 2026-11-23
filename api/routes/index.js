@@ -91,6 +91,8 @@ app.use("/api/calls", callsRoutes);
 app.use("/api/leads", leadsRoutes);
 app.use("/api/outreach", outreachRoutes);
 app.use("/api/chatbot-public", chatbotPublicRoutes);
+app.use("/api/chatbot-public", require("./routes/frontdesk-public"));
+app.use("/api/frontdesk", require("./routes/frontdesk"));
 app.use("/api/twilio", twilioRoutes); // ← NEW: all Twilio routes
 app.use("/api/test-agent", testAgentRoutes);
 app.use("/api/notifications", notificationsRoutes);

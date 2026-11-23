@@ -1,0 +1,5 @@
+# Emergency overlay on the locally verified release base, avoiding a registry
+# metadata dependency during the incident. The base image ID is recorded in
+# the security release note. The standard Dockerfile remains the normal build.
+FROM agently-api:security-20261020
+COPY . .
