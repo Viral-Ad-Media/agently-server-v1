@@ -10,6 +10,7 @@ const { getApiBaseUrl } = require("../../lib/chatbot-widget-utils");
 const mediaWidget = require("../../lib/chat-media-widget");
 const frontdeskWidget = require("../../lib/frontdesk-widget");
 const { chatbotLeadSettings, leadFieldsSentence } = require("../../lib/chatbot-lead-settings");
+const widgetI18n = require("../../lib/widget-i18n");
 
 const router = express.Router();
 
@@ -38,9 +39,12 @@ router.get("/:id", async (req, res) => {
       : null;
     const queryVoice = req.query.voice ? String(req.query.voice) : null;
 
+    // The saved setting wins. ?langs= is baked into embed snippets when they
+    // are copied, so preferring it froze old embeds on an outdated list.
     const chatLanguages =
-      queryLangs ||
-      (Array.isArray(chatbot.chat_languages) ? chatbot.chat_languages : ["en"]);
+      Array.isArray(chatbot.chat_languages) && chatbot.chat_languages.length
+        ? chatbot.chat_languages
+        : queryLangs || ["en"];
     const chatVoice = queryVoice || chatbot.chat_voice || "alloy";
 
     // Resolve agent name for the lead tag and system prompt.
@@ -178,6 +182,49 @@ router.get("/:id", async (req, res) => {
 <body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f8fafc;">
 <div style="text-align:center;color:#94a3b8"><p style="font-size:48px;margin:0">⚠️</p><p>Widget temporarily unavailable.</p></div>
 </body></html>`);
+  }
+});
+
+// GET /chatbot-widget/:id/i18n?lang=es — widget text in the visitor's chosen
+// language (lib/widget-i18n.js). Only the chatbot's enabled languages.
+router.get("/:id/i18n", async (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  try {
+    const lang = String(req.query.lang || "").trim().toLowerCase().slice(0, 2);
+    const { data: chatbot } = await getSupabase()
+      .from("chatbots")
+      .select("*")
+      .eq("id", req.params.id)
+      .maybeSingle();
+    if (!chatbot) return res.status(404).json({ error: { message: "Not found." } });
+    const languages =
+      Array.isArray(chatbot.chat_languages) && chatbot.chat_languages.length
+        ? chatbot.chat_languages.map((code) => String(code).toLowerCase())
+        : ["en"];
+    if (!languages.includes(lang) || !widgetI18n.languageName(lang)) {
+      return res.status(400).json({ error: { message: "Language not enabled for this chatbot." } });
+    }
+    const primary = languages[0];
+    const lead = chatbotLeadSettings(chatbot);
+    const [ui, content] = await Promise.all([
+      widgetI18n.getUiTranslations(lang),
+      lang === primary
+        ? Promise.resolve(null)
+        : widgetI18n.getContentTranslations(chatbot.id, lang, {
+            headerTitle: chatbot.header_title || "Chat with us",
+            welcomeMessage: chatbot.welcome_message || "Hello! How can I help you today?",
+            placeholder: chatbot.placeholder || "Type your message...",
+            suggestedPrompts: Array.isArray(chatbot.suggested_prompts) ? chatbot.suggested_prompts : [],
+            leadAsk: lead.enabled
+              ? `To serve you better, may I get your ${leadFieldsSentence(lead.fields)}?`
+              : "",
+          }),
+    ]);
+    res.setHeader("Cache-Control", "public, max-age=300");
+    return res.json({ lang, ui, content });
+  } catch (err) {
+    console.warn("[widget] i18n failed:", err?.message || err);
+    return res.json({ lang: null, ui: {}, content: null });
   }
 });
 
@@ -631,8 +678,8 @@ ${frontdeskWidget.CSS}
   <div class="hdr">
     <div class="av" aria-hidden="true">${avatarHtml}</div>
     <div class="ht">
-      <div class="hn">${cfg.headerTitle.replace(/\\'/g, "'").replace(/\\n/g, "")}</div>
-      <div class="hs"><span class="dot"></span>Online · Instant replies</div>
+      <div class="hn" id="hdrTitle">${cfg.headerTitle.replace(/\\'/g, "'").replace(/\\n/g, "")}</div>
+      <div class="hs"><span class="dot"></span><span id="hdrStatus">Online · Instant replies</span></div>
     </div>
     <button class="xb" id="vmBtn" aria-label="Start voice conversation" title="Start voice conversation"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg></button>
     <button class="xb" id="spk" aria-label="Toggle voice replies" title="Voice replies off"><svg id="ico-spk-off" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="22" y1="9" x2="16" y2="15"/><line x1="16" y1="9" x2="22" y2="15"/></svg><svg id="ico-spk-on" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button>
@@ -651,7 +698,7 @@ ${frontdeskWidget.CSS}
   ${mediaWidget.MARKUP}
   <div class="pw">Powered by <a href="https://agently.ai" target="_blank" rel="noopener">Agently</a></div>
   <div id="vMode" role="dialog" aria-label="Voice conversation">
-    <div class="vmTop"><span class="vmLabel">Voice Mode</span><span class="vmLang" id="vmLang">EN</span></div>
+    <div class="vmTop"><span class="vmLabel" id="vmLabel">Voice Mode</span><span class="vmLang" id="vmLang">EN</span></div>
     <div class="vmCenter">
       <div class="vmOrb" id="vmOrb"></div>
       <div class="vmStatus" id="vmStatus">Tap to start speaking</div>
@@ -693,7 +740,26 @@ ${frontdeskWidget.CSS}
   var AGENT_NAME = '${cfg.agentName}';
   var LANG_NAMES = ${JSON.stringify(LANG_NAMES)};
 
-  var currentLang = LANGUAGES[0] || 'en';
+  var HEADER = '${cfg.headerTitle}';
+  var PRIMARY_LANG = LANGUAGES[0] || 'en';
+  var LANG_KEY = 'agently:' + CID + ':lang';
+
+  /* ── Widget translation (server: lib/widget-i18n.js) ──
+     UI_TR maps the widget's English labels to the chosen language; CONTENT
+     holds the business's own text (header, welcome, placeholder, prompts,
+     lead question) in that language. English / the primary language use the
+     originals. */
+  var UI_TR = {};
+  var ORIGINAL = { headerTitle: HEADER, welcomeMessage: WELCOME, placeholder: PLACEHOLDER, suggestedPrompts: PROMPTS, leadAsk: '' };
+  var CONTENT = ORIGINAL;
+  function T(s) { return (UI_TR && UI_TR[s]) || s; }
+  function TH(s) { return String(T(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+  function pickStartLang() {
+    try { var saved = localStorage.getItem(LANG_KEY); if (saved && LANGUAGES.indexOf(saved) !== -1) return saved; } catch (_) {}
+    var nav = String((navigator.languages && navigator.languages[0]) || navigator.language || '').slice(0, 2).toLowerCase();
+    return LANGUAGES.indexOf(nav) !== -1 ? nav : PRIMARY_LANG;
+  }
+  var currentLang = pickStartLang();
   var isOpen = false;
   var greeted = false;
   var sending = false;
@@ -717,7 +783,8 @@ ${frontdeskWidget.CSS}
   if (LANGUAGES.length > 1) {
     var lbl = document.createElement('span');
     lbl.className = 'lang-lbl';
-    lbl.textContent = 'Lang:';
+    lbl.textContent = T('Language') + ':';
+    lbl.id = 'langLbl';
     langBar.appendChild(lbl);
 
     LANGUAGES.forEach(function(code) {
@@ -725,26 +792,86 @@ ${frontdeskWidget.CSS}
       btn.className = 'lang-btn' + (code === currentLang ? ' active' : '');
       btn.textContent = LANG_NAMES[code] || code.toUpperCase();
       btn.dataset.lang = code;
-      btn.onclick = function() {
-        currentLang = code;
-        langBar.querySelectorAll('.lang-btn').forEach(function(b) {
-          b.classList.toggle('active', b.dataset.lang === code);
-        });
-      };
+      btn.onclick = function() { setLanguage(code); };
       langBar.appendChild(btn);
     });
   }
 
   /* ── Suggested prompts ── */
-  PROMPTS.forEach(function(p) {
-    var btn = document.createElement('button');
-    btn.className = 'chip';
-    btn.textContent = p;
-    btn.onclick = function() { sendMessage(p); };
-    chips.appendChild(btn);
-  });
+  function renderChips() {
+    var hadChips = chips.children.length > 0 || !greeted;
+    chips.innerHTML = '';
+    if (!hadChips) return;
+    (CONTENT.suggestedPrompts || PROMPTS).forEach(function(p) {
+      var btn = document.createElement('button');
+      btn.className = 'chip';
+      btn.textContent = p;
+      btn.onclick = function() { sendMessage(p); };
+      chips.appendChild(btn);
+    });
+  }
+  renderChips();
+
+  function setAttr(id, attr, text) { var el = document.getElementById(id); if (el) el.setAttribute(attr, text); }
+  function setText(id, text) { var el = document.getElementById(id); if (el) el.textContent = text; }
+
+  /* Re-label everything visible in the current language. */
+  function applyLanguage() {
+    document.documentElement.lang = currentLang;
+    document.documentElement.dir = currentLang === 'ar' ? 'rtl' : 'ltr';
+    setText('hdrTitle', CONTENT.headerTitle || HEADER);
+    setText('hdrStatus', T('Online · Instant replies'));
+    setAttr('vmBtn', 'aria-label', T('Start voice conversation')); setAttr('vmBtn', 'title', T('Start voice conversation'));
+    setAttr('spk', 'aria-label', T('Toggle voice replies'));
+    var spkEl = document.getElementById('spk'); if (spkEl) spkEl.title = T(speakMode ? 'Voice replies on' : 'Voice replies off');
+    setAttr('xb', 'aria-label', T('Close chat'));
+    setAttr('lang-bar', 'aria-label', T('Language selector'));
+    setAttr('msgs', 'aria-label', T('Chat messages'));
+    setAttr('chips', 'aria-label', T('Suggested questions'));
+    setAttr('mic', 'aria-label', T('Record voice message')); setAttr('mic', 'title', T('Record voice'));
+    setAttr('ci', 'aria-label', T('Message input'));
+    if (ci && !ci.disabled) ci.placeholder = CONTENT.placeholder || PLACEHOLDER;
+    setAttr('sb', 'aria-label', T('Send message'));
+    setText('vmLabel', T('Voice Mode'));
+    setText('vmLang', (currentLang || 'en').toUpperCase());
+    if (!vmActive) { setText('vmStatus', T('Tap to start speaking')); setText('vmHint', T('Speak naturally. I will reply instantly when you pause.')); }
+    setText('vmEnd', T('End conversation'));
+    setAttr('launcher', 'aria-label', T('Open chat'));
+    if (HALTED) launcher.setAttribute('title', T('Chat is temporarily unavailable'));
+    setText('langLbl', T('Language') + ':');
+    // The welcome bubble follows the language until the visitor has written.
+    if (welcomeBubble && history.filter(function(h){ return h.role === 'user'; }).length === 0) {
+      var inner = welcomeBubble.querySelector('.btext');
+      var text = CONTENT.welcomeMessage || WELCOME;
+      if (inner) inner.innerHTML = renderMd(text);
+      for (var hi = 0; hi < history.length; hi++) { if (history[hi].role === 'model') { history[hi].text = text; break; } }
+    }
+    renderChips();
+  }
+
+  var i18nCache = {};
+  function setLanguage(code) {
+    currentLang = code;
+    try { localStorage.setItem(LANG_KEY, code); } catch (_) {}
+    langBar.querySelectorAll('.lang-btn').forEach(function(b) {
+      b.classList.toggle('active', b.dataset.lang === code);
+    });
+    if (code === 'en' && code === PRIMARY_LANG) { UI_TR = {}; CONTENT = ORIGINAL; applyLanguage(); return; }
+    var done = function(d) {
+      if (currentLang !== code) return;
+      UI_TR = (d && d.ui) || {};
+      CONTENT = (d && d.content) ? d.content : ORIGINAL;
+      applyLanguage();
+    };
+    if (i18nCache[code]) { done(i18nCache[code]); return; }
+    fetch(API + '/chatbot-widget/' + encodeURIComponent(CID) + '/i18n?lang=' + encodeURIComponent(code))
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(d) { if (d) i18nCache[code] = d; done(d); })
+      .catch(function() { done(null); });
+  }
 
   var sessionLoaded = false;
+  var welcomeBubble = null;
 
   /*
    * Tells the HOST page to grow or shrink the iframe. Without this the frame
@@ -785,7 +912,7 @@ ${frontdeskWidget.CSS}
     if (isOpen) {
       if (closeClearTimer) { clearTimeout(closeClearTimer); closeClearTimer = null; }
       if (!sessionLoaded) { sessionLoaded = true; loadSession(); }
-      if (!greeted) { greeted = true; setTimeout(function() { addBotMsg(WELCOME); }, 200); }
+      if (!greeted) { greeted = true; setTimeout(function() { welcomeBubble = addBotMsg(CONTENT.welcomeMessage || WELCOME); }, 200); }
       // Input receives focus only after the visitor taps it.
     } else {
       scheduleSessionClear();
@@ -795,7 +922,7 @@ ${frontdeskWidget.CSS}
   if (HALTED) {
     launcher.style.opacity = '0.55';
     launcher.style.cursor = 'not-allowed';
-    launcher.setAttribute('title', 'Chat is temporarily unavailable');
+    launcher.setAttribute('title', T('Chat is temporarily unavailable'));
   }
 
   launcher.onclick = toggle;
@@ -970,7 +1097,7 @@ ${frontdeskWidget.CSS}
     spk.onclick = function() {
       speakMode = !speakMode;
       spk.classList.toggle('on', speakMode);
-      spk.title = speakMode ? 'Voice replies on' : 'Voice replies off';
+      spk.title = T(speakMode ? 'Voice replies on' : 'Voice replies off');
       if (icoSpkOff) icoSpkOff.style.display = speakMode ? 'none' : '';
       if (icoSpkOn)  icoSpkOn.style.display  = speakMode ? '' : 'none';
       if (!speakMode) stopTTSPlayback();
@@ -1037,7 +1164,7 @@ ${frontdeskWidget.CSS}
       })
       .catch(function(err) {
         console.error('Mic denied', err);
-        addBotMsg('I need microphone access to record. Please allow access and try again.');
+        addBotMsg(T('I need microphone access to record. Please allow access and try again.'));
       });
   }
 
@@ -1071,7 +1198,7 @@ ${frontdeskWidget.CSS}
       addBotMsg("I couldn't transcribe that audio. Please try again.");
     })
     .finally(function() {
-      if (ci) { ci.disabled = false; ci.placeholder = PLACEHOLDER; }
+      if (ci) { ci.disabled = false; ci.placeholder = CONTENT.placeholder || PLACEHOLDER; }
       if (mic) mic.disabled = false;
       if (sb) sb.disabled = !(ci && ci.value.trim());
     });
@@ -1119,7 +1246,7 @@ ${frontdeskWidget.CSS}
     var botMsgs  = history.filter(function(m){ return m.role === 'model'; }).length;
     if (userMsgs < 1 || botMsgs < 2) return;
     leadAttempts++;
-    setTimeout(function() { addBotMsg('To serve you better, may I get your ' + LEAD_ASK + '?'); renderLeadForm(); }, 600);
+    setTimeout(function() { addBotMsg(CONTENT.leadAsk || ('To serve you better, may I get your ' + LEAD_ASK + '?')); renderLeadForm(); }, 600);
   }
 
   function renderLeadForm() {
@@ -1132,17 +1259,20 @@ ${frontdeskWidget.CSS}
     if (has('email')) contact.push('email');
     if (has('phone')) contact.push('phone');
     var contactWords = contact.length > 1 ? 'one of email or phone' : (contact[0] === 'phone' ? 'phone number' : 'email');
-    var hint = has('name') ? ('Name and ' + contactWords + (contact.length > 1 ? ' is required.' : ' are required.')) : (contactWords.charAt(0).toUpperCase() + contactWords.slice(1) + ' is required.');
+    var both = contact.length > 1, onlyPhone = contact[0] === 'phone';
+    var hint = TH(has('name')
+      ? (both ? 'Your name and an email or phone number are required.' : (onlyPhone ? 'Your name and phone number are required.' : 'Your name and email are required.'))
+      : (both ? 'An email or phone number is required.' : (onlyPhone ? 'A phone number is required.' : 'An email is required.')));
     var form = document.createElement('div');
     form.className = 'leadForm'; form.id = 'leadForm';
-    var html = '<div class="lfTitle">Quick details</div><div class="lfHint">' + hint + '</div>';
-    if (has('name')) html += '<div class="lfField"><label class="lfLabel">Name *</label><input class="lfInput" id="lfName" type="text" autocomplete="name"/></div>';
+    var html = '<div class="lfTitle">' + TH('Quick details') + '</div><div class="lfHint">' + hint + '</div>';
+    if (has('name')) html += '<div class="lfField"><label class="lfLabel">' + TH('Name *') + '</label><input class="lfInput" id="lfName" type="text" autocomplete="name"/></div>';
     var row = '';
-    if (has('phone')) row += '<div class="lfField"><label class="lfLabel">Phone</label><input class="lfInput" id="lfPhone" type="tel" autocomplete="tel"/></div>';
-    if (has('email')) row += '<div class="lfField"><label class="lfLabel">Email</label><input class="lfInput" id="lfEmail" type="email" autocomplete="email"/></div>';
+    if (has('phone')) row += '<div class="lfField"><label class="lfLabel">' + TH('Phone') + '</label><input class="lfInput" id="lfPhone" type="tel" autocomplete="tel"/></div>';
+    if (has('email')) row += '<div class="lfField"><label class="lfLabel">' + TH('Email') + '</label><input class="lfInput" id="lfEmail" type="email" autocomplete="email"/></div>';
     if (row) html += '<div class="lfRow">' + row + '</div>';
-    if (has('reason')) html += '<div class="lfField"><label class="lfLabel">What do you need help with?</label><input class="lfInput" id="lfReason" type="text"/></div>';
-    html += '<div class="lfError" id="lfError"></div><div class="lfActions"><button class="lfSubmit" type="button" id="lfSubmit">Save details</button></div>';
+    if (has('reason')) html += '<div class="lfField"><label class="lfLabel">' + TH('What do you need help with?') + '</label><input class="lfInput" id="lfReason" type="text"/></div>';
+    html += '<div class="lfError" id="lfError"></div><div class="lfActions"><button class="lfSubmit" type="button" id="lfSubmit">' + TH('Save details') + '</button></div>';
     form.innerHTML = html;
     msgs.appendChild(form); msgs.scrollTop = msgs.scrollHeight;
     var nEl = form.querySelector('#lfName'), pEl = form.querySelector('#lfPhone');
@@ -1154,8 +1284,8 @@ ${frontdeskWidget.CSS}
     function sub() {
       errEl.style.display = 'none';
       var name = val(nEl), phone = val(pEl), email = val(eEl), reason = val(rEl);
-      if (nEl && !name) { showErr('Please enter your name.'); return; }
-      if (!phone && !email) { showErr('Please enter your ' + (contact.length > 1 ? 'phone number or email' : contactWords) + '.'); return; }
+      if (nEl && !name) { showErr(T('Please enter your name.')); return; }
+      if (!phone && !email) { showErr(T(contact.length > 1 ? 'Please enter your phone number or email.' : (contact[0] === 'phone' ? 'Please enter your phone number.' : 'Please enter your email.'))); return; }
       subBtn.disabled = true; subBtn.textContent = '...';
       fetch(API + '/api/chatbot-public/capture-lead', {
         method: 'POST', headers: {'Content-Type':'application/json'},
@@ -1167,9 +1297,9 @@ ${frontdeskWidget.CSS}
         if (d && d.mediaToken && window.__agentlySetMediaToken) window.__agentlySetMediaToken(d.mediaToken);
         form.style.opacity = '0.5'; leadFormVisible = false;
         ci.disabled = false; sb.disabled = !ci.value.trim();
-        addBotMsg(d && d.deduped ? 'Thank you — I found your existing details. How else can I help you?' : 'Thank you! How else can I help you?');
+        addBotMsg(d && d.deduped ? T('Thank you — I found your existing details. How else can I help you?') : T('Thank you! How else can I help you?'));
       })
-      .catch(function() { subBtn.disabled = false; subBtn.textContent = 'Save details'; showErr('Could not save details. Please try again.'); });
+      .catch(function() { subBtn.disabled = false; subBtn.textContent = T('Save details'); showErr(T('Could not save details. Please try again.')); });
     }
     subBtn.onclick = sub;
     [nEl, pEl, eEl, rEl].filter(Boolean).forEach(function(el){ el.addEventListener('keydown', function(e){ if(e.key==='Enter'){e.preventDefault();sub();} }); });
@@ -1226,15 +1356,15 @@ ${frontdeskWidget.CSS}
 
   async function startVM() {
     if (vmActive) return;
-    if (!REALTIME_WS_BASE) { addBotMsg('Voice mode is not configured.'); return; }
+    if (!REALTIME_WS_BASE) { addBotMsg(T('Voice mode is not configured.')); return; }
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      addBotMsg('Your browser does not support microphone access. Please use Chrome or Firefox.');
+      addBotMsg(T('Your browser does not support microphone access. Please use Chrome or Firefox.'));
       return;
     }
     vmActive = true;
     if (vMode) vMode.classList.add('on');
     if (vmLangEl) vmLangEl.textContent = (currentLang || 'en').toUpperCase();
-    vmPhase('idle', 'Connecting...', '');
+    vmPhase('idle', T('Connecting...'), '');
 
     var mic;
     try {
@@ -1242,7 +1372,7 @@ ${frontdeskWidget.CSS}
     } catch (err) {
       vmActive = false;
       if (vMode) vMode.classList.remove('on');
-      addBotMsg('Microphone access denied. Please allow microphone access and try again.');
+      addBotMsg(T('Microphone access denied. Please allow microphone access and try again.'));
       return;
     }
     vmMicStream = mic;
@@ -1255,7 +1385,7 @@ ${frontdeskWidget.CSS}
       vmActive = false;
       cleanVM();
       if (vMode) vMode.classList.remove('on');
-      addBotMsg('Voice mode is not supported by your browser.');
+      addBotMsg(T('Voice mode is not supported by your browser.'));
       return;
     }
 
@@ -1266,7 +1396,7 @@ ${frontdeskWidget.CSS}
       vmActive = false;
       cleanVM();
       if (vMode) vMode.classList.remove('on');
-      addBotMsg('Could not connect to voice service. Please try again.');
+      addBotMsg(T('Could not connect to voice service. Please try again.'));
       return;
     }
 
@@ -1274,30 +1404,30 @@ ${frontdeskWidget.CSS}
       try {
         vmWs.send(JSON.stringify({ type: 'session.init', chatbotId: CID, systemPrompt: vmPrompt(), voice: CHAT_VOICE || 'alloy', language: currentLang || 'en', languages: LANGUAGES || [] }));
       } catch(e) { console.error('[vm] init send failed:', e.message); }
-      vmPhase('thinking', 'Connecting to AI...', '');
+      vmPhase('thinking', T('Connecting to AI...'), '');
     };
 
     vmWs.onmessage = function(event) {
       if (!vmActive) return;
       if (event.data instanceof ArrayBuffer) { playPCM(event.data); return; }
       var msg; try { msg = JSON.parse(event.data); } catch { return; }
-      if (msg.type === 'session.connecting') { vmPhase('thinking', 'Connecting to AI...', ''); }
+      if (msg.type === 'session.connecting') { vmPhase('thinking', T('Connecting to AI...'), ''); }
       else if (msg.type === 'session.ready') {
         micStream(mic, vmAudioCtx);
-        vmPhase('listening', 'Listening... speak now', 'I will reply instantly when you pause.');
+        vmPhase('listening', T('Listening... speak now'), T('I will reply instantly when you pause.'));
       }
-      else if (msg.type === 'input_audio_buffer.speech_started') { stopPCM(); vmPhase('listening', 'Listening...', ''); }
-      else if (msg.type === 'input_audio_buffer.speech_stopped' || msg.type === 'input_audio_buffer.committed') { vmPhase('thinking', 'Thinking...', ''); }
+      else if (msg.type === 'input_audio_buffer.speech_started') { stopPCM(); vmPhase('listening', T('Listening...'), ''); }
+      else if (msg.type === 'input_audio_buffer.speech_stopped' || msg.type === 'input_audio_buffer.committed') { vmPhase('thinking', T('Thinking...'), ''); }
       else if ((msg.type === 'response.output_audio.delta' || msg.type === 'response.audio.delta') && msg.delta) {
         // OpenAI Realtime audio arrives as base64 PCM16 JSON deltas on the proxy path.
         // Keep binary frame support too, so the previous working milestone remains safe.
         var audioAb = b64ToArrayBuffer(msg.delta);
         if (audioAb && audioAb.byteLength) playPCM(audioAb);
-        vmPhase('speaking', 'Speaking...', 'Tap end to stop.');
+        vmPhase('speaking', T('Speaking...'), T('Tap end to stop.'));
       }
-      else if (msg.type === 'response.created') { vmPhase('speaking', 'Speaking...', 'Tap end to stop.'); }
+      else if (msg.type === 'response.created') { vmPhase('speaking', T('Speaking...'), T('Tap end to stop.')); }
       else if (msg.type === 'response.done' || msg.type === 'response.audio.done') {
-        var waitT = setInterval(function() { if (!vmPlaying && !vmPlayQueue.length) { clearInterval(waitT); if (vmActive) vmPhase('listening', 'Listening...', 'I will reply instantly when you pause.'); } }, 80);
+        var waitT = setInterval(function() { if (!vmPlaying && !vmPlayQueue.length) { clearInterval(waitT); if (vmActive) vmPhase('listening', T('Listening...'), T('I will reply instantly when you pause.')); } }, 80);
       }
       else if (msg.type === 'conversation.item.input_audio_transcription.completed') { var t=(msg.transcript||'').trim(); if(t) addUserMsg(t); }
       else if (msg.type === 'response.audio_transcript.done') { var at=(msg.transcript||'').trim(); if(at) addBotMsg(at); }
@@ -1305,7 +1435,7 @@ ${frontdeskWidget.CSS}
         console.error('[vm] error:', msg.error || msg.message); 
         var errMsg = msg.message || (msg.error && msg.error.message) || 'Voice mode encountered an error';
         stopVM();
-        addBotMsg('Sorry, ' + errMsg + '. Please try text chat instead.');
+        addBotMsg(T('Voice mode encountered an error. Please try text chat instead.'));
       }
     };
 
@@ -1316,7 +1446,7 @@ ${frontdeskWidget.CSS}
       vmActive = false;
       stopPCM(); cleanVM();
       if (vMode) vMode.classList.remove('on');
-      if (ev.code !== 1000) addBotMsg('Voice connection lost. Please try again.');
+      if (ev.code !== 1000) addBotMsg(T('Voice connection lost. Please try again.'));
     };
   }
 
@@ -1445,7 +1575,7 @@ ${frontdeskWidget.CSS}
     spk.onclick = function() {
       speakMode = !speakMode;
       spk.classList.toggle('on', speakMode);
-      spk.title = speakMode ? 'Voice replies on' : 'Voice replies off';
+      spk.title = T(speakMode ? 'Voice replies on' : 'Voice replies off');
       if (icoSpkOff) icoSpkOff.style.display = speakMode ? 'none' : '';
       if (icoSpkOn)  icoSpkOn.style.display  = speakMode ? '' : 'none';
       if (!speakMode) stopTTSPlayback();
@@ -1512,7 +1642,7 @@ ${frontdeskWidget.CSS}
       })
       .catch(function(err) {
         console.error('Mic denied', err);
-        addBotMsg('I need microphone access to record. Please allow access and try again.');
+        addBotMsg(T('I need microphone access to record. Please allow access and try again.'));
       });
   }
 
@@ -1546,7 +1676,7 @@ ${frontdeskWidget.CSS}
       addBotMsg("I couldn't transcribe that audio. Please try again.");
     })
     .finally(function() {
-      if (ci) { ci.disabled = false; ci.placeholder = PLACEHOLDER; }
+      if (ci) { ci.disabled = false; ci.placeholder = CONTENT.placeholder || PLACEHOLDER; }
       if (mic) mic.disabled = false;
       if (sb) sb.disabled = !(ci && ci.value.trim());
     });
@@ -1594,7 +1724,7 @@ ${frontdeskWidget.CSS}
     var botMsgs  = history.filter(function(m){ return m.role === 'model'; }).length;
     if (userMsgs < 1 || botMsgs < 2) return;
     leadAttempts++;
-    setTimeout(function() { addBotMsg('To serve you better, may I get your ' + LEAD_ASK + '?'); renderLeadForm(); }, 600);
+    setTimeout(function() { addBotMsg(CONTENT.leadAsk || ('To serve you better, may I get your ' + LEAD_ASK + '?')); renderLeadForm(); }, 600);
   }
 
   function renderLeadForm() {
@@ -1607,17 +1737,20 @@ ${frontdeskWidget.CSS}
     if (has('email')) contact.push('email');
     if (has('phone')) contact.push('phone');
     var contactWords = contact.length > 1 ? 'one of email or phone' : (contact[0] === 'phone' ? 'phone number' : 'email');
-    var hint = has('name') ? ('Name and ' + contactWords + (contact.length > 1 ? ' is required.' : ' are required.')) : (contactWords.charAt(0).toUpperCase() + contactWords.slice(1) + ' is required.');
+    var both = contact.length > 1, onlyPhone = contact[0] === 'phone';
+    var hint = TH(has('name')
+      ? (both ? 'Your name and an email or phone number are required.' : (onlyPhone ? 'Your name and phone number are required.' : 'Your name and email are required.'))
+      : (both ? 'An email or phone number is required.' : (onlyPhone ? 'A phone number is required.' : 'An email is required.')));
     var form = document.createElement('div');
     form.className = 'leadForm'; form.id = 'leadForm';
-    var html = '<div class="lfTitle">Quick details</div><div class="lfHint">' + hint + '</div>';
-    if (has('name')) html += '<div class="lfField"><label class="lfLabel">Name *</label><input class="lfInput" id="lfName" type="text" autocomplete="name"/></div>';
+    var html = '<div class="lfTitle">' + TH('Quick details') + '</div><div class="lfHint">' + hint + '</div>';
+    if (has('name')) html += '<div class="lfField"><label class="lfLabel">' + TH('Name *') + '</label><input class="lfInput" id="lfName" type="text" autocomplete="name"/></div>';
     var row = '';
-    if (has('phone')) row += '<div class="lfField"><label class="lfLabel">Phone</label><input class="lfInput" id="lfPhone" type="tel" autocomplete="tel"/></div>';
-    if (has('email')) row += '<div class="lfField"><label class="lfLabel">Email</label><input class="lfInput" id="lfEmail" type="email" autocomplete="email"/></div>';
+    if (has('phone')) row += '<div class="lfField"><label class="lfLabel">' + TH('Phone') + '</label><input class="lfInput" id="lfPhone" type="tel" autocomplete="tel"/></div>';
+    if (has('email')) row += '<div class="lfField"><label class="lfLabel">' + TH('Email') + '</label><input class="lfInput" id="lfEmail" type="email" autocomplete="email"/></div>';
     if (row) html += '<div class="lfRow">' + row + '</div>';
-    if (has('reason')) html += '<div class="lfField"><label class="lfLabel">What do you need help with?</label><input class="lfInput" id="lfReason" type="text"/></div>';
-    html += '<div class="lfError" id="lfError"></div><div class="lfActions"><button class="lfSubmit" type="button" id="lfSubmit">Save details</button></div>';
+    if (has('reason')) html += '<div class="lfField"><label class="lfLabel">' + TH('What do you need help with?') + '</label><input class="lfInput" id="lfReason" type="text"/></div>';
+    html += '<div class="lfError" id="lfError"></div><div class="lfActions"><button class="lfSubmit" type="button" id="lfSubmit">' + TH('Save details') + '</button></div>';
     form.innerHTML = html;
     msgs.appendChild(form); msgs.scrollTop = msgs.scrollHeight;
     var nEl = form.querySelector('#lfName'), pEl = form.querySelector('#lfPhone');
@@ -1629,8 +1762,8 @@ ${frontdeskWidget.CSS}
     function sub() {
       errEl.style.display = 'none';
       var name = val(nEl), phone = val(pEl), email = val(eEl), reason = val(rEl);
-      if (nEl && !name) { showErr('Please enter your name.'); return; }
-      if (!phone && !email) { showErr('Please enter your ' + (contact.length > 1 ? 'phone number or email' : contactWords) + '.'); return; }
+      if (nEl && !name) { showErr(T('Please enter your name.')); return; }
+      if (!phone && !email) { showErr(T(contact.length > 1 ? 'Please enter your phone number or email.' : (contact[0] === 'phone' ? 'Please enter your phone number.' : 'Please enter your email.'))); return; }
       subBtn.disabled = true; subBtn.textContent = '...';
       fetch(API + '/api/chatbot-public/capture-lead', {
         method: 'POST', headers: {'Content-Type':'application/json'},
@@ -1642,9 +1775,9 @@ ${frontdeskWidget.CSS}
         if (d && d.mediaToken && window.__agentlySetMediaToken) window.__agentlySetMediaToken(d.mediaToken);
         form.style.opacity = '0.5'; leadFormVisible = false;
         ci.disabled = false; sb.disabled = !ci.value.trim();
-        addBotMsg(d && d.deduped ? 'Thank you — I found your existing details. How else can I help you?' : 'Thank you! How else can I help you?');
+        addBotMsg(d && d.deduped ? T('Thank you — I found your existing details. How else can I help you?') : T('Thank you! How else can I help you?'));
       })
-      .catch(function() { subBtn.disabled = false; subBtn.textContent = 'Save details'; showErr('Could not save details. Please try again.'); });
+      .catch(function() { subBtn.disabled = false; subBtn.textContent = T('Save details'); showErr(T('Could not save details. Please try again.')); });
     }
     subBtn.onclick = sub;
     [nEl, pEl, eEl, rEl].filter(Boolean).forEach(function(el){ el.addEventListener('keydown', function(e){ if(e.key==='Enter'){e.preventDefault();sub();} }); });
@@ -1653,6 +1786,10 @@ ${frontdeskWidget.CSS}
 ${mediaWidget.SCRIPT}
 ${frontdeskWidget.SCRIPT}
   /* ========================================================= */
+
+  // Start in the visitor's language (saved choice, else browser language if
+  // this chatbot offers it). English-primary chatbots in English need no call.
+  if (!(currentLang === 'en' && PRIMARY_LANG === 'en')) setLanguage(currentLang);
 })();
 </script>
 </body>
@@ -1660,3 +1797,5 @@ ${frontdeskWidget.SCRIPT}
 }
 
 module.exports = router;
+// For tests: render the widget page from a config object.
+module.exports.buildWidgetHtml = buildWidgetHtml;
