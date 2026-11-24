@@ -35,6 +35,52 @@ const {
 const router = express.Router();
 const nowIso = () => new Date().toISOString();
 
+/*
+ * The API only QUEUES a scrape; the scrape worker in agently-ws-server claims
+ * and runs it. When no worker is running (flag off, service scaled down) a job
+ * stayed `queued` forever: the UI sat at 0%, and the job blocked every retry
+ * with JOB_ALREADY_RUNNING. A job no worker has claimed within this window is
+ * now closed as failed with a message the tenant can act on.
+ */
+const UNCLAIMED_JOB_STALE_MS =
+  Math.max(1, Number(process.env.SCRAPE_QUEUE_STALE_MINUTES) || 10) * 60 * 1000;
+const UNCLAIMED_JOB_MESSAGE =
+  "The website reader didn't pick this scan up. Nothing was charged. Please start the scan again; if it stalls again, contact support.";
+
+function isUnclaimedAndStale(job, now = Date.now()) {
+  if (!job || job.status !== "queued" || job.claimed_by || job.started_at) return false;
+  const created = Date.parse(job.created_at || "");
+  return Number.isFinite(created) && now - created > UNCLAIMED_JOB_STALE_MS;
+}
+
+async function expireUnclaimedJob(db, job) {
+  const stamp = nowIso();
+  const { data: closed } = await db
+    .from("knowledge_scrape_jobs")
+    .update({ status: "failed", last_error: UNCLAIMED_JOB_MESSAGE, completed_at: stamp, updated_at: stamp })
+    .eq("id", job.id)
+    .eq("organization_id", job.organization_id)
+    .eq("status", "queued")
+    .is("claimed_by", null)
+    .select("id");
+  // A worker claimed it in the meantime: leave it alone.
+  if (!closed || closed.length === 0) return false;
+  await db
+    .from("knowledge_discovered_pages")
+    .update({ scrape_status: "pending", scrape_progress: 0, updated_at: stamp })
+    .eq("discovery_id", job.discovery_id)
+    .eq("organization_id", job.organization_id)
+    .eq("scrape_status", "queued");
+  await db
+    .from("knowledge_bases")
+    .update({ sync_status: "failed", updated_at: stamp })
+    .eq("id", job.knowledge_base_id)
+    .eq("organization_id", job.organization_id)
+    .eq("sync_status", "scraping");
+  console.warn(`[knowledge-scrape] job ${job.id} expired: never claimed by a scrape worker`);
+  return true;
+}
+
 /** Estimated tenant cost of scraping N pages. Drives the burn-rate warning. */
 function estimateScrapeCostUsd(pageCount) {
   const perPage = Number(process.env.BILLING_SCRAPE_PER_PAGE_USD || 0.02);
@@ -402,14 +448,18 @@ router.post(
     // workers scraping the same pages and double-charging.
     const { data: existingJobs, error: existingJobError } = await db
       .from("knowledge_scrape_jobs")
-      .select("id,status")
+      .select("id,status,claimed_by,started_at,created_at,discovery_id,knowledge_base_id,organization_id")
       .eq("knowledge_base_id", knowledgeBaseId)
       .eq("organization_id", req.orgId)
       .in("status", ["queued", "running", "paused"])
       .order("created_at", { ascending: false })
       .limit(1);
     if (existingJobError) throw existingJobError;
-    const existing = existingJobs?.[0] || null;
+    let existing = existingJobs?.[0] || null;
+    // A job no worker ever claimed must not block a retry forever.
+    if (existing && isUnclaimedAndStale(existing) && (await expireUnclaimedJob(db, existing))) {
+      existing = null;
+    }
 
     if (existing) {
       return res.status(409).json({
@@ -516,7 +566,7 @@ router.get(
 
     const { data: jobs, error } = await db
       .from("knowledge_scrape_jobs")
-      .select("id,status,discovery_id,created_at")
+      .select("id,status,discovery_id,created_at,claimed_by,started_at,knowledge_base_id,organization_id")
       .eq("organization_id", req.orgId)
       .eq("knowledge_base_id", req.params.knowledgeBaseId)
       .in("status", ["queued", "running", "paused"])
@@ -524,7 +574,10 @@ router.get(
       .limit(1);
     if (error) throw error;
 
-    const active = Array.isArray(jobs) ? jobs[0] : null;
+    let active = Array.isArray(jobs) ? jobs[0] : null;
+    if (active && isUnclaimedAndStale(active) && (await expireUnclaimedJob(db, active))) {
+      active = null;
+    }
     return res.json({
       job: active
         ? {
@@ -556,6 +609,13 @@ router.get(
     if (!job) {
       return res.status(404).json({ error: { message: "Job not found." } });
     }
+    if (isUnclaimedAndStale(job) && (await expireUnclaimedJob(db, job))) {
+      job.status = "failed";
+      job.last_error = UNCLAIMED_JOB_MESSAGE;
+    }
+    // Queued but not yet picked up by a worker: the UI shows "waiting" rather
+    // than a 0% bar that looks like it is reading.
+    const waitingForWorker = job.status === "queued" && !job.claimed_by && !job.started_at;
 
     const { data: pages } = await db
       .from("knowledge_discovered_pages")
@@ -580,6 +640,8 @@ router.get(
         lastError: job.last_error,
         startedAt: job.started_at,
         completedAt: job.completed_at,
+        createdAt: job.created_at,
+        waitingForWorker,
       },
       // The UI updates ONLY these cards. It must never re-fetch the whole
       // knowledge base list on a tick — that is what caused the glitching.

@@ -48,3 +48,5 @@ require("./transfer-status-route.test");
 require("./chat-media.test");
 require("./chat-media-widget.test");
 require("./frontdesk.test");
+require("./chatbot-lead-settings.test");
+require("./sms-and-feature-flags.test");

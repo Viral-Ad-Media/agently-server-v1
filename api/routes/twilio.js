@@ -111,7 +111,7 @@ const {
 
 const router = express.Router();
 // These endpoints are called by the provider, not authenticated browsers.
-const signedProviderPaths=new Set(['/voice-inbound','/incoming-call','/voice','/inbound','/inbound-call','/outbound-twiml','/transfer-status','/amd-status','/call-status','/recording-status','/sms-inbound','/voice-app','/import/challenge-callback']);
+const signedProviderPaths=new Set(['/voice-inbound','/incoming-call','/voice','/inbound','/inbound-call','/outbound-twiml','/transfer-status','/transfer-whisper','/transfer-whisper-result','/amd-status','/call-status','/recording-status','/sms-inbound','/voice-app','/import/challenge-callback']);
 router.use((req,res,next)=>signedProviderPaths.has(req.path.toLowerCase().replace(/\/+$/,''))?require('../../lib/twilio-request-auth').requireTwilio(req,res,next):next());
 
 const API_URL = require("../../lib/backend-url").getBackendBaseUrl;
@@ -446,6 +446,7 @@ function mediaStreamUrl(params) {
       "selectedVoiceId",
       "selectedVoiceName",
       "transferResume",
+      "transferBrief",
     ]);
     Object.entries(params || {}).forEach(([key, value]) => {
       if (!criticalKeys.has(key)) return;
@@ -484,6 +485,7 @@ function buildRealtimeTwiml({
   precomputedNormalizedPurpose = "",
   accountSid = "",
   transferResume = "",
+  transferBrief = "",
 }) {
   const normalizedPurpose =
     precomputedNormalizedPurpose ||
@@ -644,6 +646,8 @@ function buildRealtimeTwiml({
     platformTestEventId: platformTestEventId || "",
     // "failed" when /transfer-status reconnects a caller after an unanswered transfer.
     transferResume: transferResume || "",
+    // What the caller needed, so the agent doesn't make them repeat it.
+    transferBrief: String(transferBrief || "").slice(0, 300),
   };
   console.log("[twilio-stream] voice params", {
     callSid: streamParams.callSid || "",
@@ -1403,9 +1407,10 @@ router.post(
     const callSid = String(body.CallSid || "").trim();
     const dialStatus = String(body.DialCallStatus || "").trim().toLowerCase();
     const bridged = transferFlow.isBridged(body);
+    const declined = transferFlow.answeredButNotBridged(body);
     const attempt = transferFlow.clampAttempts(query.attempt, 1);
     const maxAttempts = transferFlow.clampAttempts(query.max);
-    const step = transferFlow.nextTransferStep({ bridged, attempt, maxAttempts });
+    const step = transferFlow.nextTransferStep({ bridged, attempt, maxAttempts, declined });
     const db = getSupabase();
 
     if (callSid) {
@@ -1426,7 +1431,8 @@ router.post(
               bridged,
               dial_call_sid: String(body.DialCallSid || "").trim(),
               dial_duration_seconds: Number(body.DialCallDuration || 0) || 0,
-              outcome: step === "hangup" ? "connected" : step === "retry" ? "retrying" : "returned_to_agent",
+              outcome: step === "hangup" ? "connected" : step === "retry" ? "retrying" : declined ? "declined_returned_to_agent" : "returned_to_agent",
+              manager_declined: declined || undefined,
               completed_at: step === "retry" ? null : new Date().toISOString(),
             },
           },
@@ -1456,8 +1462,13 @@ router.post(
       const number = transferFlow.transferNumberForAgent(agent);
       if (number) {
         const actionUrl = transferFlow.nextAttemptActionUrl(API_URL(), query, attempt + 1);
+        const whisperUrl = transferFlow.transferWhisperUrl(actionUrl, {
+          brief: String(query.brief || ""),
+          businessName: String(query.biz || ""),
+          parentCallSid: callSid,
+        });
         console.log("[call-transfer] retrying", { callSid, attempt: attempt + 1, maxAttempts, dialStatus });
-        return res.send(transferFlow.buildRetryTwiml(number, actionUrl));
+        return res.send(transferFlow.buildRetryTwiml(number, actionUrl, whisperUrl));
       }
     }
 
@@ -1485,10 +1496,48 @@ router.post(
           callPurpose: String(query.callPurpose || "").trim(),
           accountSid: String(query.accountSid || "").trim(),
           transferResume: "failed",
+          transferBrief: String(query.brief || "").trim(),
         }),
       );
     }
     return res.send(transferFlow.UNAVAILABLE_TWIML);
+  }),
+);
+
+// The manager's side of a transfer, before the caller is connected. Twilio
+// runs this on the dialled leg (<Number url>) while the caller hears ringing.
+router.post(
+  "/transfer-whisper",
+  asyncHandler(async (req, res) => {
+    const query = req.query || {};
+    const resultUrl = new URL(
+      "/api/twilio/transfer-whisper-result",
+      `${String(API_URL() || "").replace(/\/+$/, "")}/`,
+    );
+    if (query.parentCallSid) resultUrl.searchParams.set("parentCallSid", String(query.parentCallSid));
+    res.setHeader("Content-Type", "text/xml");
+    res.send(
+      transferFlow.buildWhisperTwiml({
+        brief: String(query.brief || ""),
+        businessName: String(query.biz || ""),
+        resultUrl: /^https:\/\//i.test(resultUrl.toString()) ? resultUrl.toString() : "",
+      }),
+    );
+  }),
+);
+
+// Yes / 1 connects the caller; anything else ends only the manager's leg and
+// /transfer-status returns the caller to the agent.
+router.post(
+  "/transfer-whisper-result",
+  asyncHandler(async (req, res) => {
+    const accepted = transferFlow.managerAccepted(req.body || {});
+    console.log("[call-transfer] manager answered the brief", {
+      parentCallSid: String(req.query?.parentCallSid || ""),
+      accepted,
+    });
+    res.setHeader("Content-Type", "text/xml");
+    res.send(transferFlow.buildWhisperResultTwiml(accepted));
   }),
 );
 

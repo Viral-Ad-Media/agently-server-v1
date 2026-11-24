@@ -317,6 +317,54 @@ router.post(
 
 router.use(requireSuperAdmin);
 
+// ── Feature kill switches (lib/feature-flags.js) ───────────────
+// Production obeys these; a local API always shows every feature.
+router.get(
+  "/feature-flags",
+  asyncHandler(async (_req, res) => {
+    const flags = require("../../lib/feature-flags");
+    const stored = await flags.getStoredFeatureFlags({ fresh: true });
+    res.json({
+      features: flags.describeFeatures(stored),
+      enforcedHere: flags.featureFlagsEnforced(),
+    });
+  }),
+);
+
+router.patch(
+  "/feature-flags/:key",
+  asyncHandler(async (req, res) => {
+    const flags = require("../../lib/feature-flags");
+    const key = String(req.params.key || "");
+    if (!Object.prototype.hasOwnProperty.call(flags.FEATURES, key)) {
+      return res.status(400).json({ error: { message: "Unknown feature." } });
+    }
+    if (typeof req.body?.enabled !== "boolean") {
+      return res.status(400).json({ error: { message: "enabled must be true or false." } });
+    }
+    let stored;
+    try {
+      stored = await flags.setFeatureFlag(key, req.body.enabled, req.superAdmin?.email);
+    } catch (error) {
+      return res.status(500).json({
+        error: {
+          message:
+            "Could not save the switch. Apply migrations/20261124_platform_feature_flags.sql first.",
+          details: error?.message,
+        },
+      });
+    }
+    await logSecurityEvent(req, "feature_flag_changed", true, {
+      feature: key,
+      enabled: req.body.enabled,
+    });
+    res.json({
+      features: flags.describeFeatures(stored),
+      enforcedHere: flags.featureFlagsEnforced(),
+    });
+  }),
+);
+
 router.get("/auth/session", (req, res) => {
   res.json({ authenticated: true, email: req.superAdmin.email });
 });

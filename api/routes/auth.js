@@ -373,9 +373,16 @@ function codeFailureResponse(res, result) {
 // GET /api/auth/config        (public)
 // Lets a client discover the flow without shipping a new build when it changes.
 // ─────────────────────────────────────────────────────────────
-router.get("/config", (_req, res) => {
+router.get("/config", async (_req, res) => {
+  let featureFlags = null;
+  try {
+    featureFlags = await require("../../lib/feature-flags").getFeatureFlags();
+  } catch {
+    featureFlags = null;
+  }
   res.json({
     ...publicAuthConfig(),
+    featureFlags,
     emailVerifyCodeTtlSeconds: CODE_TTL_SECONDS[PURPOSE_EMAIL_VERIFY],
     loginOtpTtlSeconds: CODE_TTL_SECONDS[PURPOSE_LOGIN_OTP],
     codeLength: CODE_LENGTH,

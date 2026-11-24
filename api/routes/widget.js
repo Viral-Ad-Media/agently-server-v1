@@ -9,6 +9,7 @@ const { searchScopedFaqs } = require("../../lib/knowledge-retrieval");
 const { getApiBaseUrl } = require("../../lib/chatbot-widget-utils");
 const mediaWidget = require("../../lib/chat-media-widget");
 const frontdeskWidget = require("../../lib/frontdesk-widget");
+const { chatbotLeadSettings, leadFieldsSentence } = require("../../lib/chatbot-lead-settings");
 
 const router = express.Router();
 
@@ -150,7 +151,10 @@ router.get("/:id", async (req, res) => {
           .replace(/\/ws$/, "")
           .replace(/\/$/, ""),
       ),
-      collectLeads: chatbot.collect_leads !== false,
+      // Lead collection as set in Messenger: off means no form, no prompt.
+      collectLeads: chatbotLeadSettings(chatbot).enabled,
+      leadFields: chatbotLeadSettings(chatbot).fields,
+      leadAsk: leadFieldsSentence(chatbotLeadSettings(chatbot).fields),
       // Customer photo / video uploads. Column defaults to true; undefined
       // (before the migration) also means on.
       mediaUploads: chatbot.media_uploads_enabled !== false,
@@ -680,6 +684,8 @@ ${frontdeskWidget.CSS}
   var CHAT_VOICE = '${cfg.chatVoice}';
   var REALTIME_WS_BASE = '${cfg.realtimeWsUrl}';
   var COLLECT_LEADS = ${cfg.collectLeads};
+  var LEAD_FIELDS = ${JSON.stringify(cfg.leadFields)};
+  var LEAD_ASK = ${JSON.stringify(cfg.leadAsk)};
   var MEDIA_UPLOADS_ENABLED = ${cfg.mediaUploads === true};
   var STORAGE_KEY = 'agently:' + CID;
   var IDLE_TTL_MS = 5 * 60 * 1000; // Clear local widget chat cache only after the widget has been closed for 5 minutes
@@ -1113,37 +1119,47 @@ ${frontdeskWidget.CSS}
     var botMsgs  = history.filter(function(m){ return m.role === 'model'; }).length;
     if (userMsgs < 1 || botMsgs < 2) return;
     leadAttempts++;
-    setTimeout(function() { addBotMsg('To serve you better, may I get your name and contact details (phone or email)?'); renderLeadForm(); }, 600);
+    setTimeout(function() { addBotMsg('To serve you better, may I get your ' + LEAD_ASK + '?'); renderLeadForm(); }, 600);
   }
 
   function renderLeadForm() {
+    if (!COLLECT_LEADS) return;
     if (leadFormVisible || leadAlreadyCaptured()) return;
     leadFormVisible = true;
     ci.disabled = true; sb.disabled = true;
+    var has = function(k) { return LEAD_FIELDS.indexOf(k) !== -1; };
+    var contact = [];
+    if (has('email')) contact.push('email');
+    if (has('phone')) contact.push('phone');
+    var contactWords = contact.length > 1 ? 'one of email or phone' : (contact[0] === 'phone' ? 'phone number' : 'email');
+    var hint = has('name') ? ('Name and ' + contactWords + (contact.length > 1 ? ' is required.' : ' are required.')) : (contactWords.charAt(0).toUpperCase() + contactWords.slice(1) + ' is required.');
     var form = document.createElement('div');
     form.className = 'leadForm'; form.id = 'leadForm';
-    form.innerHTML = '<div class="lfTitle">Quick details</div>'
-      + '<div class="lfHint">Name and one of email or phone is required.</div>'
-      + '<div class="lfField"><label class="lfLabel">Name *</label><input class="lfInput" id="lfName" type="text" autocomplete="name"/></div>'
-      + '<div class="lfRow"><div class="lfField"><label class="lfLabel">Phone</label><input class="lfInput" id="lfPhone" type="tel"/></div>'
-      + '<div class="lfField"><label class="lfLabel">Email</label><input class="lfInput" id="lfEmail" type="email"/></div></div>'
-      + '<div class="lfError" id="lfError"></div>'
-      + '<div class="lfActions"><button class="lfSubmit" type="button" id="lfSubmit">Save details</button></div>';
+    var html = '<div class="lfTitle">Quick details</div><div class="lfHint">' + hint + '</div>';
+    if (has('name')) html += '<div class="lfField"><label class="lfLabel">Name *</label><input class="lfInput" id="lfName" type="text" autocomplete="name"/></div>';
+    var row = '';
+    if (has('phone')) row += '<div class="lfField"><label class="lfLabel">Phone</label><input class="lfInput" id="lfPhone" type="tel" autocomplete="tel"/></div>';
+    if (has('email')) row += '<div class="lfField"><label class="lfLabel">Email</label><input class="lfInput" id="lfEmail" type="email" autocomplete="email"/></div>';
+    if (row) html += '<div class="lfRow">' + row + '</div>';
+    if (has('reason')) html += '<div class="lfField"><label class="lfLabel">What do you need help with?</label><input class="lfInput" id="lfReason" type="text"/></div>';
+    html += '<div class="lfError" id="lfError"></div><div class="lfActions"><button class="lfSubmit" type="button" id="lfSubmit">Save details</button></div>';
+    form.innerHTML = html;
     msgs.appendChild(form); msgs.scrollTop = msgs.scrollHeight;
     var nEl = form.querySelector('#lfName'), pEl = form.querySelector('#lfPhone');
-    var eEl = form.querySelector('#lfEmail'), errEl = form.querySelector('#lfError');
+    var eEl = form.querySelector('#lfEmail'), rEl = form.querySelector('#lfReason'), errEl = form.querySelector('#lfError');
     var subBtn = form.querySelector('#lfSubmit');
-    setTimeout(function(){ try { nEl.focus(); } catch(_){} }, 100);
+    setTimeout(function(){ try { form.querySelector('.lfInput').focus(); } catch(_){} }, 100);
     function showErr(m) { errEl.textContent = m; errEl.style.display = 'block'; }
+    function val(el) { return el ? (el.value || '').trim() : ''; }
     function sub() {
       errEl.style.display = 'none';
-      var name = (nEl.value||'').trim(), phone = (pEl.value||'').trim(), email = (eEl.value||'').trim();
-      if (!name) { showErr('Please enter your name.'); return; }
-      if (!phone && !email) { showErr('Please enter a phone number or email.'); return; }
+      var name = val(nEl), phone = val(pEl), email = val(eEl), reason = val(rEl);
+      if (nEl && !name) { showErr('Please enter your name.'); return; }
+      if (!phone && !email) { showErr('Please enter your ' + (contact.length > 1 ? 'phone number or email' : contactWords) + '.'); return; }
       subBtn.disabled = true; subBtn.textContent = '...';
       fetch(API + '/api/chatbot-public/capture-lead', {
         method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ chatbotId: CID, name: name, phone: phone, email: email, sessionId: (window.__agentlyMediaSessionId ? window.__agentlyMediaSessionId() : undefined) })
+        body: JSON.stringify({ chatbotId: CID, name: name, phone: phone, email: email, reason: reason || undefined, sessionId: (window.__agentlyMediaSessionId ? window.__agentlyMediaSessionId() : undefined) })
       })
       .then(function(r) { if (!r.ok) throw new Error('failed'); return r.json(); })
       .then(function(d) {
@@ -1156,7 +1172,7 @@ ${frontdeskWidget.CSS}
       .catch(function() { subBtn.disabled = false; subBtn.textContent = 'Save details'; showErr('Could not save details. Please try again.'); });
     }
     subBtn.onclick = sub;
-    [nEl, pEl, eEl].forEach(function(el){ el.addEventListener('keydown', function(e){ if(e.key==='Enter'){e.preventDefault();sub();} }); });
+    [nEl, pEl, eEl, rEl].filter(Boolean).forEach(function(el){ el.addEventListener('keydown', function(e){ if(e.key==='Enter'){e.preventDefault();sub();} }); });
   }
 
   /* =========================================================
@@ -1189,7 +1205,8 @@ ${frontdeskWidget.CSS}
     ];
     if (LANGUAGES && LANGUAGES.length > 0) {
       var ln = LANGUAGES.map(function(l){ return LANG_NAMES[l] || l.toUpperCase(); });
-      parts.push('Respond ONLY in: ' + ln.join(' or ') + '. Never switch languages.');
+      var cur = LANG_NAMES[currentLang] || ln[0];
+      parts.push('Speak in ' + cur + '. Only switch if the visitor speaks one of: ' + ln.join(', ') + '.');
     }
     if (FAQS && FAQS.length > 0) {
       var q = [];
@@ -1255,7 +1272,7 @@ ${frontdeskWidget.CSS}
 
     vmWs.onopen = function() {
       try {
-        vmWs.send(JSON.stringify({ type: 'session.init', chatbotId: CID, systemPrompt: vmPrompt(), voice: CHAT_VOICE || 'alloy' }));
+        vmWs.send(JSON.stringify({ type: 'session.init', chatbotId: CID, systemPrompt: vmPrompt(), voice: CHAT_VOICE || 'alloy', language: currentLang || 'en', languages: LANGUAGES || [] }));
       } catch(e) { console.error('[vm] init send failed:', e.message); }
       vmPhase('thinking', 'Connecting to AI...', '');
     };
@@ -1577,37 +1594,47 @@ ${frontdeskWidget.CSS}
     var botMsgs  = history.filter(function(m){ return m.role === 'model'; }).length;
     if (userMsgs < 1 || botMsgs < 2) return;
     leadAttempts++;
-    setTimeout(function() { addBotMsg('To serve you better, may I get your name and contact details (phone or email)?'); renderLeadForm(); }, 600);
+    setTimeout(function() { addBotMsg('To serve you better, may I get your ' + LEAD_ASK + '?'); renderLeadForm(); }, 600);
   }
 
   function renderLeadForm() {
+    if (!COLLECT_LEADS) return;
     if (leadFormVisible || leadAlreadyCaptured()) return;
     leadFormVisible = true;
     ci.disabled = true; sb.disabled = true;
+    var has = function(k) { return LEAD_FIELDS.indexOf(k) !== -1; };
+    var contact = [];
+    if (has('email')) contact.push('email');
+    if (has('phone')) contact.push('phone');
+    var contactWords = contact.length > 1 ? 'one of email or phone' : (contact[0] === 'phone' ? 'phone number' : 'email');
+    var hint = has('name') ? ('Name and ' + contactWords + (contact.length > 1 ? ' is required.' : ' are required.')) : (contactWords.charAt(0).toUpperCase() + contactWords.slice(1) + ' is required.');
     var form = document.createElement('div');
     form.className = 'leadForm'; form.id = 'leadForm';
-    form.innerHTML = '<div class="lfTitle">Quick details</div>'
-      + '<div class="lfHint">Name and one of email or phone is required.</div>'
-      + '<div class="lfField"><label class="lfLabel">Name *</label><input class="lfInput" id="lfName" type="text" autocomplete="name"/></div>'
-      + '<div class="lfRow"><div class="lfField"><label class="lfLabel">Phone</label><input class="lfInput" id="lfPhone" type="tel"/></div>'
-      + '<div class="lfField"><label class="lfLabel">Email</label><input class="lfInput" id="lfEmail" type="email"/></div></div>'
-      + '<div class="lfError" id="lfError"></div>'
-      + '<div class="lfActions"><button class="lfSubmit" type="button" id="lfSubmit">Save details</button></div>';
+    var html = '<div class="lfTitle">Quick details</div><div class="lfHint">' + hint + '</div>';
+    if (has('name')) html += '<div class="lfField"><label class="lfLabel">Name *</label><input class="lfInput" id="lfName" type="text" autocomplete="name"/></div>';
+    var row = '';
+    if (has('phone')) row += '<div class="lfField"><label class="lfLabel">Phone</label><input class="lfInput" id="lfPhone" type="tel" autocomplete="tel"/></div>';
+    if (has('email')) row += '<div class="lfField"><label class="lfLabel">Email</label><input class="lfInput" id="lfEmail" type="email" autocomplete="email"/></div>';
+    if (row) html += '<div class="lfRow">' + row + '</div>';
+    if (has('reason')) html += '<div class="lfField"><label class="lfLabel">What do you need help with?</label><input class="lfInput" id="lfReason" type="text"/></div>';
+    html += '<div class="lfError" id="lfError"></div><div class="lfActions"><button class="lfSubmit" type="button" id="lfSubmit">Save details</button></div>';
+    form.innerHTML = html;
     msgs.appendChild(form); msgs.scrollTop = msgs.scrollHeight;
     var nEl = form.querySelector('#lfName'), pEl = form.querySelector('#lfPhone');
-    var eEl = form.querySelector('#lfEmail'), errEl = form.querySelector('#lfError');
+    var eEl = form.querySelector('#lfEmail'), rEl = form.querySelector('#lfReason'), errEl = form.querySelector('#lfError');
     var subBtn = form.querySelector('#lfSubmit');
-    setTimeout(function(){ try { nEl.focus(); } catch(_){} }, 100);
+    setTimeout(function(){ try { form.querySelector('.lfInput').focus(); } catch(_){} }, 100);
     function showErr(m) { errEl.textContent = m; errEl.style.display = 'block'; }
+    function val(el) { return el ? (el.value || '').trim() : ''; }
     function sub() {
       errEl.style.display = 'none';
-      var name = (nEl.value||'').trim(), phone = (pEl.value||'').trim(), email = (eEl.value||'').trim();
-      if (!name) { showErr('Please enter your name.'); return; }
-      if (!phone && !email) { showErr('Please enter a phone number or email.'); return; }
+      var name = val(nEl), phone = val(pEl), email = val(eEl), reason = val(rEl);
+      if (nEl && !name) { showErr('Please enter your name.'); return; }
+      if (!phone && !email) { showErr('Please enter your ' + (contact.length > 1 ? 'phone number or email' : contactWords) + '.'); return; }
       subBtn.disabled = true; subBtn.textContent = '...';
       fetch(API + '/api/chatbot-public/capture-lead', {
         method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ chatbotId: CID, name: name, phone: phone, email: email, sessionId: (window.__agentlyMediaSessionId ? window.__agentlyMediaSessionId() : undefined) })
+        body: JSON.stringify({ chatbotId: CID, name: name, phone: phone, email: email, reason: reason || undefined, sessionId: (window.__agentlyMediaSessionId ? window.__agentlyMediaSessionId() : undefined) })
       })
       .then(function(r) { if (!r.ok) throw new Error('failed'); return r.json(); })
       .then(function(d) {
@@ -1620,7 +1647,7 @@ ${frontdeskWidget.CSS}
       .catch(function() { subBtn.disabled = false; subBtn.textContent = 'Save details'; showErr('Could not save details. Please try again.'); });
     }
     subBtn.onclick = sub;
-    [nEl, pEl, eEl].forEach(function(el){ el.addEventListener('keydown', function(e){ if(e.key==='Enter'){e.preventDefault();sub();} }); });
+    [nEl, pEl, eEl, rEl].filter(Boolean).forEach(function(el){ el.addEventListener('keydown', function(e){ if(e.key==='Enter'){e.preventDefault();sub();} }); });
   }
 
 ${mediaWidget.SCRIPT}

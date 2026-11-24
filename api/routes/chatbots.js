@@ -239,8 +239,20 @@ router.patch(
     if (body.chatVoice !== undefined) updates.chat_voice = body.chatVoice;
     if (body.chatLanguages !== undefined)
       updates.chat_languages = body.chatLanguages;
-    if (body.collectLeads !== undefined)
+    if (body.collectLeads !== undefined) {
+      // One switch in the dashboard; both columns follow it.
       updates.collect_leads = !!body.collectLeads;
+      updates.lead_capture_enabled = !!body.collectLeads;
+    }
+    if (body.leadCaptureFields !== undefined) {
+      try {
+        updates.lead_capture_fields = require("../../lib/chatbot-lead-settings").validateLeadFieldsForSave(
+          body.leadCaptureFields,
+        );
+      } catch (error) {
+        return res.status(400).json({ error: { message: error.message } });
+      }
+    }
     // Needs migrations/20261113_chat_media.sql; the dashboard only sends it
     // when the owner actually flips the switch.
     if (body.mediaUploadsEnabled !== undefined)

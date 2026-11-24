@@ -573,6 +573,8 @@ safeMount(
   () => require("./routes/email-gmail"),
   "email-gmail",
 );
+// Outbound SMS. Behind the "sms" feature switch (lib/feature-flags.js).
+safeMount("/api/sms", () => require("./routes/sms"), "sms");
 safeMount(
   "/api/operator",
   () => require("./routes/owner-operator"),

@@ -215,7 +215,15 @@ router.get(
       invoices,
     );
 
+    let featureFlags = null;
+    try {
+      featureFlags = await require("../../lib/feature-flags").getFeatureFlags();
+    } catch {
+      featureFlags = null;
+    }
+
     res.json({
+      featureFlags,
       user: serializeUser(req.user),
       organization: serializedOrg,
       leads: leads.map(serializeLead),

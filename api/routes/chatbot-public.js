@@ -20,6 +20,11 @@ const {
   looksUnanswered,
 } = require("../../lib/assistant-intelligence");
 const chatMedia = require("../../lib/chat-media");
+const {
+  chatbotLeadSettings,
+  contactFieldsSentence,
+  leadCapturePromptLines,
+} = require("../../lib/chatbot-lead-settings");
 const chatInbox = require("../../lib/chat-inbox");
 const frontdesk = require("../../lib/frontdesk");
 const frontdeskPublic = require("./frontdesk-public");
@@ -222,23 +227,36 @@ async function captureLead({ chatbotId, organizationId, lead, reason = "" }) {
   const db = getSupabase();
   let orgId = organizationId,
     voiceAgentId = lead.voiceAgentId || null;
-  if (!orgId || !voiceAgentId) {
-    const { data: chatbot } = await db
-      .from("chatbots")
-      .select("organization_id,voice_agent_id")
-      .eq("id", chatbotId)
-      .maybeSingle();
-    orgId = orgId || chatbot?.organization_id;
-    voiceAgentId = voiceAgentId || chatbot?.voice_agent_id || null;
-  }
+  // The tenant's lead settings decide whether anything is stored and which
+  // details. Read them every time: this is the gate for every chat path.
+  const { data: chatbot } = await db
+    .from("chatbots")
+    .select("organization_id,voice_agent_id,collect_leads,lead_capture_enabled,lead_capture_fields")
+    .eq("id", chatbotId)
+    .maybeSingle();
+  if (!chatbot) throw new Error("chatbot not found");
+  orgId = orgId || chatbot.organization_id;
+  voiceAgentId = voiceAgentId || chatbot.voice_agent_id || null;
   if (!orgId) throw new Error("organization not found for chatbot");
-  const name = String(lead.name || "Unknown").trim() || "Unknown";
-  const phone = normalizePhone(lead.phone);
-  const email = String(lead.email || "")
-    .trim()
-    .toLowerCase();
-  if (!name || (!phone && !email))
-    throw new Error("name and phone or email required");
+  const settings = chatbotLeadSettings(chatbot);
+  if (!settings.enabled) {
+    const error = new Error("This chat doesn't collect contact details.");
+    error.code = "LEAD_CAPTURE_DISABLED";
+    error.status = 403;
+    throw error;
+  }
+  const wants = new Set(settings.fields);
+  const name = wants.has("name")
+    ? String(lead.name || "Unknown").trim() || "Unknown"
+    : "Website visitor";
+  const phone = wants.has("phone") ? normalizePhone(lead.phone) : null;
+  const email = wants.has("email")
+    ? String(lead.email || "")
+        .trim()
+        .toLowerCase()
+    : "";
+  if (!phone && !email)
+    throw new Error(`Please leave your ${contactFieldsSentence(settings.fields)}.`);
   if (email && !validEmail(email)) throw new Error("invalid email");
   const row = {
     organization_id: orgId,
@@ -246,7 +264,9 @@ async function captureLead({ chatbotId, organizationId, lead, reason = "" }) {
     name,
     phone,
     email,
-    reason: String(lead.reason || reason || "Website chat lead").slice(0, 1000),
+    reason: wants.has("reason")
+      ? String(lead.reason || reason || "Website chat lead").slice(0, 1000)
+      : "Website chat lead",
     source: "chatbot",
     status: "new",
     tags: lead.tags || ["chatbot"],
@@ -419,7 +439,8 @@ router.post(
       });
     // Asking about times: offer real ones from the connected calendar.
     let slots;
-    if (BOOKING_INTENT.test(message) && orgId) {
+    const chatLeadSettings = chatbotLeadSettings(result.context?.entity || {});
+    if (chatLeadSettings.enabled && BOOKING_INTENT.test(message) && orgId) {
       const open = await frontdeskPublic.openSlots(orgId);
       if (open.length) slots = open;
     }
@@ -489,8 +510,11 @@ router.post(
       });
     } catch (e) {
       res
-        .status(400)
-        .json({ error: { message: e.message || "Could not capture lead." } });
+        .status(e.code === "LEAD_CAPTURE_DISABLED" ? 403 : 400)
+        .json({
+          error: { message: e.message || "Could not capture lead." },
+          leadCaptureDisabled: e.code === "LEAD_CAPTURE_DISABLED" || undefined,
+        });
     }
   }),
 );
@@ -586,7 +610,7 @@ function safeVoiceInstructionsFromContext(context, languageName = "English") {
     `If the exact answer is not in the context, say you cannot find it in the business knowledge base and offer to take a message.`,
     `If a request has multiple possible matches, ask a short clarifying question and offer the best options.`,
     `Voice mode: speak naturally and briefly. Mention page names instead of reading long raw URLs aloud.`,
-    `Collect lead details when useful: name and either phone or email. Do not ask repeatedly once provided.`,
+    leadCapturePromptLines(chatbotLeadSettings(bot)).join("\n"),
     `Language: ${languageName}.`,
     faqText ? `FAQs:\n${faqText}` : "",
     chunkText ? `Website knowledge:\n${chunkText}` : "",
@@ -917,7 +941,8 @@ router.post(
         analysis,
         settings: fdSettings,
       });
-      if (quote) {
+      const mediaLeadSettings = chatbotLeadSettings(chatbot);
+      if (quote && mediaLeadSettings.enabled) {
         let hasEmail = false;
         if (row.lead_id) {
           const sent = await frontdesk.dispatchQuote(db, quote, { settings: fdSettings });
@@ -1167,3 +1192,6 @@ router.get(
 );
 
 module.exports = router;
+
+// For tests: the single gate every chat lead goes through.
+module.exports.captureLead = captureLead;

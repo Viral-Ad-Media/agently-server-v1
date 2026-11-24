@@ -21,6 +21,7 @@ const { getSupabase } = require("../../lib/supabase");
 const { requireAuth, requireAdmin } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 const gmail = require("../../lib/gmail-send");
+const { requireFeature } = require("../../lib/feature-flags");
 
 const router = express.Router();
 
@@ -116,6 +117,7 @@ router.delete(
 router.post(
   "/draft",
   requireAuth,
+  requireFeature("gmail"),
   asyncHandler(async (req, res) => {
     const db = getSupabase();
     const body = req.body || {};
@@ -158,6 +160,7 @@ router.post(
 router.post(
   "/send",
   requireAuth,
+  requireFeature("gmail"),
   asyncHandler(async (req, res) => {
     const db = getSupabase();
     const body = req.body || {};
@@ -177,6 +180,61 @@ router.post(
       userId: req.user && req.user.id,
     });
     res.json(result);
+  }),
+);
+
+/*
+ * Gmail beta access. Until Google verifies Agently's OAuth app, only Google
+ * accounts listed as test users on the consent screen can connect Gmail, and
+ * Google offers no API to add them. A tenant asks here with the Google
+ * address they will connect; the request lands in the super-admin support
+ * list and the support inbox with the address ready to paste into
+ * Google Auth Platform > Audience > Test users.
+ */
+const GOOGLE_TEST_USERS_URL = "https://console.cloud.google.com/auth/audience";
+
+router.post(
+  "/beta-access",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const googleEmail = String(req.body?.googleEmail || "").trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(googleEmail) || googleEmail.length > 320) {
+      return res.status(400).json({ error: { message: "Enter the Google email address you'll connect." } });
+    }
+
+    const db = getSupabase();
+    const subject = `Gmail beta access: ${googleEmail}`;
+    const { data: existing } = await db
+      .from("platform_support_requests")
+      .select("id,created_at")
+      .eq("subject", subject)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (existing) {
+      return res.json({ requested: true, alreadyRequested: true });
+    }
+
+    const { data: org } = await db.from("organizations").select("name").eq("id", req.orgId).maybeSingle();
+    const { createSupportRequest } = require("../../lib/platform-assistant");
+    await createSupportRequest({
+      organizationId: req.orgId,
+      userId: req.user?.id || null,
+      contactName: req.user?.name || "",
+      contactEmail: req.user?.email || googleEmail,
+      subject,
+      body: [
+        `${org?.name || "A workspace"} wants to connect Gmail.`,
+        `Google account to add as a test user: ${googleEmail}`,
+        `Requested by: ${req.user?.email || "unknown"}`,
+        "",
+        `Add it here: ${GOOGLE_TEST_USERS_URL} (Audience > Test users > Add users).`,
+        "Google allows up to 100 test users until the app is verified.",
+      ].join("\n"),
+      conversationExcerpt: "",
+      attachments: [],
+    });
+    res.status(201).json({ requested: true, alreadyRequested: false });
   }),
 );
 

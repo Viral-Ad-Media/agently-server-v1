@@ -415,7 +415,30 @@ router.patch(
         body.callScreeningSettings || body.call_screening_settings || {};
     if (body.dataCaptureFields !== undefined)
       updates.data_capture_fields = body.dataCaptureFields;
-    if (body.rules !== undefined) updates.rules = body.rules;
+    /*
+     * `rules` holds several unrelated settings (agentPrompt, defaultCallPurpose,
+     * transferAttempts, autoEscalate, ...) and the Agent Studio sends only the
+     * keys that changed. Replacing the column wholesale therefore erased the
+     * rest: saving a new transfer-attempt count wiped the agent prompt. Merge
+     * onto the stored object instead; a key is cleared by sending "" or null.
+     */
+    if (body.rules !== undefined) {
+      const incoming =
+        body.rules && typeof body.rules === "object" && !Array.isArray(body.rules)
+          ? body.rules
+          : {};
+      const { data: existingRow } = await db
+        .from("voice_agents")
+        .select("rules")
+        .eq("id", id)
+        .eq("organization_id", req.orgId)
+        .maybeSingle();
+      const existingRules =
+        existingRow?.rules && typeof existingRow.rules === "object" && !Array.isArray(existingRow.rules)
+          ? existingRow.rules
+          : {};
+      updates.rules = { ...existingRules, ...incoming };
+    }
     if (body.twilioPhoneNumber !== undefined)
       updates.twilio_phone_number = body.twilioPhoneNumber;
     if (body.twilioPhoneSid !== undefined)

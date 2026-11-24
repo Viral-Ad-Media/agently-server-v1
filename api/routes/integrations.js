@@ -796,6 +796,12 @@ router.post(
   "/:provider/start-token",
   requireAuth,
   requireAdmin,
+  // Super Admin kill switch: gmail -> "gmail"; google/calendly -> "calendar".
+  (req, res, next) => {
+    const provider = String(req.params.provider || "").toLowerCase();
+    const feature = provider === "gmail" ? "gmail" : "calendar";
+    return require("../../lib/feature-flags").requireFeature(feature)(req, res, next);
+  },
   asyncHandler(async (req, res) => {
     const { provider } = req.params;
     getProviderConfig(provider); // throws 400/503 when misconfigured
