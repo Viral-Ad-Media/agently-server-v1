@@ -563,7 +563,7 @@ body>*:not(#agently-root):not(script){display:none!important}
 .av img{width:100%;height:100%;object-fit:cover;display:block;}
 .av-media{width:100%;height:100%;display:block;position:relative}
 .av-fallback{display:none;width:100%;height:100%;align-items:center;justify-content:center;font-weight:800;font-size:14px;}
-.ht{flex:1;min-width:0}.hn{font-weight:700;font-size:14.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ht{flex:1;min-width:0}.hn{font-weight:700;font-size:14.5px;line-height:1.25;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere;unicode-bidi:plaintext}
 .hs{font-size:11px;opacity:.82;margin-top:1px;display:flex;align-items:center;gap:5px}
 .dot{width:7px;height:7px;background:#4ade80;border-radius:50%;flex-shrink:0;animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
@@ -986,6 +986,29 @@ ${frontdeskWidget.CSS}
     try { sessionStorage.setItem(SESS_KEY, JSON.stringify({ ts: Date.now(), messages: history.slice(-24) })); } catch(e) {}
   }
 
+  /* In right-to-left text a run like "0123-456-789" or "$1,200" is reordered by
+     the bidi algorithm and reads backwards. Wrap number runs in <bdi dir=ltr>. */
+  function isolateNumbers(root) {
+    var re = /[+$€£]?\\d[\\d\\s().,:\\/-]*\\d|[+$€£]?\\d/g;
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+    var nodes = [];
+    while (walker.nextNode()) { if (/\\d/.test(walker.currentNode.nodeValue)) nodes.push(walker.currentNode); }
+    nodes.forEach(function(node) {
+      var text = node.nodeValue, last = 0, frag = document.createDocumentFragment(), m;
+      re.lastIndex = 0;
+      while ((m = re.exec(text))) {
+        if (m[0].replace(/\\D/g, '').length < 3) continue;
+        frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+        var b = document.createElement('bdi'); b.setAttribute('dir', 'ltr'); b.textContent = m[0];
+        frag.appendChild(b);
+        last = m.index + m[0].length;
+      }
+      if (last === 0) return;
+      frag.appendChild(document.createTextNode(text.slice(last)));
+      node.parentNode.replaceChild(frag, node);
+    });
+  }
+
   function addMsg(role, text, skipSave) {
     var wrap = document.createElement('div');
     wrap.className = 'bubble ' + (role === 'bot' ? 'bot' : 'usr');
@@ -995,6 +1018,7 @@ ${frontdeskWidget.CSS}
     var time = document.createElement('div');
     time.className = 'btime';
     time.textContent = ft();
+    if (document.documentElement.dir === 'rtl') isolateNumbers(inner);
     wrap.appendChild(inner);
     wrap.appendChild(time);
     msgs.appendChild(wrap);
@@ -1059,12 +1083,12 @@ ${frontdeskWidget.CSS}
       // A team member has taken this chat over: their reply arrives by polling.
       if (d && d.human) { if (window.__agentlyFrontdesk) window.__agentlyFrontdesk.afterReply(d); return; }
       setTimeout(function() { if (window.__agentlyFrontdesk) window.__agentlyFrontdesk.afterReply(d); }, 0);
-      var reply = (d.response || (d.error && d.error.message) || "I'm here to help! Could you rephrase that?");
+      var reply = (d.response || (d.error && d.error.message) || T("I'm here to help! Could you rephrase that?"));
       addBotMsg(reply); speakReply(reply);
     })
     .catch(function() {
       hideTyping();
-      addBotMsg("Sorry, I'm having trouble connecting right now. Please try again in a moment.");
+      addBotMsg(T("Sorry, I'm having trouble connecting right now. Please try again in a moment."));
     })
     .finally(function() { sending = false; ci.focus(); maybeTriggerLeadCapture(); });
   }
