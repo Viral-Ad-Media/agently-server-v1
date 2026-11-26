@@ -10,6 +10,10 @@ const {
   requireOwner,
 } = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
+const {
+  SESSION_POLICY,
+  revokeAllSessionsForUser,
+} = require("../../lib/auth-sessions");
 const { serializeUser } = require("../../lib/serializers");
 const {
   sendTeamInviteEmail,
@@ -281,7 +285,6 @@ async function loadCustomerWalletSummary(db, organizationId, limit = 150) {
 router.get(
   "/team/members",
   requireAuth,
-  requireAdmin,
   asyncHandler(async (req, res) => {
     const db = getSupabase();
     const { data: members = [], error } = await db
@@ -296,7 +299,42 @@ router.get(
         .json({ error: { message: "Unable to load team members." } });
     }
 
-    const serialized = members.map(serializeUser);
+    /*
+     * Invitation state per member, so the owner can tell "invited, never
+     * opened the link" from "active". Only the newest team_invite token per
+     * user matters; older ones were superseded by a resend.
+     */
+    const invitationByUser = new Map();
+    const memberIds = members.map((member) => member.id).filter(Boolean);
+    if (memberIds.length) {
+      const { data: inviteRows } = await db
+        .from("magic_link_tokens")
+        .select("user_id,used,used_reason,expires_at,created_at")
+        .eq("organization_id", req.orgId)
+        .eq("purpose", "team_invite")
+        .in("user_id", memberIds)
+        .order("created_at", { ascending: false });
+      for (const row of inviteRows || []) {
+        if (invitationByUser.has(row.user_id)) continue;
+        let status = "accepted";
+        if (!row.used) {
+          status = new Date(row.expires_at) < new Date() ? "expired" : "pending";
+        } else if (String(row.used_reason || "") === "revoked") {
+          status = "revoked";
+        }
+        invitationByUser.set(row.user_id, {
+          status,
+          sentAt: row.created_at,
+          expiresAt: row.expires_at,
+        });
+      }
+    }
+
+    const serialized = members.map((member) => ({
+      ...serializeUser(member),
+      invitation:
+        member.role === "Owner" ? null : invitationByUser.get(member.id) || null,
+    }));
     res.json({
       success: true,
       organizationId: req.orgId,
@@ -315,7 +353,7 @@ router.get(
 router.patch(
   "/team/members/:id/role",
   requireAuth,
-  requireAdmin,
+  requireOwner,
   asyncHandler(async (req, res) => {
     const { id } = req.params;
     const { role } = req.body;
@@ -374,7 +412,7 @@ router.patch(
 router.post(
   "/team/invitations",
   requireAuth,
-  requireAdmin,
+  requireOwner,
   asyncHandler(async (req, res) => {
     const { email, role, name } = req.body;
 
@@ -569,7 +607,7 @@ router.post(
 router.delete(
   "/team/members/:id",
   requireAuth,
-  requireAdmin,
+  requireOwner,
   asyncHandler(async (req, res) => {
     const { id } = req.params;
     const db = getSupabase();
@@ -600,13 +638,180 @@ router.delete(
         .json({ error: { message: "You cannot remove yourself." } });
     }
 
+    /*
+     * Cut access first, then delete. Revoking bumps the member's session epoch
+     * and ends every device they are signed in on, so even if the delete below
+     * fails (a row elsewhere still references them) they are locked out the
+     * moment the owner clicks Remove. Unused invitation links die with them.
+     */
+    await revokeAllSessionsForUser(id, "removed_by_owner");
     await db
+      .from("magic_link_tokens")
+      .update({
+        used: true,
+        used_reason: "revoked",
+        used_at: new Date().toISOString(),
+      })
+      .eq("user_id", id)
+      .eq("organization_id", req.orgId)
+      .eq("purpose", "team_invite")
+      .eq("used", false);
+
+    const { error: deleteError } = await db
       .from("users")
       .delete()
       .eq("id", id)
       .eq("organization_id", req.orgId);
 
+    if (deleteError) {
+      console.error("[team] member delete failed:", deleteError.message);
+      return res.status(409).json({
+        error: {
+          code: "MEMBER_DELETE_BLOCKED",
+          message:
+            "Their access was revoked and they were signed out everywhere, but the member record could not be deleted because other workspace data still points to it.",
+        },
+      });
+    }
+
     res.json({ success: true });
+  }),
+);
+
+// ── POST /api/team/members/:id/sign-out ──────────────────────
+// The owner ends every session a member has, on every device, without
+// removing them. They can sign in again with their password.
+router.post(
+  "/team/members/:id/sign-out",
+  requireAuth,
+  requireOwner,
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    if (id === req.user.id) {
+      return res.status(400).json({
+        error: {
+          message: "Use Signed-in devices in Settings to sign yourself out.",
+        },
+      });
+    }
+    const db = getSupabase();
+    const { data: target } = await db
+      .from("users")
+      .select("id")
+      .eq("id", id)
+      .eq("organization_id", req.orgId)
+      .maybeSingle();
+    if (!target) {
+      return res
+        .status(404)
+        .json({ error: { message: "Team member not found." } });
+    }
+    await revokeAllSessionsForUser(id, "signed_out_by_owner");
+    res.json({ success: true });
+  }),
+);
+
+// ── GET /api/team/sessions ───────────────────────────────────
+// Every live signed-in device across the workspace, for the owner to audit.
+router.get(
+  "/team/sessions",
+  requireAuth,
+  requireOwner,
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const idleCutoff = new Date(
+      Date.now() - SESSION_POLICY.idleSeconds * 1000,
+    ).toISOString();
+    const { data: sessions, error } = await db
+      .from("auth_sessions")
+      .select(
+        "id,user_id,client,user_agent,request_ip,created_at,last_seen_at,absolute_expires_at",
+      )
+      .eq("organization_id", req.orgId)
+      .is("revoked_at", null)
+      .gt("absolute_expires_at", new Date().toISOString())
+      .gt("last_seen_at", idleCutoff)
+      .order("last_seen_at", { ascending: false })
+      .limit(200);
+    if (error) {
+      return res
+        .status(500)
+        .json({ error: { message: "Unable to load signed-in devices." } });
+    }
+
+    const userIds = [...new Set((sessions || []).map((row) => row.user_id))];
+    const { data: users } = userIds.length
+      ? await db
+          .from("users")
+          .select("id,name,email,role")
+          .eq("organization_id", req.orgId)
+          .in("id", userIds)
+      : { data: [] };
+    const userMap = new Map((users || []).map((user) => [user.id, user]));
+
+    res.json({
+      sessions: (sessions || []).map((row) => {
+        const member = userMap.get(row.user_id) || {};
+        return {
+          id: row.id,
+          userId: row.user_id,
+          userName: member.name || "",
+          userEmail: member.email || "",
+          userRole: member.role || "",
+          client: row.client || "",
+          userAgent: row.user_agent || "",
+          requestIp: row.request_ip || "",
+          createdAt: row.created_at,
+          lastSeenAt: row.last_seen_at,
+          current: row.id === req.sessionId,
+        };
+      }),
+      policy: SESSION_POLICY,
+    });
+  }),
+);
+
+// ── DELETE /api/team/sessions/:sessionId ─────────────────────
+// The owner signs out one device. Scoped to this workspace, so an owner can
+// never touch a session that belongs to another organization.
+router.delete(
+  "/team/sessions/:sessionId",
+  requireAuth,
+  requireOwner,
+  asyncHandler(async (req, res) => {
+    const { sessionId } = req.params;
+    if (
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+        sessionId,
+      )
+    ) {
+      return res.status(400).json({ error: { message: "Invalid session." } });
+    }
+    const db = getSupabase();
+    const { data: revoked, error } = await db
+      .from("auth_sessions")
+      .update({
+        revoked_at: new Date().toISOString(),
+        revoked_reason: "removed_by_owner",
+      })
+      .eq("id", sessionId)
+      .eq("organization_id", req.orgId)
+      .is("revoked_at", null)
+      .select("id");
+    if (error) {
+      return res
+        .status(500)
+        .json({ error: { message: "Unable to sign out that device." } });
+    }
+    if (!Array.isArray(revoked) || !revoked.length) {
+      return res
+        .status(404)
+        .json({ error: { message: "That device is already signed out." } });
+    }
+    res.json({
+      success: true,
+      currentSessionRevoked: sessionId === req.sessionId,
+    });
   }),
 );
 
@@ -1126,7 +1331,7 @@ function buildKnowledgeBaseBusinessUpdate(profile) {
 router.patch(
   "/settings",
   requireAuth,
-  requireAdmin,
+  requireOwner,
   asyncHandler(async (req, res) => {
     const {
       timezone,

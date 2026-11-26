@@ -51,3 +51,4 @@ require("./frontdesk.test");
 require("./chatbot-lead-settings.test");
 require("./sms-and-feature-flags.test");
 require("./widget-i18n.test");
+require("./team-access.test");

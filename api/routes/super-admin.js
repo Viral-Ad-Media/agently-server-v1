@@ -825,16 +825,27 @@ router.get(
         (users || []).map((user) => user.organization_id).filter(Boolean),
       ),
     );
-    const [orgResult, walletRows] = await Promise.all([
+    const [orgResult, walletRows, waiverResult] = await Promise.all([
       organizationIds.length
         ? db.from("organizations").select("*").in("id", organizationIds)
         : Promise.resolve({ data: [], error: null }),
       loadWalletRows(db, organizationIds),
+      organizationIds.length
+        ? db
+            .from("billing_wallets")
+            .select("organization_id,metadata")
+            .in("organization_id", organizationIds)
+        : Promise.resolve({ data: [], error: null }),
     ]);
     if (orgResult.error) throw orgResult.error;
     const orgMap = new Map((orgResult.data || []).map((org) => [org.id, org]));
     const walletMap = new Map(
       walletRows.map((row) => [row.organization_id, row]),
+    );
+    const waivedOrgs = new Set(
+      (waiverResult.data || [])
+        .filter((row) => row.metadata?.card_gate_waiver?.waived === true)
+        .map((row) => row.organization_id),
     );
 
     const rows = (users || []).map((user) => {
@@ -859,6 +870,7 @@ router.get(
           wallet.total_debits_usd ?? wallet.total_deductions_usd ?? 0,
         ),
         walletStatus: wallet.wallet_status || wallet.status || "unknown",
+        cardRequirementWaived: waivedOrgs.has(user.organization_id),
       };
     });
 
@@ -903,6 +915,70 @@ router.post(
       amountUsd,
     });
     res.json({ success: true, transaction: data });
+  }),
+);
+
+// ── PUT /api/super-admin/organizations/:organizationId/card-waiver ──
+// Body: { waived: boolean, note? }
+// Lets a workspace buy numbers / put chatbots live without a saved card, so the
+// platform owner can test it on manually added credit. Wallet balance checks
+// still apply; only the card-on-file rule is skipped. See
+// lib/activation-gate.js getCardWaiver.
+router.put(
+  "/organizations/:organizationId/card-waiver",
+  asyncHandler(async (req, res) => {
+    const db = getSupabase();
+    const organizationId = String(req.params.organizationId || "").trim();
+    const waived = req.body?.waived === true;
+    if (!organizationId) {
+      return res
+        .status(400)
+        .json({ error: { message: "organizationId is required." } });
+    }
+
+    const { data: wallet, error: walletError } = await db
+      .from("billing_wallets")
+      .select("id,metadata")
+      .eq("organization_id", organizationId)
+      .maybeSingle();
+    if (walletError) throw walletError;
+    if (!wallet) {
+      return res.status(409).json({
+        error: {
+          code: "WALLET_MISSING",
+          message:
+            "This workspace has no wallet yet. Add credit first (that creates it), then skip the card requirement.",
+        },
+      });
+    }
+
+    const metadata = { ...(wallet.metadata || {}) };
+    metadata.card_gate_waiver = waived
+      ? {
+          waived: true,
+          by: req.superAdmin.email,
+          at: new Date().toISOString(),
+          note: String(req.body?.note || "").slice(0, 300),
+        }
+      : {
+          waived: false,
+          removedBy: req.superAdmin.email,
+          removedAt: new Date().toISOString(),
+        };
+
+    const { error: updateError } = await db
+      .from("billing_wallets")
+      .update({ metadata, updated_at: new Date().toISOString() })
+      .eq("id", wallet.id);
+    if (updateError) throw updateError;
+
+    await logSecurityEvent(
+      req,
+      waived ? "card_requirement_waived" : "card_requirement_restored",
+      true,
+      { adminEmail: req.superAdmin.email, organizationId },
+    );
+    res.json({ success: true, cardRequirementWaived: waived });
   }),
 );
 

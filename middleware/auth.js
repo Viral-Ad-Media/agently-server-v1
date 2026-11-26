@@ -33,6 +33,33 @@ function logAuthFailure(error) {
   console.error("[requireAuth] error:", error?.message || String(error));
 }
 
+/*
+ * Viewers are read-only on the server, not just in the UI.
+ *
+ * The dashboard greys out controls for a Viewer, but a greyed-out button is a
+ * courtesy; anyone can replay a request with their token. Every authenticated
+ * route passes through requireAuth, so the rule lives here once: a Viewer may
+ * read anything their workspace can read, and may only write to their own
+ * account (password, their own devices, sign-out), mark notifications read,
+ * talk to the help assistant and record product-tour progress.
+ */
+const VIEWER_WRITE_ALLOWED_PREFIXES = [
+  "/api/auth/",
+  "/api/notifications",
+  "/api/platform-assistant",
+  "/api/tour",
+];
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+function isViewerWriteBlocked(req) {
+  if (req.user?.role !== "Viewer") return false;
+  if (SAFE_METHODS.has(String(req.method || "GET").toUpperCase())) return false;
+  const path = String(req.originalUrl || req.url || "").split("?")[0];
+  return !VIEWER_WRITE_ALLOWED_PREFIXES.some((prefix) =>
+    path.startsWith(prefix),
+  );
+}
+
 async function requireAuth(req, res, next) {
   const header = req.headers["authorization"] || "";
   const token = header.startsWith("Bearer ") ? header.slice(7).trim() : null;
@@ -65,6 +92,15 @@ async function requireAuth(req, res, next) {
      */
     req.sessionId = session.sessionId || null;
     res.setHeader("Cache-Control", "no-store");
+    if (isViewerWriteBlocked(req)) {
+      return res.status(403).json({
+        error: {
+          code: "VIEWER_READ_ONLY",
+          message:
+            "Your Viewer role is read-only. Ask the account owner to make this change.",
+        },
+      });
+    }
     next();
   } catch (error) {
     logAuthFailure(error);
@@ -102,4 +138,9 @@ function requireOwner(req, res, next) {
   next();
 }
 
-module.exports = { requireAuth, requireAdmin, requireOwner };
+module.exports = {
+  requireAuth,
+  requireAdmin,
+  requireOwner,
+  isViewerWriteBlocked,
+};

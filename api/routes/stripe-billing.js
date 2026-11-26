@@ -1,7 +1,11 @@
 "use strict";
 
 const express = require("express");
-const { requireAuth, requireAdmin } = require("../../middleware/auth");
+const {
+  requireAuth,
+  requireAdmin,
+  requireOwner,
+} = require("../../middleware/auth");
 const { asyncHandler } = require("../../middleware/error");
 const { getSupabase } = require("../../lib/supabase");
 const { getBillingPlatformSettings } = require("../../lib/billing-settings");
@@ -54,7 +58,7 @@ router.get(
 router.post(
   "/setup-intent",
   requireAuth,
-  requireAdmin,
+  requireOwner,
   asyncHandler(async (req, res) => {
     const result = await createCardSetupIntent({
       organizationId: req.orgId,
@@ -79,7 +83,7 @@ router.get(
 router.post(
   "/charge",
   requireAuth,
-  requireAdmin,
+  requireOwner,
   asyncHandler(async (req, res) => {
     const result = await chargeSavedCard({
       organizationId: req.orgId,
@@ -105,7 +109,7 @@ router.get(
 router.put(
   "/auto-topup",
   requireAuth,
-  requireAdmin,
+  requireOwner,
   asyncHandler(async (req, res) => {
     const { updateAutoTopUpSettings } = require("../../lib/auto-topup");
     const body = req.body || {};
@@ -122,7 +126,7 @@ router.put(
 router.post(
   "/checkout-session",
   requireAuth,
-  requireAdmin,
+  requireOwner,
   asyncHandler(async (req, res) => {
     const result = await createWalletTopUpCheckout({
       organizationId: req.orgId,
