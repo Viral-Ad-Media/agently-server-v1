@@ -261,3 +261,30 @@ test("normalizeBookingSettings allows partial updates and empty input", () => {
   assert.deepEqual(normalizeBookingSettings("google", {}).settings, {});
   assert.deepEqual(normalizeBookingSettings("google", null).settings, {});
 });
+test("start URL stays relative when the redirect host is the API host", () => {
+  const { startUrlFor } = _internals;
+  const req = { get: (h) => (h === "host" ? "agently-ingest.example.amazonlightsail.com" : undefined) };
+  const url = startUrlFor(
+    req,
+    "https://agently-ingest.example.amazonlightsail.com/api/integrations/google/callback",
+    "/api/integrations/google/start?st=abc",
+  );
+  assert.equal(url, "/api/integrations/google/start?st=abc");
+});
+
+test("start URL moves to the redirect host so the nonce cookie reaches the callback", () => {
+  const { startUrlFor } = _internals;
+  const req = { get: (h) => (h === "host" ? "agently-ingest.example.amazonlightsail.com" : undefined) };
+  const url = startUrlFor(
+    req,
+    "https://api.agentlycall.com/api/integrations/gmail/callback",
+    "/api/integrations/gmail/start?st=abc",
+  );
+  assert.equal(url, "https://api.agentlycall.com/api/integrations/gmail/start?st=abc");
+});
+
+test("start URL falls back to the relative path for a malformed redirect URI", () => {
+  const { startUrlFor } = _internals;
+  const req = { get: () => "localhost:4000" };
+  assert.equal(startUrlFor(req, "not a url", "/api/integrations/google/start?st=x"), "/api/integrations/google/start?st=x");
+});

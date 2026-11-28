@@ -307,6 +307,28 @@ function setNonceCookie(res, provider, nonce) {
   });
 }
 
+/**
+ * The /start hop sets the nonce cookie, and the provider's callback must find
+ * it, so both have to run on the SAME host: the one in the redirect URI.
+ *
+ * Google verification needs that redirect host on a domain we own
+ * (api.agentlycall.com), while the app talks to the API on the Lightsail
+ * hostname. When the two differ, hand the browser an absolute start URL on
+ * the redirect host. When they match (today, and in local dev) keep the
+ * relative path, so a frontend that prefixes its API base keeps working.
+ */
+function startUrlFor(req, redirectUri, path) {
+  let redirect;
+  try {
+    redirect = new URL(redirectUri);
+  } catch {
+    return path;
+  }
+  const requestHost = String((req.get && req.get("host")) || "").toLowerCase();
+  if (!requestHost || redirect.host.toLowerCase() === requestHost) return path;
+  return `${redirect.origin}${path}`;
+}
+
 function clearNonceCookie(res, provider) {
   res.clearCookie(`${NONCE_COOKIE_PREFIX}${provider}`, { path: "/api/integrations" });
 }
@@ -804,19 +826,20 @@ router.post(
   },
   asyncHandler(async (req, res) => {
     const { provider } = req.params;
-    getProviderConfig(provider); // throws 400/503 when misconfigured
     if (!isEncryptionConfigured()) {
       return res.status(503).json({
         error: { code: "encryption_not_configured", message: keySetupHelp() },
       });
     }
+    const config = getProviderConfig(provider); // throws 400/503 when misconfigured
     const token = signStartToken({
       orgId: req.orgId,
       userId: req.user && req.user.id,
       provider,
       returnTo: req.body && req.body.returnTo,
     });
-    res.json({ url: `/api/integrations/${provider}/start?st=${encodeURIComponent(token)}` });
+    const path = `/api/integrations/${provider}/start?st=${encodeURIComponent(token)}`;
+    res.json({ url: startUrlFor(req, config.redirectUri, path) });
   }),
 );
 
@@ -1292,6 +1315,7 @@ module.exports._internals = {
   verifyStartToken,
   getCookie,
   getProviderConfig,
+  startUrlFor,
   buildAuthorizeUrl,
   exchangeCode,
   generateCodeVerifier,

@@ -918,6 +918,100 @@ router.post(
   }),
 );
 
+// ── Number countries ──────────────────────────────────────────
+// Which countries tenants can buy numbers in and call. Inbound calls are not
+// affected. Turning a country on also switches on outbound calling to it at
+// the carrier (US and Canada share one carrier setting).
+router.get(
+  "/number-countries",
+  asyncHandler(async (_req, res) => {
+    const numberCountries = require("../../lib/number-countries");
+    const { sellableCountries } = require("../../lib/twilio-platform");
+    const { NO_VERIFICATION } = require("../../lib/business-verification");
+    const rows = await numberCountries.loadRows(getSupabase(), { fresh: true });
+    const byIso = new Map(rows.map((row) => [row.iso_country, row]));
+    const platform = sellableCountries();
+    const all = [...new Set([...platform, ...rows.map((row) => row.iso_country)])];
+    res.json({
+      migrationApplied: !rows.some((row) => row.fallback),
+      countries: all.map((iso) => ({
+        iso,
+        name: numberCountries.countryName(iso),
+        enabled: Boolean(byIso.get(iso)?.enabled),
+        verificationRequired: !NO_VERIFICATION.has(iso),
+        updatedBy: byIso.get(iso)?.updated_by || null,
+        updatedAt: byIso.get(iso)?.updated_at || null,
+      })),
+    });
+  }),
+);
+
+router.put(
+  "/number-countries/:iso",
+  asyncHandler(async (req, res) => {
+    const numberCountries = require("../../lib/number-countries");
+    const { applyVoiceDialingPermissions } = require("../../lib/twilio-platform");
+    const enabled = req.body?.enabled === true;
+    try {
+      const result = await numberCountries.setCountryEnabled(req.params.iso, enabled, {
+        adminEmail: req.superAdmin.email,
+        db: getSupabase(),
+        applyCarrierPermission: (iso) =>
+          applyVoiceDialingPermissions({ countries: [iso === "CA" ? "US" : iso] }),
+      });
+      await logSecurityEvent(req, "number_country_changed", true, {
+        adminEmail: req.superAdmin.email,
+        country: result.iso,
+        enabled,
+        carrierUpdated: result.carrier ? Boolean(result.carrier.success) : null,
+      });
+      res.json({
+        success: true,
+        country: result.iso,
+        enabled,
+        carrierWarning:
+          result.carrier && !result.carrier.success
+            ? "Saved, but outbound calling couldn't be switched on at the phone carrier automatically. Calls to this country may fail until it's enabled there."
+            : null,
+      });
+    } catch (error) {
+      res.status(Number(error.status) || 500).json({
+        error: { code: error.code, message: error.message },
+      });
+    }
+  }),
+);
+
+// Every workspace's business verifications, newest first (oversight only).
+router.get(
+  "/business-verifications",
+  asyncHandler(async (_req, res) => {
+    const db = getSupabase();
+    const { serialize } = require("../../lib/business-verification");
+    const { data, error } = await db
+      .from("business_verifications")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(100);
+    if (error) {
+      if (["42P01", "PGRST205"].includes(error.code)) return res.json({ verifications: [] });
+      throw error;
+    }
+    const orgIds = [...new Set((data || []).map((row) => row.organization_id))];
+    const { data: orgs } = orgIds.length
+      ? await db.from("organizations").select("id,name").in("id", orgIds)
+      : { data: [] };
+    const names = new Map((orgs || []).map((org) => [org.id, org.name]));
+    res.json({
+      verifications: (data || []).map((row) => ({
+        ...serialize(row),
+        organizationId: row.organization_id,
+        organizationName: names.get(row.organization_id) || "",
+      })),
+    });
+  }),
+);
+
 // ── PUT /api/super-admin/organizations/:organizationId/card-waiver ──
 // Body: { waived: boolean, note? }
 // Lets a workspace buy numbers / put chatbots live without a saved card, so the

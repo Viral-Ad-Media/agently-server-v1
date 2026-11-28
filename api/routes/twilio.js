@@ -104,6 +104,18 @@ const {
   apiBaseUrl,
   masterSid,
 } = require("../../lib/twilio-platform");
+const numberCountries = require("../../lib/number-countries");
+const businessVerification = require("../../lib/business-verification");
+
+/** 400 with the shared "not available" message when a country is switched off. */
+async function rejectIfCountryOff(res, country, action = "numbers") {
+  if (await numberCountries.isCountryEnabled(country)) return false;
+  const error = numberCountries.countryUnavailableError(country, action);
+  res.status(400).json({
+    error: { code: error.code, message: error.message, ...error.details },
+  });
+  return true;
+}
 const {
   getTwilioNumberReadiness,
   persistReadiness,
@@ -2896,6 +2908,7 @@ router.post(
         },
       });
     }
+    if (await rejectIfCountryOff(res, country)) return;
 
     const account = await ensureTenantTwilioAccount({
       organizationId,
@@ -2917,8 +2930,8 @@ router.post(
       });
       res.json({
         numbers,
-        supportedCountries: sellableCountries(),
-        sellableCountries: sellableCountries(),
+        supportedCountries: await numberCountries.filterEnabled(sellableCountries()),
+        sellableCountries: await numberCountries.filterEnabled(sellableCountries()),
         lowRiskVoiceCountries: lowRiskCountries(),
       });
     } catch (err) {
@@ -3051,6 +3064,49 @@ router.post(
      */
     await assertCanActivate(getSupabase(), organizationId, "purchase_number");
 
+    if (await rejectIfCountryOff(res, country)) return;
+
+    /*
+     * Regulated countries only issue numbers against an approved business
+     * verification for that country and number type. Without one the owner is
+     * sent to the verification flow instead of a carrier error.
+     */
+    const purchaseNumberType = businessVerification.normalizeNumberType(
+      req.body?.type || req.body?.numberType || "local",
+    );
+    let approvedVerification = null;
+    let verificationRequirements = null;
+    try {
+      verificationRequirements = await businessVerification.getRequirements(
+        country,
+        purchaseNumberType,
+      );
+    } catch (requirementsError) {
+      console.warn(
+        "[twilio-number-purchase] verification requirements unavailable:",
+        requirementsError?.message || String(requirementsError),
+      );
+    }
+    if (verificationRequirements?.required) {
+      approvedVerification = await businessVerification.findApprovedVerification(
+        getSupabase(),
+        organizationId,
+        country,
+        purchaseNumberType,
+      );
+      if (!approvedVerification) {
+        return res.status(409).json({
+          error: {
+            code: "VERIFICATION_REQUIRED",
+            message: `${numberCountries.countryName(country)} numbers need a quick business verification first. Upload your documents once, and we'll let you know when you can get your number.`,
+            country,
+            countryName: numberCountries.countryName(country),
+            numberType: purchaseNumberType,
+          },
+        });
+      }
+    }
+
     if (agentId) {
       const { data: agent } = await getSupabase()
         .from("voice_agents")
@@ -3117,6 +3173,8 @@ router.post(
         phoneNumber,
         friendlyName: `${req.organization?.name || "Agently"} ${phoneNumber}`,
         agentId,
+        bundleSid: approvedVerification?.provider_bundle_sid || undefined,
+        addressSid: approvedVerification?.provider_address_sid || undefined,
       });
 
       let configured = purchased;
@@ -3985,6 +4043,11 @@ router.post(
 
     const destinationCountry = guessCountryFromE164(toPhone);
     console.log("[outbound-call] destinationCountry", destinationCountry);
+    if (
+      destinationCountry !== "UNKNOWN" &&
+      (await rejectIfCountryOff(res, destinationCountry, "calls"))
+    )
+      return;
     const selected = voiceCountriesForNumber(number, destinationCountry);
     if (!selected.has(destinationCountry) && destinationCountry !== "UNKNOWN") {
       return res.status(400).json({
@@ -4499,6 +4562,7 @@ router.get(
         },
       });
     }
+    if (await rejectIfCountryOff(res, country)) return;
 
     try {
       const account = await ensureTenantTwilioAccount({
@@ -4519,8 +4583,8 @@ router.get(
       });
       res.json({
         numbers,
-        supportedCountries: sellableCountries(),
-        sellableCountries: sellableCountries(),
+        supportedCountries: await numberCountries.filterEnabled(sellableCountries()),
+        sellableCountries: await numberCountries.filterEnabled(sellableCountries()),
         lowRiskVoiceCountries: lowRiskCountries(),
       });
     } catch (err) {
@@ -4957,6 +5021,7 @@ router.get(
         },
       });
     }
+    if (await rejectIfCountryOff(res, country)) return;
 
     try {
       const account = await ensureTenantTwilioAccount({
@@ -4978,8 +5043,8 @@ router.get(
       return res.json({
         success: true,
         numbers,
-        supportedCountries: sellableCountries(),
-        sellableCountries: sellableCountries(),
+        supportedCountries: await numberCountries.filterEnabled(sellableCountries()),
+        sellableCountries: await numberCountries.filterEnabled(sellableCountries()),
       });
     } catch (err) {
       const mapped = mapTwilioError(err, "Could not search Twilio numbers.");
@@ -4999,15 +5064,30 @@ router.get(
 router.get(
   "/number-countries",
   requireAuth,
-  asyncHandler(async (_req, res) => {
-    const sellable = sellableCountries();
+  asyncHandler(async (req, res) => {
+    // Only the countries the Super Admin has switched on are offered.
+    const sellable = await numberCountries.filterEnabled(sellableCountries());
+    const verifications = await businessVerification.listVerifications(
+      getSupabase(),
+      req.orgId,
+    );
+    const countries = sellable.map((iso) => {
+      const latest = verifications.find(
+        (row) => row.iso_country === iso && row.number_type === "local",
+      );
+      return {
+        iso,
+        name: numberCountries.countryName(iso),
+        verificationRequired: !businessVerification.NO_VERIFICATION.has(iso),
+        verificationStatus: latest?.status || null,
+        verificationId: latest?.id || null,
+      };
+    });
     res.json({
       sellableCountries: sellable,
+      countries,
       lowRiskVoiceCountries: lowRiskCountries(),
       defaultCountry: sellable.includes("US") ? "US" : sellable[0] || "US",
-      // Stated so the UI can warn before a tenant picks a country they cannot
-      // complete a purchase in. US and CA need no regulatory bundle; the
-      // others do, and whose name it must be in is still open (N016).
       noBundleRequired: ["US", "CA"],
     });
   }),
@@ -6262,6 +6342,11 @@ router.post(
           });
         }
       }
+      if (
+        destinationCountry !== "UNKNOWN" &&
+        (await rejectIfCountryOff(res, destinationCountry, "calls"))
+      )
+        return;
       const selected = voiceCountriesForNumber(number, destinationCountry);
       if (
         !selected.has(destinationCountry) &&

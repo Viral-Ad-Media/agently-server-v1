@@ -307,6 +307,14 @@ app.post("/api/integrations/google/push", (req, res, next) => {
     .catch(next);
 });
 
+// Business-verification documents arrive base64-encoded, one per request, up
+// to 10 MB each (~13.4 MB encoded). Parsed here, before the global 4 MB
+// parser, which then skips the already-parsed body.
+app.use(
+  /^\/api\/business-verification\/[^/]+\/documents$/,
+  express.json({ limit: "15mb" }),
+);
+
 app.use(
   express.json({
     limit: process.env.JSON_BODY_LIMIT || "4mb",
@@ -575,6 +583,11 @@ safeMount(
 );
 // Outbound SMS. Behind the "sms" feature switch (lib/feature-flags.js).
 safeMount("/api/sms", () => require("./routes/sms"), "sms");
+safeMount(
+  "/api/business-verification",
+  () => require("./routes/business-verification"),
+  "business-verification",
+);
 safeMount(
   "/api/operator",
   () => require("./routes/owner-operator"),
